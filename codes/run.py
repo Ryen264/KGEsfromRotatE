@@ -1,5 +1,3 @@
-#!/usr/bin/python3
-
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -49,6 +47,7 @@ def parse_args(args=None):
     parser.add_argument('-a', '--adversarial_temperature', default=1.0, type=float)
     parser.add_argument('-b', '--batch_size', default=1024, type=int)
     parser.add_argument('-r', '--regularization', default=0.0, type=float)
+    parser.add_argument('-rp', '--regularization_power', default=3, type=int)
     parser.add_argument('--test_batch_size', default=4, type=int, help='valid/test batch size')
     parser.add_argument('--uni_weight', action='store_true', 
                         help='Otherwise use subsampling weighting like in word2vec')
