@@ -365,7 +365,7 @@ def parse_cli():
     )
     parser.add_argument('--valid-metric', default='MRR', help='Validation metric for learning curve')
     parser.add_argument('--display-epochs', type=int, default=100, help='First N epochs to train and plot')
-    parser.add_argument('--gpu', type=int, default=0, help='GPU device id')
+    parser.add_argument('--gpu', type=int, default=1, help='GPU device id')
     parser.add_argument(
         '--output-dir', default=None,
         help='Directory to save PNG figures (default: visualization/outputs)',
