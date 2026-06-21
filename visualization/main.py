@@ -22,6 +22,31 @@ from loss import AlignmentUniformityLoss, compute_kge_loss
 from model import KGEModel
 
 
+LOSS_DISPLAY_NAMES = {
+    'ce': 'CE',
+    'mr': 'MR',
+    'bce': 'BCE',
+    'self_adv': 'SA',
+    'au': 'AU',
+}
+
+
+def get_loss_display_name(args):
+    loss_name = getattr(args, 'loss', 'self_adv')
+    return LOSS_DISPLAY_NAMES.get(loss_name, loss_name.upper())
+
+
+def format_training_postfix(valid_metric, metric_value, loss_name, loss_value, align, uniform):
+    return '{metric}={metric_v:.4f}, {loss_name}={loss_v:.4f}, align={align:.4f}, uniform={uniform:.4f}'.format(
+        metric=valid_metric,
+        metric_v=metric_value,
+        loss_name=loss_name,
+        loss_v=loss_value,
+        align=align,
+        uniform=uniform,
+    )
+
+
 def load_config(config_path):
     config_path = os.path.abspath(config_path)
     with open(config_path, 'r') as f:
@@ -186,6 +211,7 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR'):
     train_triples, valid_triples, _, all_true_triples = load_dataset(args)
     model, train_iterator, optimizer = build_model_and_iterator(args, train_triples)
     epoch_steps = train_run.steps_per_epoch(len(train_triples), args.batch_size)
+    loss_name = get_loss_display_name(args)
 
     history = {
         'epochs': [],
@@ -195,7 +221,12 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR'):
         'valid_metric': [],
     }
 
-    epoch_bar = tqdm(range(1, num_epochs + 1), desc='Training', unit='epoch')
+    epoch_bar = tqdm(
+        range(1, num_epochs + 1),
+        desc='Training',
+        unit='epoch',
+        dynamic_ncols=True,
+    )
     for epoch in epoch_bar:
         batch_logs = []
         step_bar = tqdm(
@@ -203,6 +234,7 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR'):
             desc='  batches',
             unit='batch',
             leave=False,
+            dynamic_ncols=True,
         )
         for _ in step_bar:
             batch_logs.append(train_step_with_metrics(model, optimizer, train_iterator, args))
@@ -215,12 +247,15 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR'):
         metrics = KGEModel.test_step(model, valid_triples, all_true_triples, args)
         history['valid_metric'].append(metrics)
 
-        epoch_bar.set_postfix(
-            loss='{:.4f}'.format(history['loss'][-1]),
-            align='{:.4f}'.format(history['align_loss'][-1]),
-            uniform='{:.4f}'.format(history['uniform_loss'][-1]),
-            **{valid_metric: '{:.4f}'.format(metrics[valid_metric])},
+        postfix = format_training_postfix(
+            valid_metric,
+            metrics[valid_metric],
+            loss_name,
+            history['loss'][-1],
+            history['align_loss'][-1],
+            history['uniform_loss'][-1],
         )
+        epoch_bar.set_postfix_str(postfix, refresh=True)
 
     return history
 
@@ -324,12 +359,12 @@ def visualize_training(
     os.makedirs(output_dir, exist_ok=True)
 
     loss_label = {
-        'self_adv': 'loss',
-        'bce': 'BCE loss',
         'ce': 'CE loss',
-        'mr': 'margin loss',
+        'mr': 'MR loss',
+        'bce': 'BCE loss',
+        'self_adv': 'SA loss',
         'au': 'AU loss',
-    }.get(getattr(args, 'loss', 'self_adv'), 'loss')
+    }.get(getattr(args, 'loss', 'self_adv'), get_loss_display_name(args) + ' loss')
 
     fig_au = plot_alignment_uniformity(
         history,
