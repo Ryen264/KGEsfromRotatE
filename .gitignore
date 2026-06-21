@@ -1,3 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Training outputs
+models/
 checkpoint
 *.npy
 *.log
+visualization/outputs/
+
+# IDE / editor
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+get-pip.py
+*.egg-info/
+dist/
+build/

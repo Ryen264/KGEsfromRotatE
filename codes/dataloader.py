@@ -36,17 +36,15 @@ class TrainDataset(Dataset):
         while negative_sample_size < self.negative_sample_size:
             negative_sample = np.random.randint(self.nentity, size=self.negative_sample_size*2)
             if self.mode == 'head-batch':
-                mask = np.in1d(
+                mask = np.isin(
                     negative_sample, 
                     self.true_head[(relation, tail)], 
-                    assume_unique=True, 
                     invert=True
                 )
             elif self.mode == 'tail-batch':
-                mask = np.in1d(
+                mask = np.isin(
                     negative_sample, 
                     self.true_tail[(head, relation)], 
-                    assume_unique=True, 
                     invert=True
                 )
             else:

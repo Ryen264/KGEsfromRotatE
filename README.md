@@ -6,11 +6,7 @@ A clone of RotatE's repo to test its KGEs. Thanks RotatE and its 'parents'.
 **Implemented features**
 
 Models:
- - [x] RotatE
- - [x] pRotatE
- - [x] TransE
  - [x] ComplEx
- - [x] DistMult
 
 Evaluation Metrics:
 
@@ -31,6 +27,27 @@ Knowledge Graph Data:
  - *valid.txt*: create a blank file if no validation data is available
  - *test.txt*: the KGE model is evaluated on this data set
 
+**Setup**
+
+1. Create a virtual environment and activate
+```
+python -m venv .venv
+```
+
+2. Activate venv
+```
+# Linux/macOS
+source .venv/bin/activate
+
+# Windows (PowerShell)
+.venv\Scripts\activate
+```
+
+3. Install dependencies
+```
+pip install -r requirements.txt
+```
+
 **Train**
 
 For example, this command train a RotatE model on FB15k dataset with GPU 0.
@@ -43,7 +60,7 @@ CUDA_VISIBLE_DEVICES=0 python -u codes/run.py --do_train \
  --model RotatE \
  -n 256 -b 1024 -d 1000 \
  -g 24.0 -a 1.0 -adv \
- -lr 0.0001 --max_steps 150000 \
+ -lr 0.0001 --epochs 159 \
  -save models/RotatE_FB15k_0 --test_batch_size 16 -de
 ```
    Check argparse configuration at codes/run.py for more arguments and more details.
@@ -58,26 +75,7 @@ To reprocude the results in the ICLR 2019 paper [RotatE: Knowledge Graph Embeddi
 
 The run.sh script provides an easy way to search hyper-parameters:
 
-    bash run.sh train RotatE FB15k 0 0 1024 256 1000 24.0 1.0 0.0001 200000 16 -de
-
-**Speed**
-
-The KGE models usually take about half an hour to run 10000 steps on a single GeForce GTX 1080 Ti GPU with default configuration. And these models need different max_steps to converge on different data sets:
-
-| Dataset | FB15k | FB15k-237 | wn18 | wn18rr | Countries S* |
-|-------------|-------------|-------------|-------------|-------------|-------------|
-|MAX_STEPS| 150000 | 100000 | 80000 | 80000 | 40000 | 
-|TIME| 9 h | 6 h | 4 h | 4 h | 2 h | 
-
-**Results of the RotatE model**
-
-| Dataset | FB15k | FB15k-237 | wn18 | wn18rr |
-|-------------|-------------|-------------|-------------|-------------|
-| MRR | .797 ± .001 | .337 ± .001 | .949 ± .000 |.477 ± .001
-| MR | 40 | 177 | 309 | 3340 |
-| HITS@1 | .746 | .241 | .944 | .428 |
-| HITS@3 | .830 | .375 | .952 | .492 |
-| HITS@10 | .884 | .533 | .959 | .571 |
+    bash run.sh train RotatE FB15k 0 0 1024 256 1000 24.0 1.0 0.0001 212 16 -de
 
 **Using the library**
 

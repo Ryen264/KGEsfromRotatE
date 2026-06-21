@@ -18,6 +18,10 @@ from model import KGEModel
 from dataloader import TrainDataset
 from dataloader import BidirectionalOneShotIterator
 
+def steps_per_epoch(num_train_triples, batch_size):
+    batches = (num_train_triples + batch_size - 1) // batch_size
+    return 2 * batches
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser(
         description='Training and Testing Knowledge Graph Embedding Models',
@@ -41,13 +45,15 @@ def parse_args(args=None):
     parser.add_argument('-dr', '--double_relation_embedding', action='store_true')
     
     parser.add_argument('-n', '--negative_sample_size', default=128, type=int)
-    parser.add_argument('-d', '--hidden_dim', default=500, type=int)
+    parser.add_argument('-d', '--dim', default=500, type=int)
     parser.add_argument('-g', '--gamma', default=12.0, type=float)
     parser.add_argument('-adv', '--negative_adversarial_sampling', action='store_true')
     parser.add_argument('-a', '--adversarial_temperature', default=1.0, type=float)
     parser.add_argument('-b', '--batch_size', default=1024, type=int)
-    parser.add_argument('-r', '--regularization', default=0.0, type=float)
-    parser.add_argument('-rp', '--regularization_power', default=3, type=int)
+    parser.add_argument('-r', '--regularization_coeff', default=0.0, type=float,
+                        help='Lp embedding regularization coefficient')
+    parser.add_argument('-rp', '--regularization_p', default=3, type=int,
+                        help='Lp norm order for embedding regularization')
     parser.add_argument('--test_batch_size', default=4, type=int, help='valid/test batch size')
     parser.add_argument('--uni_weight', action='store_true', 
                         help='Otherwise use subsampling weighting like in word2vec')
@@ -56,13 +62,19 @@ def parse_args(args=None):
     parser.add_argument('-cpu', '--cpu_num', default=10, type=int)
     parser.add_argument('-init', '--init_checkpoint', default=None, type=str)
     parser.add_argument('-save', '--save_path', default=None, type=str)
-    parser.add_argument('--max_steps', default=100000, type=int)
-    parser.add_argument('--warm_up_steps', default=None, type=int)
+    parser.add_argument('--epochs', default=100, type=int,
+                        help='Number of training epochs (full head+tail passes over train triples)')
+    parser.add_argument('--warm_up_epochs', default=None, type=int,
+                        help='Epochs before first learning-rate decay (default: epochs // 2)')
     
     parser.add_argument('--save_checkpoint_steps', default=10000, type=int)
     parser.add_argument('--valid_steps', default=10000, type=int)
     parser.add_argument('--log_steps', default=100, type=int, help='train log every xx steps')
     parser.add_argument('--test_log_steps', default=1000, type=int, help='valid/test log every xx steps')
+    
+    parser.add_argument('--loss', default='self_adv', type=str,
+                        choices=['self_adv', 'ce', 'mr', 'bce', 'au'],
+                        help='Training loss (see codes/loss.py)')
     
     parser.add_argument('--nentity', type=int, default=0, help='DO NOT MANUALLY SET')
     parser.add_argument('--nrelation', type=int, default=0, help='DO NOT MANUALLY SET')
@@ -83,7 +95,7 @@ def override_config(args):
     args.model = argparse_dict['model']
     args.double_entity_embedding = argparse_dict['double_entity_embedding']
     args.double_relation_embedding = argparse_dict['double_relation_embedding']
-    args.hidden_dim = argparse_dict['hidden_dim']
+    args.dim = argparse_dict['dim']
     args.test_batch_size = argparse_dict['test_batch_size']
     
 def save_model(model, optimizer, save_variable_list, args):
@@ -213,6 +225,9 @@ def main(args):
     logging.info('#valid: %d' % len(valid_triples))
     test_triples = read_triple(os.path.join(args.data_path, 'test.txt'), entity2id, relation2id)
     logging.info('#test: %d' % len(test_triples))
+
+    steps_per_epoch_val = steps_per_epoch(len(train_triples), args.batch_size)
+    max_steps_internal = args.epochs * steps_per_epoch_val
     
     #All true triples
     all_true_triples = train_triples + valid_triples + test_triples
@@ -221,7 +236,7 @@ def main(args):
         model_name=args.model,
         nentity=nentity,
         nrelation=nrelation,
-        hidden_dim=args.hidden_dim,
+        dim=args.dim,
         gamma=args.gamma,
         double_entity_embedding=args.double_entity_embedding,
         double_relation_embedding=args.double_relation_embedding
@@ -260,10 +275,10 @@ def main(args):
             filter(lambda p: p.requires_grad, kge_model.parameters()), 
             lr=current_learning_rate
         )
-        if args.warm_up_steps:
-            warm_up_steps = args.warm_up_steps
-        else:
-            warm_up_steps = args.max_steps // 2
+        warm_up_epochs_val = (
+            args.warm_up_epochs if args.warm_up_epochs is not None else args.epochs // 2
+        )
+        warm_up_steps_internal = warm_up_epochs_val * steps_per_epoch_val
 
     if args.init_checkpoint:
         # Restore model from checkpoint directory
@@ -273,7 +288,12 @@ def main(args):
         kge_model.load_state_dict(checkpoint['model_state_dict'])
         if args.do_train:
             current_learning_rate = checkpoint['current_learning_rate']
-            warm_up_steps = checkpoint['warm_up_steps']
+            if 'warm_up_epochs' in checkpoint:
+                warm_up_epochs_val = checkpoint['warm_up_epochs']
+                warm_up_steps_internal = warm_up_epochs_val * steps_per_epoch_val
+            elif 'warm_up_steps' in checkpoint:
+                warm_up_steps_internal = checkpoint['warm_up_steps']
+                warm_up_epochs_val = warm_up_steps_internal // steps_per_epoch_val
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     else:
         logging.info('Ramdomly Initializing %s Model...' % args.model)
@@ -283,9 +303,11 @@ def main(args):
     
     logging.info('Start Training...')
     logging.info('init_step = %d' % init_step)
+    logging.info('epochs = %d' % args.epochs)
+    logging.info('steps_per_epoch = %d' % steps_per_epoch_val)
     logging.info('batch_size = %d' % args.batch_size)
     logging.info('negative_adversarial_sampling = %d' % args.negative_adversarial_sampling)
-    logging.info('hidden_dim = %d' % args.hidden_dim)
+    logging.info('dim = %d' % args.dim)
     logging.info('gamma = %f' % args.gamma)
     logging.info('negative_adversarial_sampling = %s' % str(args.negative_adversarial_sampling))
     if args.negative_adversarial_sampling:
@@ -299,26 +321,27 @@ def main(args):
         training_logs = []
         
         #Training Loop
-        for step in range(init_step, args.max_steps):
+        for step in range(init_step, max_steps_internal):
             
             log = kge_model.train_step(kge_model, optimizer, train_iterator, args)
             
             training_logs.append(log)
             
-            if step >= warm_up_steps:
+            if step >= warm_up_steps_internal:
                 current_learning_rate = current_learning_rate / 10
                 logging.info('Change learning_rate to %f at step %d' % (current_learning_rate, step))
                 optimizer = torch.optim.Adam(
                     filter(lambda p: p.requires_grad, kge_model.parameters()), 
                     lr=current_learning_rate
                 )
-                warm_up_steps = warm_up_steps * 3
+                warm_up_steps_internal = warm_up_steps_internal * 3
+                warm_up_epochs_val = warm_up_epochs_val * 3
             
             if step % args.save_checkpoint_steps == 0:
                 save_variable_list = {
                     'step': step, 
                     'current_learning_rate': current_learning_rate,
-                    'warm_up_steps': warm_up_steps
+                    'warm_up_epochs': warm_up_epochs_val
                 }
                 save_model(kge_model, optimizer, save_variable_list, args)
                 
@@ -337,7 +360,7 @@ def main(args):
         save_variable_list = {
             'step': step, 
             'current_learning_rate': current_learning_rate,
-            'warm_up_steps': warm_up_steps
+            'warm_up_epochs': warm_up_epochs_val
         }
         save_model(kge_model, optimizer, save_variable_list, args)
         

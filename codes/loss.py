@@ -20,6 +20,14 @@ def regularization(model, coeff, p):
     return regularization_term, {'regularization': regularization_term.item()}
 
 
+def weighted_mean(loss, subsampling_weight, uni_weight):
+    if uni_weight:
+        return loss.mean()
+    weight = subsampling_weight.view(-1)
+    loss = loss.view(-1)
+    return (weight * loss).sum() / weight.sum()
+
+
 class KGELoss:
     def __init__(self, args):
         self.args = args
@@ -62,7 +70,7 @@ class SelfAdversarialNegativeSamplingLoss(KGELoss):
         loss = (positive_sample_loss_val + negative_sample_loss_val) / 2
 
         regularization_term, regularization_log = regularization(
-            model, self.args.regularization, p=self.args.regularization_power
+            model, self.args.regularization_coeff, p=self.args.regularization_p
         )
         if regularization_term is not None:
             loss = loss + regularization_term
@@ -79,13 +87,21 @@ class SelfAdversarialNegativeSamplingLoss(KGELoss):
 class CrossEntropyLoss(KGELoss):
     '''
     Cross-entropy loss - a listwise cross-entropy loss
-    L = cross_entropy(positive_score) + regularization
+    L = cross_entropy([positive_score; negative_scores], target=0) + regularization
     '''
-    
+
+    def _weighted_mean(self, loss, subsampling_weight):
+        return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
+
     def __call__(self, positive_score, negative_score, subsampling_weight, model):
-        loss = F.cross_entropy(positive_score, negative_score)
+        scores = torch.cat([positive_score, negative_score], dim=1)
+        target = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
+        loss = self._weighted_mean(
+            F.cross_entropy(scores, target, reduction='none'),
+            subsampling_weight,
+        )
         regularization_term, regularization_log = regularization(
-            model, self.args.regularization, p=self.args.regularization_power
+            model, self.args.regularization_coeff, p=self.args.regularization_p
         )
         if regularization_term is not None:
             loss = loss + regularization_term
@@ -101,11 +117,20 @@ class MarginRankingLoss(KGELoss):
     Margin ranking loss - a pairwise margin-based ranking loss
     L = max(0, margin - positive_score + negative_score) + regularization
     '''
-    
+
+    def _weighted_mean(self, loss, subsampling_weight):
+        return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
+
     def __call__(self, positive_score, negative_score, subsampling_weight, model):
-        loss = F.margin_ranking_loss(positive_score, negative_score, margin=self.args.gamma)
+        positive_expanded = positive_score.expand_as(negative_score)
+        target = torch.ones_like(negative_score)
+        per_sample_loss = F.margin_ranking_loss(
+            positive_expanded, negative_score, target,
+            margin=self.args.gamma, reduction='none',
+        ).mean(dim=1)
+        loss = self._weighted_mean(per_sample_loss, subsampling_weight)
         regularization_term, regularization_log = regularization(
-            model, self.args.regularization, p=self.args.regularization_power
+            model, self.args.regularization_coeff, p=self.args.regularization_p
         )
         if regularization_term is not None:
             loss = loss + regularization_term
@@ -118,15 +143,28 @@ class MarginRankingLoss(KGELoss):
 
 class BinaryCrossEntropyLoss(KGELoss):
     '''
-    Binary cross-entropy loss - a binary cross-entropy loss
-    L = binary_cross_entropy(positive_score) + regularization
+    Binary cross-entropy loss - treats positive/negative scores as binary labels
+    L = BCE(sigmoid(positive), 1) + BCE(sigmoid(negative), 0) + regularization
     '''
-    
-    def __call__(self, positive_score, subsampling_weight, model):
-        loss = F.binary_cross_entropy(positive_score, subsampling_weight)
+
+    def _weighted_mean(self, loss, subsampling_weight):
+        return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
+
+    def __call__(self, positive_score, negative_score, subsampling_weight, model):
+        positive_loss = F.binary_cross_entropy_with_logits(
+            positive_score.squeeze(dim=1),
+            torch.ones(positive_score.size(0), device=positive_score.device),
+            reduction='none',
+        )
+        negative_loss = F.binary_cross_entropy_with_logits(
+            negative_score,
+            torch.zeros_like(negative_score),
+            reduction='none',
+        ).mean(dim=1)
+        loss = self._weighted_mean((positive_loss + negative_loss) / 2, subsampling_weight)
 
         regularization_term, regularization_log = regularization(
-            model, self.args.regularization, p=self.args.regularization_power
+            model, self.args.regularization_coeff, p=self.args.regularization_p
         )
         if regularization_term is not None:
             loss = loss + regularization_term
@@ -145,24 +183,20 @@ class AlignmentUniformityLoss(KGELoss):
     @staticmethod
     def uniformity(x, tuni=2):
         x = F.normalize(x, dim=-1)
+        if x.size(0) < 2:
+            return x.new_zeros(())
         return torch.pdist(x, p=2).pow(2).mul(-tuni).exp().mean().log()
 
-    def query_encoder(self, head, relation, model):
-        return model.query_encoder(head, relation)
-
-    def target_encoder(self, tail, model):
-        return model.target_encoder(tail)
-
-    def calculate_loss(self, head, relation, tail, model):
+    def calculate_loss(self, head, relation, tail, model, mode):
         tuni = getattr(self.args, 'tuni', 2)
         gamma_q = getattr(self.args, 'gamma_q', 1.0)
         gamma_t = getattr(self.args, 'gamma_t', 1.0)
 
-        query_e = self.query_encoder(head, relation, model)
-        target_e = self.target_encoder(tail, model)
+        query_e = model.query_encoder(head, relation, tail, mode=mode)
+        target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
         align_loss = self.alignment(query_e, target_e)
 
-        uniform_loss = 0.0
+        uniform_loss = query_e.new_zeros(())
         uniform_count = 0
         if gamma_q > 0:
             uniform_loss = uniform_loss + gamma_q * self.uniformity(query_e, tuni=tuni)
@@ -173,19 +207,34 @@ class AlignmentUniformityLoss(KGELoss):
 
         if uniform_count > 0:
             loss = align_loss + uniform_loss / uniform_count
+            uniform_loss_val = (uniform_loss / uniform_count).item()
         else:
             loss = align_loss
-        return loss
+            uniform_loss_val = 0.0
+
+        regularization_term, regularization_log = regularization(
+            model, self.args.regularization_coeff, p=self.args.regularization_p
+        )
+        if regularization_term is not None:
+            loss = loss + regularization_term
+
+        log = {
+            **regularization_log,
+            'align_loss': align_loss.item(),
+            'uniform_loss': uniform_loss_val,
+            'loss': loss.item(),
+        }
+        return loss, log
 
     def __call__(self, positive_score, negative_score, subsampling_weight, model):
         raise NotImplementedError(
             'AlignmentUniformityLoss requires positive triple embeddings; '
-            'wire train_step to pass head/relation/tail and call calculate_loss.'
+            'use compute_kge_loss with positive_sample and mode.'
         )
 
 
 LOSS_REGISTRY = {
-    'self_adversarial': SelfAdversarialNegativeSamplingLoss,
+    'self_adv': SelfAdversarialNegativeSamplingLoss,
     'ce': CrossEntropyLoss,
     'mr': MarginRankingLoss,
     'bce': BinaryCrossEntropyLoss,
@@ -193,10 +242,19 @@ LOSS_REGISTRY = {
 }
 
 def get_loss(args):
-    loss_name = getattr(args, 'loss', 'self_adversarial')
+    loss_name = getattr(args, 'loss', 'self_adv')
     if loss_name not in LOSS_REGISTRY:
         raise ValueError('Unknown loss: {}'.format(loss_name))
     return LOSS_REGISTRY[loss_name](args)
 
-def compute_kge_loss(positive_score, negative_score, subsampling_weight, model, args):
+def compute_kge_loss(positive_score, negative_score, subsampling_weight, model, args,
+                     positive_sample=None, mode=None):
+    loss_name = getattr(args, 'loss', 'self_adv')
+    if loss_name == 'au':
+        if positive_sample is None or mode is None:
+            raise ValueError('AlignmentUniformityLoss requires positive_sample and mode')
+        head = model.entity_embedding[positive_sample[:, 0]]
+        relation = model.relation_embedding[positive_sample[:, 1]]
+        tail = model.entity_embedding[positive_sample[:, 2]]
+        return get_loss(args).calculate_loss(head, relation, tail, model, mode)
     return get_loss(args)(positive_score, negative_score, subsampling_weight, model)
