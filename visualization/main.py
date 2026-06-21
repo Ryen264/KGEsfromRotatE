@@ -118,7 +118,7 @@ def build_model_and_iterator(args, train_triples):
         ),
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=max(1, args.cpu_num // 2),
+        num_workers=4,
         collate_fn=TrainDataset.collate_fn,
     )
     train_dataloader_tail = DataLoader(
@@ -128,7 +128,7 @@ def build_model_and_iterator(args, train_triples):
         ),
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=max(1, args.cpu_num // 2),
+        num_workers=4,
         collate_fn=TrainDataset.collate_fn,
     )
     train_iterator = BidirectionalOneShotIterator(train_dataloader_head, train_dataloader_tail)

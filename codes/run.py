@@ -255,7 +255,7 @@ def main(args):
             TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, 'head-batch'), 
             batch_size=args.batch_size,
             shuffle=True, 
-            num_workers=max(1, args.cpu_num//2),
+            num_workers=4,
             collate_fn=TrainDataset.collate_fn
         )
         
@@ -263,7 +263,7 @@ def main(args):
             TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, 'tail-batch'), 
             batch_size=args.batch_size,
             shuffle=True, 
-            num_workers=max(1, args.cpu_num//2),
+            num_workers=4,
             collate_fn=TrainDataset.collate_fn
         )
         
