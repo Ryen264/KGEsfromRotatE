@@ -17,6 +17,7 @@ from model import KGEModel
 
 from dataloader import TrainDataset
 from dataloader import BidirectionalOneShotIterator
+from loss import AUGammaController, build_training_optimizer, is_learnable_au_gammas, set_optimizer_learning_rates, update_au_gamma_schedule
 
 def steps_per_epoch(num_train_triples, batch_size):
     batches = (num_train_triples + batch_size - 1) // batch_size
@@ -77,6 +78,33 @@ def parse_args(args=None):
                         help='Training loss (see codes/loss.py)')
     parser.add_argument('--infonce_temperature', default=1.0, type=float,
                         help='Temperature for InfoNCE loss')
+
+    parser.add_argument('--tuni', default=2, type=float,
+                        help='Uniformity temperature for AU loss')
+    parser.add_argument('--uni-gamma-query', dest='uni_gamma_query', default=1.0, type=float,
+                        help='Initial AU uniformity weight for query embeddings (0=off)')
+    parser.add_argument('--uni-gamma-target', dest='uni_gamma_target', default=1.0, type=float,
+                        help='Initial AU uniformity weight for target embeddings (0=off)')
+    parser.add_argument('--uni-gamma-head', dest='uni_gamma_head', default=0.0, type=float,
+                        help='Initial AU uniformity weight for head entity embeddings (0=off)')
+    parser.add_argument('--uni-gamma-tail', dest='uni_gamma_tail', default=0.0, type=float,
+                        help='Initial AU uniformity weight for tail entity embeddings (0=off)')
+    parser.add_argument('--uni-gamma-entity', dest='uni_gamma_entity', default=0.0, type=float,
+                        help='Initial AU uniformity weight for entity pool (0=off)')
+    parser.add_argument('--uni-gamma-relation', dest='uni_gamma_relation', default=0.0, type=float,
+                        help='Initial AU uniformity weight for relation embeddings (0=off)')
+    parser.add_argument('--learnable_au_gammas', action='store_true',
+                        help='Learn batch-wise AU gamma down-weighting via log_gamma_adj')
+    parser.add_argument('--log_au_gamma_lr', default=None, type=float,
+                        help='LR for learnable AU gammas (default: learning_rate)')
+    parser.add_argument('--gamma_linear_schedule', action='store_true',
+                        help='Linearly anneal AU gamma schedule multiplier over training')
+    parser.add_argument('--gamma_schedule_end', default=0.1, type=float,
+                        help='Final AU gamma schedule multiplier')
+    parser.add_argument('--gamma_schedule_start_epoch', default=0, type=int,
+                        help='Epoch when AU gamma schedule starts')
+    parser.add_argument('--gamma_schedule_epochs', default=0, type=int,
+                        help='AU gamma schedule length (0=full epochs)')
     
     parser.add_argument('--nentity', type=int, default=0, help='DO NOT MANUALLY SET')
     parser.add_argument('--nrelation', type=int, default=0, help='DO NOT MANUALLY SET')
@@ -250,6 +278,9 @@ def main(args):
 
     if args.cuda:
         kge_model = kge_model.cuda()
+
+    if is_learnable_au_gammas(args):
+        AUGammaController(args).ensure_model_params(kge_model)
     
     if args.do_train:
         # Set training dataloader iterator
@@ -273,10 +304,7 @@ def main(args):
         
         # Set training configuration
         current_learning_rate = args.learning_rate
-        optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, kge_model.parameters()), 
-            lr=current_learning_rate
-        )
+        optimizer = build_training_optimizer(kge_model, args)
         warm_up_epochs_val = (
             args.warm_up_epochs if args.warm_up_epochs is not None else args.epochs // 2
         )
@@ -321,9 +349,16 @@ def main(args):
         logging.info('learning_rate = %d' % current_learning_rate)
 
         training_logs = []
+        last_schedule_epoch = None
         
         #Training Loop
         for step in range(init_step, max_steps_internal):
+            if is_learnable_au_gammas(args):
+                current_epoch = step // steps_per_epoch_val + 1
+                if current_epoch != last_schedule_epoch:
+                    args.current_epoch = current_epoch
+                    update_au_gamma_schedule(args)
+                    last_schedule_epoch = current_epoch
             
             log = kge_model.train_step(kge_model, optimizer, train_iterator, args)
             
@@ -332,10 +367,14 @@ def main(args):
             if step >= warm_up_steps_internal:
                 current_learning_rate = current_learning_rate / 10
                 logging.info('Change learning_rate to %f at step %d' % (current_learning_rate, step))
-                optimizer = torch.optim.Adam(
-                    filter(lambda p: p.requires_grad, kge_model.parameters()), 
-                    lr=current_learning_rate
-                )
+                if is_learnable_au_gammas(args) and len(optimizer.param_groups) > 1:
+                    set_optimizer_learning_rates(
+                        optimizer, current_learning_rate,
+                        getattr(args, 'log_au_gamma_lr', None) or current_learning_rate,
+                    )
+                else:
+                    for group in optimizer.param_groups:
+                        group['lr'] = current_learning_rate
                 warm_up_steps_internal = warm_up_steps_internal * 3
                 warm_up_epochs_val = warm_up_epochs_val * 3
             

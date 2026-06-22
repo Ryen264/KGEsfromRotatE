@@ -19,9 +19,20 @@ sys.path.insert(0, os.path.join(ROOT, 'codes'))
 
 import run as train_run
 from dataloader import BidirectionalOneShotIterator, TrainDataset
-from loss import AlignmentUniformityLoss, compute_kge_loss
+from loss import AlignmentUniformityLoss, compute_kge_loss, AUGammaController, build_training_optimizer, is_learnable_au_gammas, update_au_gamma_schedule
 from model import KGEModel
 
+UNIFORM_SET_KEYS = ('query', 'target', 'head', 'tail', 'entity', 'relation')
+DEFAULT_UNIFORM_SETS = ['query', 'target', 'head', 'tail', 'entity', 'relation']
+
+UNIFORM_COLORS = {
+    'query': '#6aa84f',
+    'target': '#38761d',
+    'head': '#93c47d',
+    'tail': '#b6d7a8',
+    'entity': '#274e13',
+    'relation': '#d9ead3',
+}
 
 LOSS_DISPLAY_NAMES = {
     'ce': 'CE',
@@ -152,6 +163,9 @@ def build_model_and_iterator(args, train_triples):
     if args.cuda:
         model = model.cuda()
 
+    if is_learnable_au_gammas(args):
+        AUGammaController(args).ensure_model_params(model)
+
     train_dataloader_head = DataLoader(
         TrainDataset(
             train_triples, args.nentity, args.nrelation,
@@ -173,14 +187,25 @@ def build_model_and_iterator(args, train_triples):
         collate_fn=TrainDataset.collate_fn,
     )
     train_iterator = BidirectionalOneShotIterator(train_dataloader_head, train_dataloader_tail)
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.learning_rate,
-    )
+    optimizer = build_training_optimizer(model, args)
     return model, train_iterator, optimizer
 
 
-def compute_au_metrics(model, positive_sample, mode, args):
+def validate_uniform_sets(uniform_sets):
+    if not uniform_sets:
+        raise ValueError('uniform_sets must be non-empty')
+    allowed = set(UNIFORM_SET_KEYS)
+    unknown = [key for key in uniform_sets if key not in allowed]
+    if unknown:
+        raise ValueError(
+            'Unknown uniform_sets: {}. Allowed: {}'.format(
+                unknown, ', '.join(UNIFORM_SET_KEYS)
+            )
+        )
+    return list(uniform_sets)
+
+
+def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     au = AlignmentUniformityLoss(args)
     head = model.entity_embedding[positive_sample[:, 0]]
     relation = model.relation_embedding[positive_sample[:, 1]]
@@ -190,14 +215,27 @@ def compute_au_metrics(model, positive_sample, mode, args):
     target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
 
     align_loss = au.alignment(query_e, target_e).item()
+    
     tuni = getattr(args, 'tuni', 2)
-    uniform_q = au.uniformity(query_e, tuni=tuni).item()
-    uniform_t = au.uniformity(target_e, tuni=tuni).item()
-    uniform_loss = 0.5 * (uniform_q + uniform_t)
-    return align_loss, uniform_loss
+    uniform_components = {}
+
+    embeddings = {
+        'query': query_e,
+        'target': target_e,
+        'head': head,   # already embedded by entity_embedding
+        'tail': tail,   # already embedded by entity_embedding
+        'entity': torch.cat([head, tail], dim=0),   # already embedded by entity_embedding
+        'relation': relation,   # already embedded by relation_embedding
+    }
+
+    for key in uniform_sets:
+        uniform_components[key] = au.uniformity(embeddings[key], tuni=tuni).item()
+
+    uniform_loss = float(np.mean(list(uniform_components.values())))
+    return align_loss, uniform_components, uniform_loss
 
 
-def train_step_with_metrics(model, optimizer, train_iterator, args):
+def train_step_with_metrics(model, optimizer, train_iterator, args, uniform_sets):
     model.train()
     optimizer.zero_grad()
 
@@ -216,14 +254,20 @@ def train_step_with_metrics(model, optimizer, train_iterator, args):
     loss.backward()
     optimizer.step()
 
-    if getattr(args, 'loss', '') != 'au':
-        align_loss, uniform_loss = compute_au_metrics(model, positive_sample, mode, args)
-        log['align_loss'] = align_loss
-        log['uniform_loss'] = uniform_loss
+    if is_learnable_au_gammas(args):
+        AUGammaController(args).clamp_log_gammas(model)
+
+    align_loss, uniform_components, uniform_loss = compute_au_metrics(
+        model, positive_sample, mode, args, uniform_sets,
+    )
+    log['align_loss'] = align_loss
+    log['uniform_loss'] = uniform_loss
+    log['uniform'] = uniform_components
     return log
 
 
-def train_and_collect_history(args, num_epochs, valid_metric='MRR'):
+def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets=None):
+    uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_SETS)
     train_triples, valid_triples, _, all_true_triples = load_dataset(args)
     model, train_iterator, optimizer = build_model_and_iterator(args, train_triples)
     epoch_steps = train_run.steps_per_epoch(len(train_triples), args.batch_size)
@@ -233,6 +277,7 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR'):
         'epochs': [],
         'align_loss': [],
         'uniform_loss': [],
+        'uniform': {key: [] for key in uniform_sets},
         'loss': [],
         'valid_metric': [],
     }
@@ -244,6 +289,10 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR'):
         dynamic_ncols=True,
     )
     for epoch in epoch_bar:
+        if is_learnable_au_gammas(args):
+            args.current_epoch = epoch
+            update_au_gamma_schedule(args)
+
         batch_logs = []
         step_bar = tqdm(
             range(epoch_steps),
@@ -253,11 +302,17 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR'):
             dynamic_ncols=True,
         )
         for _ in step_bar:
-            batch_logs.append(train_step_with_metrics(model, optimizer, train_iterator, args))
+            batch_logs.append(
+                train_step_with_metrics(model, optimizer, train_iterator, args, uniform_sets)
+            )
 
         history['epochs'].append(epoch)
         history['align_loss'].append(np.mean([log['align_loss'] for log in batch_logs]))
         history['uniform_loss'].append(np.mean([log['uniform_loss'] for log in batch_logs]))
+        for key in uniform_sets:
+            history['uniform'][key].append(
+                np.mean([log['uniform'][key] for log in batch_logs])
+            )
         history['loss'].append(np.mean([log['loss'] for log in batch_logs]))
 
         metrics = KGEModel.test_step(model, valid_triples, all_true_triples, args)
@@ -280,7 +335,10 @@ def _truncate_history(history, display_epochs):
     n = min(display_epochs, len(history['epochs']))
     truncated = {}
     for key, value in history.items():
-        truncated[key] = value[:n]
+        if key == 'uniform':
+            truncated[key] = {k: v[:n] for k, v in value.items()}
+        else:
+            truncated[key] = value[:n]
     return truncated
 
 
@@ -296,21 +354,27 @@ def _place_legend_bottom_right(ax_right, lines):
     )
 
 
-def plot_alignment_uniformity(history, display_epochs, output_path=None):
+def plot_alignment_uniformity(history, display_epochs, uniform_sets, output_path=None):
     history = _truncate_history(history, display_epochs)
     epochs = history['epochs']
 
     fig, ax_left = plt.subplots(figsize=(6, 4))
     ax_right = ax_left.twinx()
 
-    line_align, = ax_left.plot(
+    ax_left.plot(
         epochs, history['align_loss'],
         color='#e69138', linewidth=2, label=r'$l_{align}$'
     )
-    line_uniform, = ax_right.plot(
-        epochs, history['uniform_loss'],
-        color='#6aa84f', linewidth=2, label=r'$l_{uniform}$'
-    )
+
+    uniform_lines = []
+    for key in uniform_sets:
+        color = UNIFORM_COLORS.get(key, '#6aa84f')
+        line, = ax_right.plot(
+            epochs, history['uniform'][key],
+            color=color, linewidth=2,
+            label=r'$l_{uniform}^{' + key + '}$',
+        )
+        uniform_lines.append(line)
 
     ax_left.set_xlabel('training epochs')
     ax_left.set_ylabel('alignment', color='#e69138')
@@ -319,9 +383,8 @@ def plot_alignment_uniformity(history, display_epochs, output_path=None):
     ax_right.tick_params(axis='y', labelcolor='#6aa84f')
     ax_left.set_xlim(min(epochs), max(epochs))
 
-    lines = [line_align, line_uniform]
     fig.tight_layout()
-    _place_legend_bottom_right(ax_right, lines)
+    _place_legend_bottom_right(ax_right, uniform_lines)
 
     if output_path:
         fig.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -368,10 +431,12 @@ def visualize_training(
     gpu=0,
     output_dir=None,
     show=True,
+    uniform_sets=None,
 ):
     config, config_path = load_config(resolve_path(config_path))
     num_epochs = resolve_num_epochs(config, display_epochs)
     args = build_args(config)
+    uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_SETS)
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
 
     print('Config: {}'.format(config_path))
@@ -379,6 +444,7 @@ def visualize_training(
         config.get('model'), getattr(args, 'loss', 'self_adv'), config.get('data_path')
     ))
     print('Training for {} epochs (displaying first {})'.format(num_epochs, display_epochs))
+    print('Uniform sets: {}'.format(', '.join(uniform_sets)))
 
     if output_dir is None:
         output_dir = build_output_dir(config_path)
@@ -387,7 +453,9 @@ def visualize_training(
     os.makedirs(output_dir, exist_ok=True)
     print('Output dir: {}'.format(output_dir))
 
-    history = train_and_collect_history(args, num_epochs, valid_metric=valid_metric)
+    history = train_and_collect_history(
+        args, num_epochs, valid_metric=valid_metric, uniform_sets=uniform_sets,
+    )
 
     loss_label = {
         'ce': 'CE loss',
@@ -403,6 +471,7 @@ def visualize_training(
     fig_au = plot_alignment_uniformity(
         history,
         display_epochs,
+        uniform_sets,
         output_path=os.path.join(output_dir, 'alignment_uniformity.png'),
     )
     fig_curve = plot_loss_and_metric(
@@ -440,6 +509,11 @@ def parse_cli():
         help='Directory to save PNG figures (default: visualization/outputs/<config_path>_<timestamp>)',
     )
     parser.add_argument('--no-show', action='store_true', help='Save figures without opening a window')
+    parser.add_argument(
+        '--uniform-sets', nargs='+', default=None,
+        choices=list(UNIFORM_SET_KEYS),
+        help='Uniformity embedding pools to track and plot (default: query target)',
+    )
     return parser.parse_args()
 
 
@@ -453,6 +527,7 @@ def main():
         gpu=cli.gpu,
         output_dir=resolve_path(cli.output_dir) if cli.output_dir else None,
         show=not cli.no_show,
+        uniform_sets=cli.uniform_sets,
     )
 
 

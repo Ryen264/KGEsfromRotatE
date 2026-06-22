@@ -3,6 +3,7 @@ from __future__ import division
 from __future__ import print_function
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -259,6 +260,133 @@ class InfoNCELoss(KGELoss):
         return loss, log
 
 
+AU_UNIFORM_TERMS = [
+    ('query', 'uni_gamma_query'),
+    ('target', 'uni_gamma_target'),
+    ('head', 'uni_gamma_head'),
+    ('tail', 'uni_gamma_tail'),
+    ('entity', 'uni_gamma_entity'),
+    ('relation', 'uni_gamma_relation'),
+]
+
+AU_GAMMA_KEY_BY_TERM = {term_key: gamma_key for term_key, gamma_key in AU_UNIFORM_TERMS}
+
+
+def is_learnable_au_gammas(args):
+    return getattr(args, 'loss', '') == 'au' and getattr(args, 'learnable_au_gammas', False)
+
+
+def get_au_uniform_embeddings(head, relation, tail, query_e, target_e, term_key):
+    if term_key == 'query':
+        return query_e
+    if term_key == 'target':
+        return target_e
+    if term_key == 'head':
+        return head
+    if term_key == 'tail':
+        return tail
+    if term_key == 'entity':
+        return torch.cat([head, tail], dim=0)
+    if term_key == 'relation':
+        return relation
+    raise ValueError('Unknown AU uniform term key: {}'.format(term_key))
+
+
+class AUGammaController(object):
+    def __init__(self, args):
+        self.args = args
+
+    def active_terms(self):
+        active = []
+        for term_key, gamma_key in AU_UNIFORM_TERMS:
+            if getattr(self.args, gamma_key, 0.0) > 0:
+                active.append(term_key)
+        return active
+
+    def gamma_init(self, term_key):
+        gamma_key = AU_GAMMA_KEY_BY_TERM[term_key]
+        return getattr(self.args, gamma_key, 0.0)
+
+    def schedule_mult(self, epoch):
+        if not getattr(self.args, 'gamma_linear_schedule', False):
+            return 1.0
+        start_epoch = getattr(self.args, 'gamma_schedule_start_epoch', 0)
+        span = getattr(self.args, 'gamma_schedule_epochs', 0) or getattr(self.args, 'epochs', 1)
+        if span <= 0:
+            return 1.0
+        progress = float(epoch - start_epoch) / float(span)
+        progress = max(0.0, min(1.0, progress))
+        end_mult = getattr(self.args, 'gamma_schedule_end', 0.1)
+        return 1.0 + progress * (end_mult - 1.0)
+
+    def effective_gamma(self, model, term_key, epoch):
+        gamma_init = self.gamma_init(term_key)
+        schedule = self.schedule_mult(epoch)
+        log_adj = torch.clamp(model.au_log_gamma_adj[term_key], max=0.0)
+        return gamma_init * schedule * torch.exp(log_adj)
+
+    def ensure_model_params(self, model):
+        active = self.active_terms()
+        if not active:
+            return
+        device = model.entity_embedding.device
+        model.au_log_gamma_adj = nn.ParameterDict({
+            term_key: nn.Parameter(torch.zeros((), device=device))
+            for term_key in active
+        })
+
+    def clamp_log_gammas(self, model):
+        for param in model.au_log_gamma_adj.parameters():
+            param.data.clamp_(max=0.0)
+
+    def log_effective_gammas(self, model, epoch):
+        log = {}
+        for term_key in self.active_terms():
+            eff = self.effective_gamma(model, term_key, epoch)
+            if isinstance(eff, torch.Tensor):
+                log['uni_gamma_eff_{}'.format(term_key)] = eff.item()
+            else:
+                log['uni_gamma_eff_{}'.format(term_key)] = float(eff)
+        return log
+
+
+def update_au_gamma_schedule(args):
+    if not is_learnable_au_gammas(args):
+        return 1.0
+    controller = AUGammaController(args)
+    epoch = getattr(args, 'current_epoch', 0)
+    args.au_schedule_mult = controller.schedule_mult(epoch)
+    return args.au_schedule_mult
+
+
+def build_training_optimizer(model, args):
+    lr = args.learning_rate
+    if not is_learnable_au_gammas(args):
+        return torch.optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=lr,
+        )
+
+    gamma_lr = getattr(args, 'log_au_gamma_lr', None) or lr
+    embedding_params = []
+    gamma_params = []
+    for name, param in model.named_parameters():
+        if name.startswith('au_log_gamma_adj.'):
+            gamma_params.append(param)
+        else:
+            embedding_params.append(param)
+    param_groups = [{'params': embedding_params, 'lr': lr}]
+    if gamma_params:
+        param_groups.append({'params': gamma_params, 'lr': gamma_lr})
+    return torch.optim.Adam(param_groups)
+
+
+def set_optimizer_learning_rates(optimizer, lr, gamma_lr=None):
+    optimizer.param_groups[0]['lr'] = lr
+    if len(optimizer.param_groups) > 1:
+        optimizer.param_groups[1]['lr'] = gamma_lr if gamma_lr is not None else lr
+
+
 class AlignmentUniformityLoss(KGELoss):
     @staticmethod
     def alignment(x, y):
@@ -272,27 +400,56 @@ class AlignmentUniformityLoss(KGELoss):
             return x.new_zeros(())
         return torch.pdist(x, p=2).pow(2).mul(-tuni).exp().mean().log()
 
+    def _compute_uniform_terms(self, head, relation, tail, query_e, target_e, model, tuni):
+        uniform_loss_sum = query_e.new_zeros(())
+        uniform_count = 0
+        uniform_log = {}
+
+        if is_learnable_au_gammas(self.args):
+            controller = AUGammaController(self.args)
+            epoch = getattr(self.args, 'current_epoch', 0)
+            for term_key, gamma_key in AU_UNIFORM_TERMS:
+                gamma_init = getattr(self.args, gamma_key, 0.0)
+                if gamma_init <= 0:
+                    continue
+                embeddings = get_au_uniform_embeddings(
+                    head, relation, tail, query_e, target_e, term_key,
+                )
+                uniform_val = self.uniformity(embeddings, tuni=tuni)
+                gamma_eff = controller.effective_gamma(model, term_key, epoch)
+                uniform_loss_sum = uniform_loss_sum + gamma_eff * uniform_val
+                uniform_count += 1
+                uniform_log['uniform_{}'.format(term_key)] = uniform_val.item()
+                uniform_log['uni_gamma_eff_{}'.format(term_key)] = gamma_eff.item()
+        else:
+            for term_key, gamma_key in AU_UNIFORM_TERMS:
+                gamma_init = getattr(self.args, gamma_key, 0.0)
+                if gamma_init <= 0:
+                    continue
+                embeddings = get_au_uniform_embeddings(
+                    head, relation, tail, query_e, target_e, term_key,
+                )
+                uniform_val = self.uniformity(embeddings, tuni=tuni)
+                uniform_loss_sum = uniform_loss_sum + gamma_init * uniform_val
+                uniform_count += 1
+                uniform_log['uniform_{}'.format(term_key)] = uniform_val.item()
+
+        return uniform_loss_sum, uniform_count, uniform_log
+
     def calculate_loss(self, head, relation, tail, model, mode):
         tuni = getattr(self.args, 'tuni', 2)
-        gamma_q = getattr(self.args, 'gamma_q', 1.0)
-        gamma_t = getattr(self.args, 'gamma_t', 1.0)
 
         query_e = model.query_encoder(head, relation, tail, mode=mode)
         target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
         align_loss = self.alignment(query_e, target_e)
 
-        uniform_loss = query_e.new_zeros(())
-        uniform_count = 0
-        if gamma_q > 0:
-            uniform_loss = uniform_loss + gamma_q * self.uniformity(query_e, tuni=tuni)
-            uniform_count += 1
-        if gamma_t > 0:
-            uniform_loss = uniform_loss + gamma_t * self.uniformity(target_e, tuni=tuni)
-            uniform_count += 1
+        uniform_loss_sum, uniform_count, uniform_log = self._compute_uniform_terms(
+            head, relation, tail, query_e, target_e, model, tuni,
+        )
 
         if uniform_count > 0:
-            loss = align_loss + uniform_loss / uniform_count
-            uniform_loss_val = (uniform_loss / uniform_count).item()
+            loss = align_loss + uniform_loss_sum / uniform_count
+            uniform_loss_val = (uniform_loss_sum / uniform_count).item()
         else:
             loss = align_loss
             uniform_loss_val = 0.0
@@ -305,6 +462,7 @@ class AlignmentUniformityLoss(KGELoss):
 
         log = {
             **regularization_log,
+            **uniform_log,
             'align_loss': align_loss.item(),
             'uniform_loss': uniform_loss_val,
             'loss': loss.item(),

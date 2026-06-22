@@ -14,7 +14,7 @@ from sklearn.metrics import average_precision_score
 from torch.utils.data import DataLoader
 
 from dataloader import TestDataset
-from loss import compute_kge_loss
+from loss import compute_kge_loss, AUGammaController, is_learnable_au_gammas
 
 
 class BaseKGE(object):
@@ -247,6 +247,9 @@ class KGEModel(nn.Module):
         loss.backward()
 
         optimizer.step()
+
+        if is_learnable_au_gammas(args):
+            AUGammaController(args).clamp_log_gammas(model)
 
         return log
     
