@@ -6,8 +6,6 @@
   "batch_size": 512,
   "negative_sample_size": 1024,
   "gamma": 200.0,
-  "adversarial_temperature": 1.0,
-  "negative_adversarial_sampling": true,
   "learning_rate": 0.002,
   "epochs": 400,
   "test_batch_size": 8,

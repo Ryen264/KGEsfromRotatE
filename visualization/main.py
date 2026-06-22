@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -58,6 +59,18 @@ def resolve_path(path):
     if path is None or os.path.isabs(path):
         return path
     return os.path.join(ROOT, path)
+
+
+def build_output_dir(config_path):
+    config_path = resolve_path(config_path)
+    try:
+        config_rel = os.path.relpath(config_path, ROOT)
+    except ValueError:
+        config_rel = config_path
+    config_slug = config_rel.replace(os.sep, '_')
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    folder_name = '{}_{}'.format(config_slug, timestamp)
+    return os.path.join(ROOT, 'visualization', 'outputs', folder_name)
 
 
 def default_save_path(config, save_id=0):
@@ -268,6 +281,18 @@ def _truncate_history(history, display_epochs):
     return truncated
 
 
+def _place_legend_bottom_right(ax_right, lines):
+    ax_right.legend(
+        lines,
+        [line.get_label() for line in lines],
+        loc='lower right',
+        bbox_to_anchor=(1.0, 0.0),
+        bbox_transform=ax_right.transAxes,
+        frameon=True,
+        framealpha=0.95,
+    )
+
+
 def plot_alignment_uniformity(history, display_epochs, output_path=None):
     history = _truncate_history(history, display_epochs)
     epochs = history['epochs']
@@ -292,8 +317,8 @@ def plot_alignment_uniformity(history, display_epochs, output_path=None):
     ax_left.set_xlim(min(epochs), max(epochs))
 
     lines = [line_align, line_uniform]
-    ax_left.legend(lines, [line.get_label() for line in lines], loc='upper right')
     fig.tight_layout()
+    _place_legend_bottom_right(ax_right, lines)
 
     if output_path:
         fig.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -325,8 +350,8 @@ def plot_loss_and_metric(history, valid_metric, display_epochs, loss_label='loss
     ax_left.set_xlim(min(epochs), max(epochs))
 
     lines = [line_loss, line_metric]
-    ax_left.legend(lines, [line.get_label() for line in lines], loc='center right')
     fig.tight_layout()
+    _place_legend_bottom_right(ax_right, lines)
 
     if output_path:
         fig.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -352,11 +377,14 @@ def visualize_training(
     ))
     print('Training for {} epochs (displaying first {})'.format(num_epochs, display_epochs))
 
-    history = train_and_collect_history(args, num_epochs, valid_metric=valid_metric)
-
     if output_dir is None:
-        output_dir = os.path.join(ROOT, 'visualization', 'outputs')
+        output_dir = build_output_dir(config_path)
+    else:
+        output_dir = resolve_path(output_dir)
     os.makedirs(output_dir, exist_ok=True)
+    print('Output dir: {}'.format(output_dir))
+
+    history = train_and_collect_history(args, num_epochs, valid_metric=valid_metric)
 
     loss_label = {
         'ce': 'CE loss',
@@ -403,7 +431,7 @@ def parse_cli():
     parser.add_argument('--gpu', type=int, default=1, help='GPU device id')
     parser.add_argument(
         '--output-dir', default=None,
-        help='Directory to save PNG figures (default: visualization/outputs)',
+        help='Directory to save PNG figures (default: visualization/outputs/<config_path>_<timestamp>)',
     )
     parser.add_argument('--no-show', action='store_true', help='Save figures without opening a window')
     return parser.parse_args()

@@ -15,6 +15,9 @@ checkpoint
 *.npy
 *.log
 visualization/outputs/
+nohup/logs/*.log
+nohup/job.pid
+nohup/job.meta
 
 # IDE / editor
 .cursor/
