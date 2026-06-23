@@ -9,12 +9,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from sklearn.metrics import average_precision_score
-
 from torch.utils.data import DataLoader
 
 from dataloader import TestDataset
 from loss import compute_kge_loss, UniGammaController, is_learnable_au_gammas
+from metrics.classification import classification_metrics
+from metrics.ranking import ranks_from_score_matrix, rotate_ranking_metrics_from_ranks
 
 
 class BaseKGE(object):
@@ -280,10 +280,12 @@ class KGEModel(nn.Module):
 
             y_true = np.array(y_true)
 
-            #average_precision_score is the same as auc_pr
-            auc_pr = average_precision_score(y_true, y_score)
-
-            metrics = {'auc_pr': auc_pr}
+            cls_metrics = classification_metrics(
+                y_true,
+                (y_score > 0).astype(int),
+                y_prob=y_score,
+            )
+            metrics = {'auc_pr': cls_metrics['pr_auc']}
             
         else:
             #Otherwise use standard (filtered) MRR, MR, HITS@1, HITS@3, and HITS@10 metrics
@@ -315,8 +317,8 @@ class KGEModel(nn.Module):
             )
             
             test_dataset_list = [test_dataloader_head, test_dataloader_tail]
-            
-            logs = []
+
+            ranks = []
 
             step = 0
             total_steps = sum([len(dataset) for dataset in test_dataset_list])
@@ -329,13 +331,8 @@ class KGEModel(nn.Module):
                             negative_sample = negative_sample.cuda()
                             filter_bias = filter_bias.cuda()
 
-                        batch_size = positive_sample.size(0)
-
                         score = model((positive_sample, negative_sample), mode)
                         score += filter_bias
-
-                        #Explicitly sort all the entities to ensure that there is no test exposure bias
-                        argsort = torch.argsort(score, dim = 1, descending=True)
 
                         if mode == 'head-batch':
                             positive_arg = positive_sample[:, 0]
@@ -344,28 +341,13 @@ class KGEModel(nn.Module):
                         else:
                             raise ValueError('mode %s not supported' % mode)
 
-                        for i in range(batch_size):
-                            #Notice that argsort is not ranking
-                            ranking = (argsort[i, :] == positive_arg[i]).nonzero()
-                            assert ranking.size(0) == 1
-
-                            #ranking + 1 is the true ranking used in evaluation metrics
-                            ranking = 1 + ranking.item()
-                            logs.append({
-                                'MRR': 1.0/ranking,
-                                'MR': float(ranking),
-                                'HITS@1': 1.0 if ranking <= 1 else 0.0,
-                                'HITS@3': 1.0 if ranking <= 3 else 0.0,
-                                'HITS@10': 1.0 if ranking <= 10 else 0.0,
-                            })
+                        ranks.extend(ranks_from_score_matrix(score, positive_arg))
 
                         if step % args.test_log_steps == 0:
                             logging.info('Evaluating the model... (%d/%d)' % (step, total_steps))
 
                         step += 1
 
-            metrics = {}
-            for metric in logs[0].keys():
-                metrics[metric] = sum([log[metric] for log in logs])/len(logs)
+            metrics = rotate_ranking_metrics_from_ranks(ranks)
 
         return metrics

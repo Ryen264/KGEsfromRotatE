@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime
 
 import matplotlib.pyplot as plt
@@ -20,6 +21,7 @@ sys.path.insert(0, os.path.join(ROOT, 'codes'))
 import run as train_run
 from dataloader import BidirectionalOneShotIterator, TrainDataset
 from loss import AlignmentUniformityLoss, compute_kge_loss, UniGammaController, build_training_optimizer, is_learnable_au_gammas, update_au_gamma_schedule
+from metrics.classification import classification_metrics_from_probs
 from model import KGEModel
 
 UNIFORM_SET_KEYS = ('query', 'target', 'head', 'tail', 'entity', 'relation')
@@ -44,6 +46,120 @@ LOSS_DISPLAY_NAMES = {
     'self_adv': 'SA',
     'au': 'AU',
 }
+
+
+def format_duration(seconds):
+    seconds = max(0.0, float(seconds))
+    hours, rem = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return '{}h {}m {}s'.format(hours, minutes, secs)
+    if minutes:
+        return '{}m {}s'.format(minutes, secs)
+    return '{:.2f}s'.format(seconds)
+
+
+def format_metric_value(value, digits=4):
+    if value is None:
+        return 'N/A'
+    return '{:.{}f}'.format(float(value), digits)
+
+
+def find_best_valid(history, valid_metric='MRR'):
+    metric_values = [metrics[valid_metric] for metrics in history['valid_metric']]
+    best_idx = int(np.argmax(metric_values))
+    return history['epochs'][best_idx], metric_values[best_idx]
+
+
+def evaluate_triple_classification(model, test_triples, args):
+    model.eval()
+    sample = []
+    y_true = []
+    for head, relation, tail in test_triples:
+        for candidate_region in args.regions:
+            y_true.append(1 if candidate_region == tail else 0)
+            sample.append((head, relation, candidate_region))
+
+    sample = torch.LongTensor(sample)
+    if args.cuda:
+        sample = sample.cuda()
+
+    with torch.no_grad():
+        y_score = model(sample).squeeze(1).cpu().numpy()
+
+    return classification_metrics_from_probs(np.array(y_true), y_score)
+
+
+def build_results_report(
+    num_epochs,
+    valid_metric,
+    link_metrics,
+    classification_metrics_dict,
+    best_epoch,
+    best_valid_value,
+    timing,
+):
+    lines = [
+        '(Link Prediction metrics)',
+        'MR: {}'.format(format_metric_value(link_metrics.get('MR') if link_metrics else None)),
+        'MRR: {}'.format(format_metric_value(link_metrics.get('MRR') if link_metrics else None)),
+        'Hit@1: {}'.format(format_metric_value(link_metrics.get('HITS@1') if link_metrics else None)),
+        'Hit@3: {}'.format(format_metric_value(link_metrics.get('HITS@3') if link_metrics else None)),
+        'Hit@10: {}'.format(format_metric_value(link_metrics.get('HITS@10') if link_metrics else None)),
+        '',
+        '(Triple Classification)',
+        'Acc: {}'.format(format_metric_value(
+            classification_metrics_dict.get('accuracy') if classification_metrics_dict else None
+        )),
+        'Prec: {}'.format(format_metric_value(
+            classification_metrics_dict.get('precision') if classification_metrics_dict else None
+        )),
+        'Rec: {}'.format(format_metric_value(
+            classification_metrics_dict.get('recall') if classification_metrics_dict else None
+        )),
+        'F1: {}'.format(format_metric_value(
+            classification_metrics_dict.get('f1') if classification_metrics_dict else None
+        )),
+        'PR-AUC: {}'.format(format_metric_value(
+            classification_metrics_dict.get('pr_auc') if classification_metrics_dict else None
+        )),
+        'ROC-AUC: {}'.format(format_metric_value(
+            classification_metrics_dict.get('roc_auc') if classification_metrics_dict else None
+        )),
+        '',
+        '(Best Valid)',
+        'Best Epoch: {}'.format(best_epoch),
+        'Best {}: {}'.format(valid_metric, format_metric_value(best_valid_value)),
+        '',
+        '(Time)',
+        'Training: {}'.format(format_duration(timing['train_time'])),
+        'Valid: {}'.format(format_duration(timing['valid_time'])),
+        'Test: {}'.format(format_duration(timing['test_time'])),
+        'Total: {}'.format(format_duration(timing['total_time'])),
+        '',
+        '(Efficiency)',
+        'Time per epoch: {}'.format(format_duration(timing['train_time'] / max(num_epochs, 1))),
+        'Peak GPU memory: {}'.format(
+            '{:.2f} GB'.format(timing['peak_gpu_memory_gb'])
+            if timing['peak_gpu_memory_gb'] is not None else 'N/A'
+        ),
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def write_results_report(output_dir, report_text):
+    results_path = os.path.join(output_dir, 'results.txt')
+    with open(results_path, 'w') as fout:
+        fout.write(report_text)
+    print('Results saved to {}'.format(results_path))
+    return results_path
+
+
+def run_post_training_evaluation(model, args, test_triples, all_true_triples):
+    if args.countries:
+        return None, evaluate_triple_classification(model, test_triples, args)
+
+    return KGEModel.test_step(model, test_triples, all_true_triples, args), None
 
 
 def get_loss_display_name(args):
@@ -264,10 +380,13 @@ def train_step_with_metrics(model, optimizer, train_iterator, args, uniform_sets
 
 def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets=None):
     uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_SETS)
-    train_triples, valid_triples, _, all_true_triples = load_dataset(args)
+    train_triples, valid_triples, test_triples, all_true_triples = load_dataset(args)
     model, train_iterator, optimizer = build_model_and_iterator(args, train_triples)
     epoch_steps = train_run.steps_per_epoch(len(train_triples), args.batch_size)
     loss_name = get_loss_display_name(args)
+
+    if args.cuda:
+        torch.cuda.reset_peak_memory_stats()
 
     history = {
         'epochs': [],
@@ -277,6 +396,8 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
         'loss': [],
         'valid_metric': [],
     }
+    train_time = 0.0
+    valid_time = 0.0
 
     epoch_bar = tqdm(
         range(1, num_epochs + 1),
@@ -290,6 +411,7 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
             update_au_gamma_schedule(args)
 
         batch_logs = []
+        train_start = time.perf_counter()
         step_bar = tqdm(
             range(epoch_steps),
             desc='  batches',
@@ -301,6 +423,7 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
             batch_logs.append(
                 train_step_with_metrics(model, optimizer, train_iterator, args, uniform_sets)
             )
+        train_time += time.perf_counter() - train_start
 
         history['epochs'].append(epoch)
         history['align_loss'].append(np.mean([log['align_loss'] for log in batch_logs]))
@@ -311,7 +434,9 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
             )
         history['loss'].append(np.mean([log['loss'] for log in batch_logs]))
 
+        valid_start = time.perf_counter()
         metrics = KGEModel.test_step(model, valid_triples, all_true_triples, args)
+        valid_time += time.perf_counter() - valid_start
         history['valid_metric'].append(metrics)
 
         postfix = format_training_postfix(
@@ -324,7 +449,24 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
         )
         epoch_bar.set_postfix_str(postfix, refresh=True)
 
-    return history
+    peak_gpu_memory_gb = None
+    if args.cuda:
+        peak_gpu_memory_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+    timing = {
+        'train_time': train_time,
+        'valid_time': valid_time,
+        'test_time': 0.0,
+        'total_time': train_time + valid_time,
+        'peak_gpu_memory_gb': peak_gpu_memory_gb,
+    }
+
+    datasets = {
+        'valid_triples': valid_triples,
+        'test_triples': test_triples,
+        'all_true_triples': all_true_triples,
+    }
+    return history, model, args, datasets, timing
 
 
 def _truncate_history(history, display_epochs):
@@ -449,7 +591,7 @@ def visualize_training(
     os.makedirs(output_dir, exist_ok=True)
     print('Output dir: {}'.format(output_dir))
 
-    history = train_and_collect_history(
+    history, model, args, datasets, timing = train_and_collect_history(
         args, num_epochs, valid_metric=valid_metric, uniform_sets=uniform_sets,
     )
 
@@ -483,6 +625,28 @@ def visualize_training(
     else:
         plt.close(fig_au)
         plt.close(fig_curve)
+
+    test_start = time.perf_counter()
+    link_metrics, classification_metrics_dict = run_post_training_evaluation(
+        model,
+        args,
+        datasets['test_triples'],
+        datasets['all_true_triples'],
+    )
+    timing['test_time'] = time.perf_counter() - test_start
+    timing['total_time'] = timing['train_time'] + timing['valid_time'] + timing['test_time']
+
+    best_epoch, best_valid_value = find_best_valid(history, valid_metric=valid_metric)
+    report_text = build_results_report(
+        num_epochs=num_epochs,
+        valid_metric=valid_metric,
+        link_metrics=link_metrics,
+        classification_metrics_dict=classification_metrics_dict,
+        best_epoch=best_epoch,
+        best_valid_value=best_valid_value,
+        timing=timing,
+    )
+    write_results_report(output_dir, report_text)
 
     return history, fig_au, fig_curve
 
