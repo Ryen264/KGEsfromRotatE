@@ -2,7 +2,7 @@
   "model": "ComplEx",
   "data_path": "data/wn18rr",
   "loss": "mr",
-  "dim": 500,
+  "dim": 64,
   "batch_size": 512,
   "negative_sample_size": 1024,
   "gamma": 200.0,
