@@ -292,7 +292,7 @@ def get_au_uniform_embeddings(head, relation, tail, query_e, target_e, term_key)
     raise ValueError('Unknown AU uniform term key: {}'.format(term_key))
 
 
-class AUGammaController(object):
+class UniGammaController(object):
     def __init__(self, args):
         self.args = args
 
@@ -320,12 +320,16 @@ class AUGammaController(object):
         return 1.0 + progress * (end_mult - 1.0)
 
     def effective_gamma(self, model, term_key, epoch):
+        if not hasattr(model, 'au_log_gamma_adj'):
+            self.ensure_model_params(model)
         gamma_init = self.gamma_init(term_key)
         schedule = self.schedule_mult(epoch)
         log_adj = torch.clamp(model.au_log_gamma_adj[term_key], max=0.0)
         return gamma_init * schedule * torch.exp(log_adj)
 
     def ensure_model_params(self, model):
+        if hasattr(model, 'au_log_gamma_adj'):
+            return
         active = self.active_terms()
         if not active:
             return
@@ -353,7 +357,7 @@ class AUGammaController(object):
 def update_au_gamma_schedule(args):
     if not is_learnable_au_gammas(args):
         return 1.0
-    controller = AUGammaController(args)
+    controller = UniGammaController(args)
     epoch = getattr(args, 'current_epoch', 0)
     args.au_schedule_mult = controller.schedule_mult(epoch)
     return args.au_schedule_mult
@@ -397,42 +401,39 @@ class AlignmentUniformityLoss(KGELoss):
     def uniformity(x, tuni=2):
         x = F.normalize(x, dim=-1)
         if x.size(0) < 2:
-            return x.new_zeros(())
+            return (x * 0).sum()
         return torch.pdist(x, p=2).pow(2).mul(-tuni).exp().mean().log()
 
     def _compute_uniform_terms(self, head, relation, tail, query_e, target_e, model, tuni):
         uniform_loss_sum = query_e.new_zeros(())
         uniform_count = 0
         uniform_log = {}
+        epoch = getattr(self.args, 'current_epoch', 0)
+        learnable = is_learnable_au_gammas(self.args)
+        controller = UniGammaController(self.args) if learnable else None
 
-        if is_learnable_au_gammas(self.args):
-            controller = AUGammaController(self.args)
-            epoch = getattr(self.args, 'current_epoch', 0)
-            for term_key, gamma_key in AU_UNIFORM_TERMS:
-                gamma_init = getattr(self.args, gamma_key, 0.0)
-                if gamma_init <= 0:
-                    continue
-                embeddings = get_au_uniform_embeddings(
-                    head, relation, tail, query_e, target_e, term_key,
+        for term_key, gamma_key in AU_UNIFORM_TERMS:
+            gamma_init = getattr(self.args, gamma_key, 0.0)
+            if gamma_init <= 0:
+                continue
+            embeddings = get_au_uniform_embeddings(
+                head, relation, tail, query_e, target_e, term_key,
+            )
+            uniform_val = self.uniformity(embeddings, tuni=tuni)
+            if learnable:
+                gamma_weight = controller.effective_gamma(model, term_key, epoch)
+            else:
+                gamma_weight = gamma_init
+            uniform_loss_sum = uniform_loss_sum + gamma_weight * uniform_val
+            uniform_count += 1
+            uniform_log['uniform_{}'.format(term_key)] = uniform_val.item()
+            if learnable:
+                eff_item = (
+                    gamma_weight.item()
+                    if isinstance(gamma_weight, torch.Tensor)
+                    else float(gamma_weight)
                 )
-                uniform_val = self.uniformity(embeddings, tuni=tuni)
-                gamma_eff = controller.effective_gamma(model, term_key, epoch)
-                uniform_loss_sum = uniform_loss_sum + gamma_eff * uniform_val
-                uniform_count += 1
-                uniform_log['uniform_{}'.format(term_key)] = uniform_val.item()
-                uniform_log['uni_gamma_eff_{}'.format(term_key)] = gamma_eff.item()
-        else:
-            for term_key, gamma_key in AU_UNIFORM_TERMS:
-                gamma_init = getattr(self.args, gamma_key, 0.0)
-                if gamma_init <= 0:
-                    continue
-                embeddings = get_au_uniform_embeddings(
-                    head, relation, tail, query_e, target_e, term_key,
-                )
-                uniform_val = self.uniformity(embeddings, tuni=tuni)
-                uniform_loss_sum = uniform_loss_sum + gamma_init * uniform_val
-                uniform_count += 1
-                uniform_log['uniform_{}'.format(term_key)] = uniform_val.item()
+                uniform_log['uni_gamma_eff_{}'.format(term_key)] = eff_item
 
         return uniform_loss_sum, uniform_count, uniform_log
 

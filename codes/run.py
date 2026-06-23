@@ -17,7 +17,7 @@ from model import KGEModel
 
 from dataloader import TrainDataset
 from dataloader import BidirectionalOneShotIterator
-from loss import AUGammaController, build_training_optimizer, is_learnable_au_gammas, set_optimizer_learning_rates, update_au_gamma_schedule
+from loss import UniGammaController, build_training_optimizer, is_learnable_au_gammas, set_optimizer_learning_rates, update_au_gamma_schedule
 
 def steps_per_epoch(num_train_triples, batch_size):
     batches = (num_train_triples + batch_size - 1) // batch_size
@@ -279,8 +279,17 @@ def main(args):
     if args.cuda:
         kge_model = kge_model.cuda()
 
+    init_step = 0
+    if args.init_checkpoint:
+        logging.info('Loading checkpoint %s...' % args.init_checkpoint)
+        checkpoint = torch.load(os.path.join(args.init_checkpoint, 'checkpoint'))
+        init_step = checkpoint['step']
+        kge_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    else:
+        logging.info('Ramdomly Initializing %s Model...' % args.model)
+
     if is_learnable_au_gammas(args):
-        AUGammaController(args).ensure_model_params(kge_model)
+        UniGammaController(args).ensure_model_params(kge_model)
     
     if args.do_train:
         # Set training dataloader iterator
@@ -310,13 +319,7 @@ def main(args):
         )
         warm_up_steps_internal = warm_up_epochs_val * steps_per_epoch_val
 
-    if args.init_checkpoint:
-        # Restore model from checkpoint directory
-        logging.info('Loading checkpoint %s...' % args.init_checkpoint)
-        checkpoint = torch.load(os.path.join(args.init_checkpoint, 'checkpoint'))
-        init_step = checkpoint['step']
-        kge_model.load_state_dict(checkpoint['model_state_dict'])
-        if args.do_train:
+        if args.init_checkpoint:
             current_learning_rate = checkpoint['current_learning_rate']
             if 'warm_up_epochs' in checkpoint:
                 warm_up_epochs_val = checkpoint['warm_up_epochs']
@@ -325,9 +328,6 @@ def main(args):
                 warm_up_steps_internal = checkpoint['warm_up_steps']
                 warm_up_epochs_val = warm_up_steps_internal // steps_per_epoch_val
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    else:
-        logging.info('Ramdomly Initializing %s Model...' % args.model)
-        init_step = 0
     
     step = init_step
     

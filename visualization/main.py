@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(ROOT, 'codes'))
 
 import run as train_run
 from dataloader import BidirectionalOneShotIterator, TrainDataset
-from loss import AlignmentUniformityLoss, compute_kge_loss, AUGammaController, build_training_optimizer, is_learnable_au_gammas, update_au_gamma_schedule
+from loss import AlignmentUniformityLoss, compute_kge_loss, UniGammaController, build_training_optimizer, is_learnable_au_gammas, update_au_gamma_schedule
 from model import KGEModel
 
 UNIFORM_SET_KEYS = ('query', 'target', 'head', 'tail', 'entity', 'relation')
@@ -77,13 +77,9 @@ def resolve_path(path):
 
 def build_output_dir(config_path):
     config_path = resolve_path(config_path)
-    try:
-        config_rel = os.path.relpath(config_path, ROOT)
-    except ValueError:
-        config_rel = config_path
-    config_slug = config_rel.replace(os.sep, '_')
+    config_stem = os.path.splitext(os.path.basename(config_path))[0]
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    folder_name = '{}_{}'.format(config_slug, timestamp)
+    folder_name = '{}_{}'.format(config_stem, timestamp)
     return os.path.join(ROOT, 'visualization', 'outputs', folder_name)
 
 
@@ -164,7 +160,7 @@ def build_model_and_iterator(args, train_triples):
         model = model.cuda()
 
     if is_learnable_au_gammas(args):
-        AUGammaController(args).ensure_model_params(model)
+        UniGammaController(args).ensure_model_params(model)
 
     train_dataloader_head = DataLoader(
         TrainDataset(
@@ -255,7 +251,7 @@ def train_step_with_metrics(model, optimizer, train_iterator, args, uniform_sets
     optimizer.step()
 
     if is_learnable_au_gammas(args):
-        AUGammaController(args).clamp_log_gammas(model)
+        UniGammaController(args).clamp_log_gammas(model)
 
     align_loss, uniform_components, uniform_loss = compute_au_metrics(
         model, positive_sample, mode, args, uniform_sets,
@@ -428,7 +424,7 @@ def visualize_training(
     config_path,
     valid_metric='MRR',
     display_epochs=100,
-    gpu=0,
+    gpu=1,
     output_dir=None,
     show=True,
     uniform_sets=None,
