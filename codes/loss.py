@@ -175,7 +175,7 @@ class BinaryCrossEntropyLoss(KGELoss):
         }
         return loss, log
 
-class MeanSquaredErrorLoss(KGELoss):
+class SquaredErrorLoss(KGELoss):
     '''
     Mean squared error on logits with targets y=1 (positive) and y=0 (negative)
     L = 1/2 * (f(x+)-1)^2 + 1/2 * mean((f(x-)-0)^2) + regularization
