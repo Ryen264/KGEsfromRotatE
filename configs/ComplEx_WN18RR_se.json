@@ -1,7 +1,7 @@
 {
   "model": "ComplEx",
   "data_path": "data/wn18rr",
-  "loss": "self_adv",
+  "loss": "se",
   "dim": 500,
   "batch_size": 512,
   "negative_sample_size": 1024,
@@ -12,7 +12,5 @@
   "double_entity_embedding": true,
   "double_relation_embedding": true,
   "regularization_coeff": 0.000005,
-  "regularization_p": 3,
-  "adversarial_temperature": 1.0,
-  "negative_adversarial_sampling": true
+  "regularization_p": 3
 }

@@ -73,8 +73,8 @@ def parse_args(args=None):
     parser.add_argument('--log_steps', default=100, type=int, help='train log every xx steps')
     parser.add_argument('--test_log_steps', default=1000, type=int, help='valid/test log every xx steps')
     
-    parser.add_argument('--loss', default='self_adv', type=str,
-                        choices=['self_adv', 'ce', 'mr', 'bce', 'mse', 'bpr', 'infonce', 'au'],
+    parser.add_argument('--loss', default='sans', type=str,
+                        choices=['sans', 'ce', 'mr', 'bce', 'se', 'bpr', 'infonce', 'au'],
                         help='Training loss (see codes/loss.py)')
     parser.add_argument('--infonce_temperature', default=1.0, type=float,
                         help='Temperature for InfoNCE loss')

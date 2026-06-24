@@ -478,25 +478,25 @@ class AlignmentUniformityLoss(KGELoss):
 
 
 LOSS_REGISTRY = {
-    'self_adv': SelfAdversarialNegativeSamplingLoss,
+    'sans': SelfAdversarialNegativeSamplingLoss,
     'ce': CrossEntropyLoss,
     'mr': MarginRankingLoss,
     'bce': BinaryCrossEntropyLoss,
-    'mse': MeanSquaredErrorLoss,
+    'se': SquaredErrorLoss,
     'bpr': BayesianPersonalizedRankingLoss,
     'infonce': InfoNCELoss,
     'au': AlignmentUniformityLoss,
 }
 
 def get_loss(args):
-    loss_name = getattr(args, 'loss', 'self_adv')
+    loss_name = getattr(args, 'loss', 'sans')
     if loss_name not in LOSS_REGISTRY:
         raise ValueError('Unknown loss: {}'.format(loss_name))
     return LOSS_REGISTRY[loss_name](args)
 
 def compute_kge_loss(positive_score, negative_score, subsampling_weight, model, args,
                      positive_sample=None, mode=None):
-    loss_name = getattr(args, 'loss', 'self_adv')
+    loss_name = getattr(args, 'loss', 'sans')
     if loss_name == 'au':
         if positive_sample is None or mode is None:
             raise ValueError('AlignmentUniformityLoss requires positive_sample and mode')

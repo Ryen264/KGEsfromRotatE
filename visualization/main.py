@@ -40,10 +40,10 @@ LOSS_DISPLAY_NAMES = {
     'ce': 'CE',
     'mr': 'MR',
     'bce': 'BCE',
-    'mse': 'MSE',
+    'se': 'SE',
     'bpr': 'BPR',
     'infonce': 'InfoNCE',
-    'self_adv': 'SA',
+    'sans': 'SA',
     'au': 'AU',
 }
 
@@ -163,7 +163,7 @@ def run_post_training_evaluation(model, args, test_triples, all_true_triples):
 
 
 def get_loss_display_name(args):
-    loss_name = getattr(args, 'loss', 'self_adv')
+    loss_name = getattr(args, 'loss', 'sans')
     return LOSS_DISPLAY_NAMES.get(loss_name, loss_name.upper())
 
 
@@ -579,7 +579,7 @@ def visualize_training(
 
     print('Config: {}'.format(config_path))
     print('Model: {}  Loss: {}  Dataset: {}'.format(
-        config.get('model'), getattr(args, 'loss', 'self_adv'), config.get('data_path')
+        config.get('model'), getattr(args, 'loss', 'sans'), config.get('data_path')
     ))
     print('Training for {} epochs (displaying first {})'.format(num_epochs, display_epochs))
     print('Uniform sets: {}'.format(', '.join(uniform_sets)))
@@ -599,12 +599,12 @@ def visualize_training(
         'ce': 'CE loss',
         'mr': 'MR loss',
         'bce': 'BCE loss',
-        'mse': 'MSE loss',
+        'se': 'SE loss',
         'bpr': 'BPR loss',
         'infonce': 'InfoNCE loss',
-        'self_adv': 'SA loss',
+        'sans': 'SA loss',
         'au': 'AU loss',
-    }.get(getattr(args, 'loss', 'self_adv'), get_loss_display_name(args) + ' loss')
+    }.get(getattr(args, 'loss', 'sans'), get_loss_display_name(args) + ' loss')
 
     fig_au = plot_alignment_uniformity(
         history,
