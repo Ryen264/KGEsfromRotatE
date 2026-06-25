@@ -15,8 +15,8 @@
   "tuni": 5,
   "uni_gamma_query": 1.0,
   "uni_gamma_target": 1.0,
+  "uni_gamma_entity": 1.0,
   "uni_gamma_head": 0.0,
   "uni_gamma_tail": 0.0,
-  "uni_gamma_entity": 1.0,
   "uni_gamma_relation": 0.0
 }

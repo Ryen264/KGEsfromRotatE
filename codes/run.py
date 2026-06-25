@@ -74,7 +74,7 @@ def parse_args(args=None):
     parser.add_argument('--test_log_steps', default=1000, type=int, help='valid/test log every xx steps')
     
     parser.add_argument('--loss', default='sans', type=str,
-                        choices=['sans', 'ce', 'mr', 'bce', 'se', 'bpr', 'au'],
+                        choices=['se', 'hinge', 'bce', 'mr', 'bpr', 'ce', 'sans', 'au'],
                         help='Training loss (see codes/loss.py)')
 
     parser.add_argument('--tuni', default=2, type=float,
@@ -83,14 +83,15 @@ def parse_args(args=None):
                         help='Initial AU uniformity weight for query embeddings (0=off)')
     parser.add_argument('--uni-gamma-target', dest='uni_gamma_target', default=1.0, type=float,
                         help='Initial AU uniformity weight for target embeddings (0=off)')
+    parser.add_argument('--uni-gamma-entity', dest='uni_gamma_entity', default=0.0, type=float,
+                        help='Initial AU uniformity weight for entity embeddings (0=off)')
     parser.add_argument('--uni-gamma-head', dest='uni_gamma_head', default=0.0, type=float,
                         help='Initial AU uniformity weight for head entity embeddings (0=off)')
     parser.add_argument('--uni-gamma-tail', dest='uni_gamma_tail', default=0.0, type=float,
                         help='Initial AU uniformity weight for tail entity embeddings (0=off)')
-    parser.add_argument('--uni-gamma-entity', dest='uni_gamma_entity', default=0.0, type=float,
-                        help='Initial AU uniformity weight for entity pool (0=off)')
     parser.add_argument('--uni-gamma-relation', dest='uni_gamma_relation', default=0.0, type=float,
                         help='Initial AU uniformity weight for relation embeddings (0=off)')
+                        
     parser.add_argument('--learnable_au_gammas', action='store_true',
                         help='Learn batch-wise AU gamma down-weighting via log_gamma_adj')
     parser.add_argument('--log_au_gamma_lr', default=None, type=float,

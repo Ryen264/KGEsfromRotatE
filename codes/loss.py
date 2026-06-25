@@ -40,7 +40,7 @@ class KGELoss:
 class SquaredErrorLoss(KGELoss):
     '''
     Mean squared error on logits with targets y=1 (positive) and y=0 (negative)
-    L = 1/2 * (f(x+)-1)^2 + 1/2 * mean((f(x-)-0)^2) + regularization
+    L = 1/2 * f(x)-y)^2 + regularization
     '''
 
     def _weighted_mean(self, loss, subsampling_weight):
@@ -64,71 +64,21 @@ class SquaredErrorLoss(KGELoss):
         return loss, log
 
 
-
-class SelfAdversarialNegativeSamplingLoss(KGELoss):
+class PointwiseHingeLoss(KGELoss):
     '''
-    Margin negative sampling loss - a listwise margin-based log-sigmoid loss
-    L = 1/2 * (L_positive + L_negative) + regularization
-    L_positive = logsigmoid(positive_score)
-    L_negative = logsigmoid(-negative_score)
-    '''
-
-    def _weighted_mean(self, score, subsampling_weight):
-        if self.args.uni_weight:
-            return - score.mean()
-        return - (subsampling_weight * score).sum() / subsampling_weight.sum()
-
-    def _positive_sample_loss(self, positive_score, subsampling_weight):
-        positive_score = F.logsigmoid(positive_score).squeeze(dim = 1)
-        return self._weighted_mean(positive_score, subsampling_weight)
-
-    def _negative_sample_loss(self, negative_score, subsampling_weight):
-        if self.args.negative_adversarial_sampling:
-            # In self-adversarial sampling, we do not apply back-propagation on the sampling weight
-            negative_score = (F.softmax(negative_score * self.args.adversarial_temperature, dim = 1).detach()
-                              * F.logsigmoid(-negative_score)).sum(dim = 1)
-        else:
-            negative_score = F.logsigmoid(-negative_score).mean(dim = 1)
-
-        return self._weighted_mean(negative_score, subsampling_weight)
-
-    def __call__(self, positive_score, negative_score, subsampling_weight, model):
-        positive_sample_loss_val = self._positive_sample_loss(positive_score, subsampling_weight)
-        negative_sample_loss_val = self._negative_sample_loss(negative_score, subsampling_weight)
-
-        loss = (positive_sample_loss_val + negative_sample_loss_val) / 2
-
-        regularization_term, regularization_log = regularization(
-            model, self.args.regularization_coeff, p=self.args.regularization_p
-        )
-        if regularization_term is not None:
-            loss = loss + regularization_term
-
-        log = {
-            **regularization_log,
-            'positive_sample_loss': positive_sample_loss_val.item(),
-            'negative_sample_loss': negative_sample_loss_val.item(),
-            'loss': loss.item()
-        }
-        return loss, log
-
-
-class CrossEntropyLoss(KGELoss):
-    '''
-    Cross-entropy loss - a listwise cross-entropy loss
-    L = cross_entropy([positive_score; negative_scores], target=0) + regularization
+    Pointwise Hinge loss - a pointwise max-margin loss with labels l=1 (positive) and l=-1 (negative)
+    L = max(0, margin - l * score) + regularization
     '''
 
     def _weighted_mean(self, loss, subsampling_weight):
         return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
 
     def __call__(self, positive_score, negative_score, subsampling_weight, model):
-        scores = torch.cat([positive_score, negative_score], dim=1)
-        target = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
-        loss = self._weighted_mean(
-            F.cross_entropy(scores, target, reduction='none'),
-            subsampling_weight,
-        )
+        margin = self.args.gamma
+        positive_loss = F.relu(margin - positive_score.squeeze(dim=1))
+        negative_loss = F.relu(margin + negative_score).mean(dim=1)
+        loss = self._weighted_mean((positive_loss + negative_loss) / 2, subsampling_weight)
+
         regularization_term, regularization_log = regularization(
             model, self.args.regularization_coeff, p=self.args.regularization_p
         )
@@ -141,34 +91,6 @@ class CrossEntropyLoss(KGELoss):
         }
         return loss, log
 
-class MarginRankingLoss(KGELoss):
-    '''
-    Margin ranking loss - a pairwise margin-based ranking loss
-    L = max(0, margin - positive_score + negative_score) + regularization
-    '''
-
-    def _weighted_mean(self, loss, subsampling_weight):
-        return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
-
-    def __call__(self, positive_score, negative_score, subsampling_weight, model):
-        positive_expanded = positive_score.expand_as(negative_score)
-        target = torch.ones_like(negative_score)
-        per_sample_loss = F.margin_ranking_loss(
-            positive_expanded, negative_score, target,
-            margin=self.args.gamma, reduction='none',
-        ).mean(dim=1)
-        loss = self._weighted_mean(per_sample_loss, subsampling_weight)
-        regularization_term, regularization_log = regularization(
-            model, self.args.regularization_coeff, p=self.args.regularization_p
-        )
-        if regularization_term is not None:
-            loss = loss + regularization_term
-
-        log = {
-            **regularization_log,
-            'loss': loss.item()
-        }
-        return loss, log
 
 class BinaryCrossEntropyLoss(KGELoss):
     '''
@@ -204,9 +126,39 @@ class BinaryCrossEntropyLoss(KGELoss):
         return loss, log
 
 
+class MarginRankingLoss(KGELoss):
+    '''
+    Margin ranking loss - a pairwise margin-based ranking loss
+    L = max(0, margin - positive_score + negative_score) + regularization
+    '''
+
+    def _weighted_mean(self, loss, subsampling_weight):
+        return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
+
+    def __call__(self, positive_score, negative_score, subsampling_weight, model):
+        positive_expanded = positive_score.expand_as(negative_score)
+        target = torch.ones_like(negative_score)
+        per_sample_loss = F.margin_ranking_loss(
+            positive_expanded, negative_score, target,
+            margin=self.args.gamma, reduction='none',
+        ).mean(dim=1)
+        loss = self._weighted_mean(per_sample_loss, subsampling_weight)
+        regularization_term, regularization_log = regularization(
+            model, self.args.regularization_coeff, p=self.args.regularization_p
+        )
+        if regularization_term is not None:
+            loss = loss + regularization_term
+
+        log = {
+            **regularization_log,
+            'loss': loss.item()
+        }
+        return loss, log
+
+
 class BayesianPersonalizedRankingLoss(KGELoss):
     '''
-    Bayesian personalized ranking loss
+    Bayesian personalized ranking loss - a pairwise logistic loss
     L = -log(sigmoid(f(x+) - f(x-))) + regularization
     '''
 
@@ -226,6 +178,79 @@ class BayesianPersonalizedRankingLoss(KGELoss):
 
         log = {
             **regularization_log,
+            'loss': loss.item()
+        }
+        return loss, log
+
+
+class CrossEntropyLoss(KGELoss):
+    '''
+    Cross-entropy loss - a listwise softmax loss
+    L = -log(softmax(positive_score)) + regularization
+    '''
+
+    def _weighted_mean(self, loss, subsampling_weight):
+        return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
+
+    def __call__(self, positive_score, negative_score, subsampling_weight, model):
+        scores = torch.cat([positive_score, negative_score], dim=1)
+        target = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
+        loss = self._weighted_mean(
+            F.cross_entropy(scores, target, reduction='none'),
+            subsampling_weight,
+        )
+        regularization_term, regularization_log = regularization(
+            model, self.args.regularization_coeff, p=self.args.regularization_p
+        )
+        if regularization_term is not None:
+            loss = loss + regularization_term
+
+        log = {
+            **regularization_log,
+            'loss': loss.item()
+        }
+        return loss, log
+
+
+class SelfAdversarialNegativeSamplingLoss(KGELoss):
+    '''
+    Self-adversarial negative sampling loss - a listwise margin-based log-sigmoid loss
+    L = -log(sigmoid(positive_score)) - softmax(adversarial_temperature * negative_score) * log(sigmoid(-negative_score)) + regularization
+    '''
+
+    def _weighted_mean(self, loss, subsampling_weight):
+        return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
+
+    def _positive_sample_loss(self, positive_score, subsampling_weight):
+        positive_score = F.logsigmoid(positive_score).squeeze(dim = 1)
+        return self._weighted_mean(positive_score, subsampling_weight)
+
+    def _negative_sample_loss(self, negative_score, subsampling_weight):
+        if self.args.negative_adversarial_sampling:
+            # In self-adversarial sampling, we do not apply back-propagation on the sampling weight
+            negative_score = (F.softmax(negative_score * self.args.adversarial_temperature, dim = 1).detach()
+                              * F.logsigmoid(-negative_score)).sum(dim = 1)
+        else:
+            negative_score = F.logsigmoid(-negative_score).mean(dim = 1)
+
+        return self._weighted_mean(negative_score, subsampling_weight)
+
+    def __call__(self, positive_score, negative_score, subsampling_weight, model):
+        positive_sample_loss_val = self._positive_sample_loss(positive_score, subsampling_weight)
+        negative_sample_loss_val = self._negative_sample_loss(negative_score, subsampling_weight)
+
+        loss = (positive_sample_loss_val + negative_sample_loss_val) / 2
+
+        regularization_term, regularization_log = regularization(
+            model, self.args.regularization_coeff, p=self.args.regularization_p
+        )
+        if regularization_term is not None:
+            loss = loss + regularization_term
+
+        log = {
+            **regularization_log,
+            'positive_sample_loss': positive_sample_loss_val.item(),
+            'negative_sample_loss': negative_sample_loss_val.item(),
             'loss': loss.item()
         }
         return loss, log
@@ -363,13 +388,20 @@ def set_optimizer_learning_rates(optimizer, lr, gamma_lr=None):
 
 
 class AlignmentUniformityLoss(KGELoss):
+    '''
+    Alignment-uniformity loss - a pairwise uniformity-based loss
+    L = alignment_loss + Avg(uniformity_loss)_terms + regularization
+    alignment_loss = (query_e - target_e).norm(p=2, dim=1).pow(2).mean()
+    uniformity_loss = torch.pdist(x, p=2).pow(2).mul(-tuni).exp().mean().log()
+    '''
+    
     @staticmethod
     def alignment(x, y):
         x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
         return (x - y).norm(p=2, dim=1).pow(2).mean()
 
     @staticmethod
-    def uniformity(x, tuni=2):
+    def uniformity(x, tuni=4):
         x = F.normalize(x, dim=-1)
         if x.size(0) < 2:
             return (x * 0).sum()
@@ -409,7 +441,7 @@ class AlignmentUniformityLoss(KGELoss):
         return uniform_loss_sum, uniform_count, uniform_log
 
     def calculate_loss(self, head, relation, tail, model, mode):
-        tuni = getattr(self.args, 'tuni', 2)
+        tuni = getattr(self.args, 'tuni', 4)
 
         query_e = model.query_encoder(head, relation, tail, mode=mode)
         target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
@@ -449,12 +481,13 @@ class AlignmentUniformityLoss(KGELoss):
 
 
 LOSS_REGISTRY = {
-    'sans': SelfAdversarialNegativeSamplingLoss,
-    'ce': CrossEntropyLoss,
-    'mr': MarginRankingLoss,
-    'bce': BinaryCrossEntropyLoss,
     'se': SquaredErrorLoss,
+    'hinge': PointwiseHingeLoss,
+    'bce': BinaryCrossEntropyLoss,
+    'mr': MarginRankingLoss,
     'bpr': BayesianPersonalizedRankingLoss,
+    'ce': CrossEntropyLoss,
+    'sans': SelfAdversarialNegativeSamplingLoss,
     'au': AlignmentUniformityLoss,
 }
 

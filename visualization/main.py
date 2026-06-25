@@ -37,11 +37,12 @@ UNIFORM_COLORS = {
 }
 
 LOSS_DISPLAY_NAMES = {
-    'ce': 'CE',
-    'mr': 'MR',
-    'bce': 'BCE',
     'se': 'SE',
+    'hinge': 'Hinge',
+    'bce': 'BCE',
+    'mr': 'MR',
     'bpr': 'BPR',
+    'ce': 'CE',
     'sans': 'SA',
     'au': 'AU',
 }
@@ -595,12 +596,13 @@ def visualize_training(
     )
 
     loss_label = {
-        'ce': 'CE loss',
-        'mr': 'MR loss',
-        'bce': 'BCE loss',
         'se': 'SE loss',
+        'hinge': 'Hinge loss',
+        'bce': 'BCE loss',
+        'mr': 'MR loss',
         'bpr': 'BPR loss',
-        'sans': 'SA loss',
+        'ce': 'CE loss',
+        'sans': 'SANS loss',
         'au': 'AU loss',
     }.get(getattr(args, 'loss', 'sans'), get_loss_display_name(args) + ' loss')
 
