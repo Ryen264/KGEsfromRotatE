@@ -42,7 +42,6 @@ LOSS_DISPLAY_NAMES = {
     'bce': 'BCE',
     'se': 'SE',
     'bpr': 'BPR',
-    'infonce': 'InfoNCE',
     'sans': 'SA',
     'au': 'AU',
 }
@@ -601,7 +600,6 @@ def visualize_training(
         'bce': 'BCE loss',
         'se': 'SE loss',
         'bpr': 'BPR loss',
-        'infonce': 'InfoNCE loss',
         'sans': 'SA loss',
         'au': 'AU loss',
     }.get(getattr(args, 'loss', 'sans'), get_loss_display_name(args) + ' loss')

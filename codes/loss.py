@@ -37,6 +37,34 @@ class KGELoss:
         raise NotImplementedError
 
 
+class SquaredErrorLoss(KGELoss):
+    '''
+    Mean squared error on logits with targets y=1 (positive) and y=0 (negative)
+    L = 1/2 * (f(x+)-1)^2 + 1/2 * mean((f(x-)-0)^2) + regularization
+    '''
+
+    def _weighted_mean(self, loss, subsampling_weight):
+        return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
+
+    def __call__(self, positive_score, negative_score, subsampling_weight, model):
+        positive_loss = (positive_score.squeeze(dim=1) - 1).pow(2)
+        negative_loss = negative_score.pow(2).mean(dim=1)
+        loss = self._weighted_mean((positive_loss + negative_loss) / 2, subsampling_weight)
+
+        regularization_term, regularization_log = regularization(
+            model, self.args.regularization_coeff, p=self.args.regularization_p
+        )
+        if regularization_term is not None:
+            loss = loss + regularization_term
+
+        log = {
+            **regularization_log,
+            'loss': loss.item()
+        }
+        return loss, log
+
+
+
 class SelfAdversarialNegativeSamplingLoss(KGELoss):
     '''
     Margin negative sampling loss - a listwise margin-based log-sigmoid loss
@@ -175,32 +203,6 @@ class BinaryCrossEntropyLoss(KGELoss):
         }
         return loss, log
 
-class SquaredErrorLoss(KGELoss):
-    '''
-    Mean squared error on logits with targets y=1 (positive) and y=0 (negative)
-    L = 1/2 * (f(x+)-1)^2 + 1/2 * mean((f(x-)-0)^2) + regularization
-    '''
-
-    def _weighted_mean(self, loss, subsampling_weight):
-        return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
-
-    def __call__(self, positive_score, negative_score, subsampling_weight, model):
-        positive_loss = (positive_score.squeeze(dim=1) - 1).pow(2)
-        negative_loss = negative_score.pow(2).mean(dim=1)
-        loss = self._weighted_mean((positive_loss + negative_loss) / 2, subsampling_weight)
-
-        regularization_term, regularization_log = regularization(
-            model, self.args.regularization_coeff, p=self.args.regularization_p
-        )
-        if regularization_term is not None:
-            loss = loss + regularization_term
-
-        log = {
-            **regularization_log,
-            'loss': loss.item()
-        }
-        return loss, log
-
 
 class BayesianPersonalizedRankingLoss(KGELoss):
     '''
@@ -215,37 +217,6 @@ class BayesianPersonalizedRankingLoss(KGELoss):
         positive_expanded = positive_score.expand_as(negative_score)
         per_sample_loss = -F.logsigmoid(positive_expanded - negative_score).mean(dim=1)
         loss = self._weighted_mean(per_sample_loss, subsampling_weight)
-
-        regularization_term, regularization_log = regularization(
-            model, self.args.regularization_coeff, p=self.args.regularization_p
-        )
-        if regularization_term is not None:
-            loss = loss + regularization_term
-
-        log = {
-            **regularization_log,
-            'loss': loss.item()
-        }
-        return loss, log
-
-
-class InfoNCELoss(KGELoss):
-    '''
-    InfoNCE loss with temperature tau
-    L = -log(exp(f(x+)/tau) / (exp(f(x+)/tau) + sum_i exp(f(x-_i)/tau))) + regularization
-    '''
-
-    def _weighted_mean(self, loss, subsampling_weight):
-        return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
-
-    def __call__(self, positive_score, negative_score, subsampling_weight, model):
-        tau = getattr(self.args, 'infonce_temperature', 1.0)
-        scores = torch.cat([positive_score, negative_score], dim=1) / tau
-        target = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
-        loss = self._weighted_mean(
-            F.cross_entropy(scores, target, reduction='none'),
-            subsampling_weight,
-        )
 
         regularization_term, regularization_log = regularization(
             model, self.args.regularization_coeff, p=self.args.regularization_p
@@ -484,7 +455,6 @@ LOSS_REGISTRY = {
     'bce': BinaryCrossEntropyLoss,
     'se': SquaredErrorLoss,
     'bpr': BayesianPersonalizedRankingLoss,
-    'infonce': InfoNCELoss,
     'au': AlignmentUniformityLoss,
 }
 

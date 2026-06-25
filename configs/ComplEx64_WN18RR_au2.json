@@ -2,7 +2,7 @@
   "model": "ComplEx",
   "data_path": "data/wn18rr",
   "loss": "au",
-  "dim": 500,
+  "dim": 64,
   "batch_size": 512,
   "gamma": 200.0,
   "learning_rate": 0.002,
@@ -17,6 +17,6 @@
   "uni_gamma_target": 1.0,
   "uni_gamma_head": 0.0,
   "uni_gamma_tail": 0.0,
-  "uni_gamma_entity": 0.0,
+  "uni_gamma_entity": 1.0,
   "uni_gamma_relation": 0.0
 }
