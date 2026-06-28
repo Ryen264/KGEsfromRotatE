@@ -222,18 +222,20 @@ class SelfAdversarialNegativeSamplingLoss(KGELoss):
         return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
 
     def _positive_sample_loss(self, positive_score, subsampling_weight):
-        positive_score = F.logsigmoid(positive_score).squeeze(dim = 1)
-        return self._weighted_mean(positive_score, subsampling_weight)
+        positive_log_prob = F.logsigmoid(positive_score).squeeze(dim=1)
+        return -self._weighted_mean(positive_log_prob, subsampling_weight)
 
     def _negative_sample_loss(self, negative_score, subsampling_weight):
         if self.args.negative_adversarial_sampling:
             # In self-adversarial sampling, we do not apply back-propagation on the sampling weight
-            negative_score = (F.softmax(negative_score * self.args.adversarial_temperature, dim = 1).detach()
-                              * F.logsigmoid(-negative_score)).sum(dim = 1)
+            negative_log_prob = (
+                F.softmax(negative_score * self.args.adversarial_temperature, dim=1).detach()
+                * F.logsigmoid(-negative_score)
+            ).sum(dim=1)
         else:
-            negative_score = F.logsigmoid(-negative_score).mean(dim = 1)
+            negative_log_prob = F.logsigmoid(-negative_score).mean(dim=1)
 
-        return self._weighted_mean(negative_score, subsampling_weight)
+        return -self._weighted_mean(negative_log_prob, subsampling_weight)
 
     def __call__(self, positive_score, negative_score, subsampling_weight, model):
         positive_sample_loss_val = self._positive_sample_loss(positive_score, subsampling_weight)
