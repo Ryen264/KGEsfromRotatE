@@ -40,7 +40,7 @@ class KGELoss:
 class SquaredErrorLoss(KGELoss):
     '''
     Mean squared error on logits with targets y=1 (positive) and y=0 (negative)
-    L = 1/2 * f(x)-y)^2 + regularization
+    L = 1/2 * (f(x)-y)^2 + regularization
     '''
 
     def _weighted_mean(self, loss, subsampling_weight):
@@ -223,7 +223,7 @@ class SelfAdversarialNegativeSamplingLoss(KGELoss):
 
     def _positive_sample_loss(self, positive_score, subsampling_weight):
         positive_log_prob = F.logsigmoid(positive_score).squeeze(dim=1)
-        return -self._weighted_mean(positive_log_prob, subsampling_weight)
+        return self._weighted_mean(positive_log_prob, subsampling_weight)
 
     def _negative_sample_loss(self, negative_score, subsampling_weight):
         if self.args.negative_adversarial_sampling:
@@ -235,7 +235,7 @@ class SelfAdversarialNegativeSamplingLoss(KGELoss):
         else:
             negative_log_prob = F.logsigmoid(-negative_score).mean(dim=1)
 
-        return -self._weighted_mean(negative_log_prob, subsampling_weight)
+        return self._weighted_mean(negative_log_prob, subsampling_weight)
 
     def __call__(self, positive_score, negative_score, subsampling_weight, model):
         positive_sample_loss_val = self._positive_sample_loss(positive_score, subsampling_weight)
