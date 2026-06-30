@@ -265,10 +265,7 @@ class SelfAdversarialNegativeSamplingLoss(KGELoss):
 AU_UNIFORM_TERMS = [
     ('query', 'uni_gamma_query'),
     ('target', 'uni_gamma_target'),
-    ('head', 'uni_gamma_head'),
-    ('tail', 'uni_gamma_tail'),
     ('entity', 'uni_gamma_entity'),
-    ('relation', 'uni_gamma_relation'),
 ]
 
 AU_GAMMA_KEY_BY_TERM = {term_key: gamma_key for term_key, gamma_key in AU_UNIFORM_TERMS}
