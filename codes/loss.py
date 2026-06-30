@@ -214,20 +214,24 @@ class CrossEntropyLoss(KGELoss):
 
 class SelfAdversarialNegativeSamplingLoss(KGELoss):
     '''
-    Self-adversarial negative sampling loss - a listwise margin-based log-sigmoid loss
-    L = -log(sigmoid(positive_score)) - softmax(adversarial_temperature * negative_score) * log(sigmoid(-negative_score)) + regularization
+    Self-adversarial negative sampling loss (RotatE Eq. 6).
+
+    L = -log(sigmoid(positive_score))
+        - sum_j softmax(alpha * negative_score_j).detach() * log(sigmoid(-negative_score_j))
+        + regularization
     '''
 
     def _weighted_mean(self, loss, subsampling_weight):
         return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
 
     def _positive_sample_loss(self, positive_score, subsampling_weight):
+        # RotatE: positive_sample_loss = -weighted_mean(logsigmoid(positive_score))
         positive_log_prob = F.logsigmoid(positive_score).squeeze(dim=1)
-        return self._weighted_mean(positive_log_prob, subsampling_weight)
+        return -self._weighted_mean(positive_log_prob, subsampling_weight)
 
     def _negative_sample_loss(self, negative_score, subsampling_weight):
         if self.args.negative_adversarial_sampling:
-            # In self-adversarial sampling, we do not apply back-propagation on the sampling weight
+            # RotatE: softmax weights are detached from the computation graph.
             negative_log_prob = (
                 F.softmax(negative_score * self.args.adversarial_temperature, dim=1).detach()
                 * F.logsigmoid(-negative_score)
@@ -235,7 +239,7 @@ class SelfAdversarialNegativeSamplingLoss(KGELoss):
         else:
             negative_log_prob = F.logsigmoid(-negative_score).mean(dim=1)
 
-        return self._weighted_mean(negative_log_prob, subsampling_weight)
+        return -self._weighted_mean(negative_log_prob, subsampling_weight)
 
     def __call__(self, positive_score, negative_score, subsampling_weight, model):
         positive_sample_loss_val = self._positive_sample_loss(positive_score, subsampling_weight)

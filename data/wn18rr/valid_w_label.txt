@@ -6066,5 +6066,3 @@
 04842029	_hypernym	05475681	0
 08860123	_member_of_domain_region	03077616	1
 08860123	_member_of_domain_region	01088304	0
-
-### Source: R2D2
