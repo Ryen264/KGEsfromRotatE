@@ -2,7 +2,7 @@
   "model": "ComplEx",
   "data_path": "data/wn18rr",
   "loss": "au",
-  "dim": 500,
+  "dim": 256,
   "batch_size": 512,
   "gamma": 200.0,
   "learning_rate": 0.002,
