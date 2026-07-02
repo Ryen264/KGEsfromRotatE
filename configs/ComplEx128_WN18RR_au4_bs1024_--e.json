@@ -1,0 +1,19 @@
+{
+  "model": "ComplEx",
+  "data_path": "data/wn18rr",
+  "loss": "au",
+  "dim": 128,
+  "batch_size": 1024,
+  "gamma": 200.0,
+  "learning_rate": 0.002,
+  "epochs": 400,
+  "test_batch_size": 8,
+  "double_entity_embedding": true,
+  "double_relation_embedding": true,
+  "regularization_coeff": 0.000005,
+  "regularization_p": 3,
+  "tuni": 4,
+  "uni_gamma_query": 1.0,
+  "uni_gamma_target": 1.0,
+  "uni_gamma_entity": 1.0
+}
