@@ -100,14 +100,12 @@ def build_results_report(
     timing,
 ):
     lines = [
-        '(Link Prediction metrics)',
         'MR: {}'.format(format_metric_value(link_metrics.get('MR') if link_metrics else None)),
         'MRR: {}'.format(format_metric_value(link_metrics.get('MRR') if link_metrics else None)),
         'Hit@1: {}'.format(format_metric_value(link_metrics.get('HITS@1') if link_metrics else None)),
         'Hit@3: {}'.format(format_metric_value(link_metrics.get('HITS@3') if link_metrics else None)),
         'Hit@10: {}'.format(format_metric_value(link_metrics.get('HITS@10') if link_metrics else None)),
         '',
-        '(Triple Classification)',
         'Acc: {}'.format(format_metric_value(
             classification_metrics_dict.get('accuracy') if classification_metrics_dict else None
         )),
@@ -127,17 +125,14 @@ def build_results_report(
             classification_metrics_dict.get('roc_auc') if classification_metrics_dict else None
         )),
         '',
-        '(Best Valid)',
         'Best Epoch: {}'.format(best_epoch),
         'Best {}: {}'.format(valid_metric, format_metric_value(best_valid_value)),
         '',
-        '(Time)',
         'Training: {}'.format(format_duration(timing['train_time'])),
         'Valid: {}'.format(format_duration(timing['valid_time'])),
         'Test: {}'.format(format_duration(timing['test_time'])),
         'Total: {}'.format(format_duration(timing['total_time'])),
         '',
-        '(Efficiency)',
         'Time per epoch: {}'.format(format_duration(timing['train_time'] / max(num_epochs, 1))),
         'Peak GPU memory: {}'.format(
             '{:.2f} GB'.format(timing['peak_gpu_memory_gb'])
