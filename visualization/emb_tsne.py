@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from sklearn.manifold import TSNE  # Added for embedding visualization
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'codes'))
@@ -24,17 +25,8 @@ from loss import AlignmentUniformityLoss, compute_kge_loss, UniGammaController, 
 from metrics.classification import classification_metrics_from_probs
 from model import KGEModel
 
-UNIFORM_SET_KEYS = ('query', 'target', 'head', 'tail', 'entity', 'relation')
-DEFAULT_UNIFORM_SETS = ['query', 'target', 'head', 'tail', 'entity', 'relation']
-
-UNIFORM_COLORS = {
-    'query': '#6aa84f',
-    'target': '#38761d',
-    'head': '#93c47d',
-    'tail': '#b6d7a8',
-    'entity': '#274e13',
-    'relation': '#d9ead3',
-}
+UNIFORM_SET_KEYS = ('query', 'target', 'entity')
+DEFAULT_UNIFORM_SETS = ['query', 'target', 'entity']
 
 LOSS_DISPLAY_NAMES = {
     'se': 'SE',
@@ -44,7 +36,7 @@ LOSS_DISPLAY_NAMES = {
     'bpr': 'BPR',
     'ce': 'CE',
     'sans': 'SA',
-    'au': 'KGAU',
+    'au': 'AU',
 }
 
 
@@ -69,6 +61,15 @@ def find_best_valid(history, valid_metric='MRR'):
     metric_values = [metrics[valid_metric] for metrics in history['valid_metric']]
     best_idx = int(np.argmax(metric_values))
     return history['epochs'][best_idx], metric_values[best_idx]
+
+
+def resolve_tsne_milestone_epochs(num_epochs):
+    """Epochs visualized during training: first and last."""
+    return {1, num_epochs}
+
+
+def clone_model_state(model):
+    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
 
 def evaluate_triple_classification(model, test_triples, args):
@@ -329,10 +330,10 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     embeddings = {
         'query': query_e,
         'target': target_e,
-        'head': head,   # already embedded by entity_embedding
-        'tail': tail,   # already embedded by entity_embedding
-        'entity': torch.cat([head, tail], dim=0),   # already embedded by entity_embedding
-        'relation': relation,   # already embedded by relation_embedding
+        'head': head,
+        'tail': tail,
+        'entity': torch.cat([head, tail], dim=0),
+        'relation': relation,
     }
 
     for key in uniform_sets:
@@ -373,7 +374,125 @@ def train_step_with_metrics(model, optimizer, train_iterator, args, uniform_sets
     return log
 
 
-def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets=None):
+def get_tab10_colors():
+    try:
+        return list(plt.colormaps['tab10'].colors)
+    except (AttributeError, KeyError):
+        return [plt.cm.tab10(i) for i in range(10)]
+
+
+def rank_top_tails(model, head, relation, max_tails):
+    device = next(model.parameters()).device
+    nentity = model.nentity
+    k = min(max_tails, nentity)
+
+    head_part = torch.LongTensor([[head, relation]]).to(device)
+    tail_part = torch.arange(nentity, device=device).unsqueeze(0)
+
+    with torch.no_grad():
+        scores = model((head_part, tail_part), mode='tail-batch').squeeze(0)
+        top_tail_ids = torch.topk(scores, k=k).indices.cpu().tolist()
+    return top_tail_ids
+
+
+def generate_tsne_visualization(
+    model, triples, epoch, target_epochs, max_queries, max_tails_per_query,
+    output_dir, loss_name, running_results,
+):
+    """
+    Builds a t-SNE scatter plot where each point is a tail (target) entity embedding.
+    For up to max_queries (head, relation) queries, plot the top-ranked tail entities
+    per query. Points sharing the same color belong to the same query.
+    """
+    if epoch not in target_epochs:
+        return
+
+    unique_queries = sorted({(head, relation) for head, relation, _tail in triples})[:max_queries]
+    if not unique_queries:
+        print(f"\n[t-SNE Snapshot Skipped] No validation triples available at epoch {epoch}.")
+        return
+
+    model.eval()
+    device = next(model.parameters()).device
+
+    heads = []
+    relations = []
+    tails = []
+    query_colors = []
+    for query_idx, (head, relation) in enumerate(unique_queries):
+        top_tail_ids = rank_top_tails(model, head, relation, max_tails_per_query)
+        for tail in top_tail_ids:
+            heads.append(head)
+            relations.append(relation)
+            tails.append(tail)
+            query_colors.append(query_idx)
+
+    heads_tensor = torch.LongTensor(heads).to(device)
+    relations_tensor = torch.LongTensor(relations).to(device)
+    tails_tensor = torch.LongTensor(tails).to(device)
+
+    with torch.no_grad():
+        head_emb = model.entity_embedding[heads_tensor]
+        rel_emb = model.relation_embedding[relations_tensor]
+        tail_emb = model.entity_embedding[tails_tensor]
+        target_emb = model.target_encoder(
+            tail_emb, head=head_emb, relation=rel_emb, mode='tail-batch',
+        )
+        target_emb = target_emb.cpu().numpy()
+
+    num_points = len(target_emb)
+    if num_points < 2:
+        print(f"\n[t-SNE Snapshot Skipped] Not enough tail embeddings at epoch {epoch}.")
+        return
+
+    perplexity = min(30, max(5, num_points // 3), num_points - 1)
+    tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, max_iter=1000)
+    embeddings_2d = tsne.fit_transform(target_emb)
+
+    query_colors = np.array(query_colors)
+    tab10_colors = get_tab10_colors()
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for query_idx in range(len(unique_queries)):
+        mask = query_colors == query_idx
+        ax.scatter(
+            embeddings_2d[mask, 0],
+            embeddings_2d[mask, 1],
+            c=[tab10_colors[query_idx % 10]],
+            s=60,
+            edgecolors='none',
+            label='query {}'.format(query_idx + 1),
+            zorder=3,
+        )
+
+    ax.legend(
+        loc='lower left',
+        frameon=True,
+        fancybox=False,
+        edgecolor='0.8',
+        facecolor='white',
+        fontsize=10,
+    )
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel('')
+    ax.set_ylabel('')
+    for spine in ax.spines.values():
+        spine.set_visible(True)
+        spine.set_color('black')
+        spine.set_linewidth(1.0)
+
+    fig.tight_layout()
+
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    save_path = os.path.join(output_dir, f"tsne_{loss_name}_epoch_{epoch}_{timestamp}.png")
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"\n[t-SNE Snapshot Triggered] Image saved for Epoch {epoch} to: {save_path}")
+
+
+def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets=None, tsne_config=None):
     uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_SETS)
     train_triples, valid_triples, test_triples, all_true_triples = load_dataset(args)
     model, train_iterator, optimizer = build_model_and_iterator(args, train_triples)
@@ -393,6 +512,10 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
     }
     train_time = 0.0
     valid_time = 0.0
+    best_epoch = None
+    best_valid_value = float('-inf')
+    best_model_state = None
+    milestone_epochs = resolve_tsne_milestone_epochs(num_epochs) if tsne_config is not None else set()
 
     epoch_bar = tqdm(
         range(1, num_epochs + 1),
@@ -434,6 +557,25 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
         valid_time += time.perf_counter() - valid_start
         history['valid_metric'].append(metrics)
 
+        metric_value = metrics[valid_metric]
+        if metric_value > best_valid_value:
+            best_valid_value = metric_value
+            best_epoch = epoch
+            best_model_state = clone_model_state(model)
+
+        if tsne_config is not None:
+            generate_tsne_visualization(
+                model=model,
+                triples=valid_triples,
+                epoch=epoch,
+                target_epochs=milestone_epochs,
+                max_queries=tsne_config['max_queries'],
+                max_tails_per_query=tsne_config['max_tails_per_query'],
+                output_dir=tsne_config['output_dir'],
+                loss_name=loss_name,
+                running_results=metrics,
+            )
+
         postfix = format_training_postfix(
             valid_metric,
             metrics[valid_metric],
@@ -443,6 +585,22 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
             history['uniform_loss'][-1],
         )
         epoch_bar.set_postfix_str(postfix, refresh=True)
+
+    if tsne_config is not None and best_epoch is not None and best_epoch not in milestone_epochs:
+        final_model_state = clone_model_state(model)
+        model.load_state_dict(best_model_state)
+        generate_tsne_visualization(
+            model=model,
+            triples=valid_triples,
+            epoch=best_epoch,
+            target_epochs={best_epoch},
+            max_queries=tsne_config['max_queries'],
+            max_tails_per_query=tsne_config['max_tails_per_query'],
+            output_dir=tsne_config['output_dir'],
+            loss_name=loss_name,
+            running_results=history['valid_metric'][history['epochs'].index(best_epoch)],
+        )
+        model.load_state_dict(final_model_state)
 
     peak_gpu_memory_gb = None
     if args.cuda:
@@ -464,112 +622,25 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
     return history, model, args, datasets, timing
 
 
-def _truncate_history(history, display_epochs):
-    n = min(display_epochs, len(history['epochs']))
-    truncated = {}
-    for key, value in history.items():
-        if key == 'uniform':
-            truncated[key] = {k: v[:n] for k, v in value.items()}
-        else:
-            truncated[key] = value[:n]
-    return truncated
-
-
-def _place_legend_bottom_right(ax_right, lines):
-    ax_right.legend(
-        lines,
-        [line.get_label() for line in lines],
-        loc='lower right',
-        bbox_to_anchor=(1.0, 0.0),
-        bbox_transform=ax_right.transAxes,
-        frameon=True,
-        framealpha=0.95,
-    )
-
-
-def plot_alignment_uniformity(history, display_epochs, uniform_sets, output_path=None):
-    history = _truncate_history(history, display_epochs)
-    epochs = history['epochs']
-
-    fig, ax_left = plt.subplots(figsize=(6, 4))
-    ax_right = ax_left.twinx()
-
-    ax_left.plot(
-        epochs, history['align_loss'],
-        color='#e69138', linewidth=2, label=r'$l_{align}$'
-    )
-
-    uniform_lines = []
-    for key in uniform_sets:
-        color = UNIFORM_COLORS.get(key, '#6aa84f')
-        line, = ax_right.plot(
-            epochs, history['uniform'][key],
-            color=color, linewidth=2,
-            label=r'$l_{uniform}^{' + key + '}$',
-        )
-        uniform_lines.append(line)
-
-    ax_left.set_xlabel('training epochs')
-    ax_left.set_ylabel('alignment', color='#e69138')
-    ax_right.set_ylabel('uniformity', color='#6aa84f')
-    ax_left.tick_params(axis='y', labelcolor='#e69138')
-    ax_right.tick_params(axis='y', labelcolor='#6aa84f')
-    ax_left.set_xlim(min(epochs), max(epochs))
-
-    fig.tight_layout()
-    _place_legend_bottom_right(ax_right, uniform_lines)
-
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches='tight')
-    return fig
-
-
-def plot_loss_and_metric(history, valid_metric, display_epochs, loss_label='loss', output_path=None):
-    history = _truncate_history(history, display_epochs)
-    epochs = history['epochs']
-    metric_values = [m[valid_metric] for m in history['valid_metric']]
-
-    fig, ax_left = plt.subplots(figsize=(6, 4))
-    ax_right = ax_left.twinx()
-
-    line_loss, = ax_left.plot(
-        epochs, history['loss'],
-        color='#4a86e8', linewidth=2, label=loss_label
-    )
-    line_metric, = ax_right.plot(
-        epochs, metric_values,
-        color='#cc0000', linewidth=2, label='performance'
-    )
-
-    ax_left.set_xlabel('training epochs')
-    ax_left.set_ylabel(loss_label, color='#4a86e8')
-    ax_right.set_ylabel(valid_metric, color='#cc0000')
-    ax_left.tick_params(axis='y', labelcolor='#4a86e8')
-    ax_right.tick_params(axis='y', labelcolor='#cc0000')
-    ax_left.set_xlim(min(epochs), max(epochs))
-
-    lines = [line_loss, line_metric]
-    fig.tight_layout()
-    _place_legend_bottom_right(ax_right, lines)
-
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches='tight')
-    return fig
+def resolve_default_gpu():
+    return 1 if torch.cuda.is_available() else 0
 
 
 def visualize_training(
     config_path,
     valid_metric='MRR',
     display_epochs=100,
-    gpu=1,
-    output_dir=None,
-    show=True,
+    gpu=None,
+    output_dir='visualization/outputs/charts',
     uniform_sets=None,
+    tsne_config=None,
 ):
     config, config_path = load_config(resolve_path(config_path))
     num_epochs = resolve_num_epochs(config, display_epochs)
     args = build_args(config)
     uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_SETS)
+    if gpu is None:
+        gpu = resolve_default_gpu()
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
 
     print('Config: {}'.format(config_path))
@@ -578,48 +649,24 @@ def visualize_training(
     ))
     print('Training for {} epochs (displaying first {})'.format(num_epochs, display_epochs))
     print('Uniform sets: {}'.format(', '.join(uniform_sets)))
+    if tsne_config is not None:
+        print('t-SNE snapshots at epochs: 1, best valid, {}'.format(num_epochs))
+        print('t-SNE max queries: {}'.format(tsne_config['max_queries']))
+        print('t-SNE max tails per query: {}'.format(tsne_config['max_tails_per_query']))
 
     if output_dir is None:
-        output_dir = build_output_dir(config_path)
-    else:
-        output_dir = resolve_path(output_dir)
+        output_dir = 'visualization/outputs/charts'
+    output_dir = resolve_path(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     print('Output dir: {}'.format(output_dir))
 
+    if tsne_config is not None:
+        tsne_config = dict(tsne_config)
+        tsne_config['output_dir'] = output_dir
+
     history, model, args, datasets, timing = train_and_collect_history(
-        args, num_epochs, valid_metric=valid_metric, uniform_sets=uniform_sets,
+        args, num_epochs, valid_metric=valid_metric, uniform_sets=uniform_sets, tsne_config=tsne_config
     )
-
-    loss_label = {
-        'se': 'SE loss',
-        'hinge': 'Hinge loss',
-        'bce': 'BCE loss',
-        'mr': 'MR loss',
-        'bpr': 'BPR loss',
-        'ce': 'CE loss',
-        'sans': 'SANS loss',
-        'au': 'KGAU loss',
-    }.get(getattr(args, 'loss', 'sans'), get_loss_display_name(args) + ' loss')
-
-    fig_au = plot_alignment_uniformity(
-        history,
-        display_epochs,
-        uniform_sets,
-        output_path=os.path.join(output_dir, 'alignment_uniformity.png'),
-    )
-    fig_curve = plot_loss_and_metric(
-        history,
-        valid_metric,
-        display_epochs,
-        loss_label=loss_label,
-        output_path=os.path.join(output_dir, 'loss_and_{}.png'.format(valid_metric)),
-    )
-
-    if show:
-        plt.show()
-    else:
-        plt.close(fig_au)
-        plt.close(fig_curve)
 
     test_start = time.perf_counter()
     link_metrics, classification_metrics_dict = run_post_training_evaluation(
@@ -643,12 +690,12 @@ def visualize_training(
     )
     write_results_report(output_dir, report_text)
 
-    return history, fig_au, fig_curve
+    return history, model, timing
 
 
 def parse_cli():
     parser = argparse.ArgumentParser(
-        description='Train and visualize a KGE model from a JSON config file.'
+        description='Train a KGE model and save t-SNE embedding snapshots.'
     )
     parser.add_argument(
         'config',
@@ -657,32 +704,35 @@ def parse_cli():
         help='Path to config JSON (default: configs/ComplEx_WN18RR.json)',
     )
     parser.add_argument('--valid-metric', default='MRR', help='Validation metric for learning curve')
-    parser.add_argument('--display-epochs', type=int, default=100, help='First N epochs to train and plot')
-    parser.add_argument('--gpu', type=int, default=1, help='GPU device id')
-    parser.add_argument(
-        '--output-dir', default=None,
-        help='Directory to save PNG figures (default: visualization/outputs/<config_path>_<timestamp>)',
-    )
-    parser.add_argument('--no-show', action='store_true', help='Save figures without opening a window')
     parser.add_argument(
         '--uniform-sets', nargs='+', default=None,
         choices=list(UNIFORM_SET_KEYS),
-        help='Uniformity embedding pools to track and plot (default: query target)',
+        help='Uniformity embedding pools to track during training (default: query target entity)',
     )
     return parser.parse_args()
 
 
 def main():
+    display_epochs = 100
+    tsne_max_queries = 10
+    tsne_max_tails_per_query = 30
+    output_dir = 'visualization/outputs/charts'
+    gpu = resolve_default_gpu()
+
     cli = parse_cli()
+    tsne_params = {
+        'max_queries': tsne_max_queries,
+        'max_tails_per_query': tsne_max_tails_per_query,
+    }
 
     visualize_training(
         cli.config,
         valid_metric=cli.valid_metric,
-        display_epochs=cli.display_epochs,
-        gpu=cli.gpu,
-        output_dir=resolve_path(cli.output_dir) if cli.output_dir else None,
-        show=not cli.no_show,
+        display_epochs=display_epochs,
+        gpu=gpu,
+        output_dir=output_dir,
         uniform_sets=cli.uniform_sets,
+        tsne_config=tsne_params,
     )
 
 
