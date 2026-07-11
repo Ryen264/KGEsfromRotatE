@@ -74,7 +74,7 @@ class PointwiseHingeLoss(KGELoss):
         return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
 
     def __call__(self, positive_score, negative_score, subsampling_weight, model):
-        margin = self.args.gamma
+        margin = self.args.margin_gamma
         positive_loss = F.relu(margin - positive_score.squeeze(dim=1))
         negative_loss = F.relu(margin + negative_score).mean(dim=1)
         loss = self._weighted_mean((positive_loss + negative_loss) / 2, subsampling_weight)
@@ -140,7 +140,7 @@ class MarginRankingLoss(KGELoss):
         target = torch.ones_like(negative_score)
         per_sample_loss = F.margin_ranking_loss(
             positive_expanded, negative_score, target,
-            margin=self.args.gamma, reduction='none',
+            margin=self.args.margin_gamma, reduction='none',
         ).mean(dim=1)
         loss = self._weighted_mean(per_sample_loss, subsampling_weight)
         regularization_term, regularization_log = regularization(
@@ -263,9 +263,9 @@ class SelfAdversarialNegativeSamplingLoss(KGELoss):
 
 
 AU_UNIFORM_TERMS = [
-    ('query', 'uni_gamma_query'),
-    ('target', 'uni_gamma_target'),
-    ('entity', 'uni_gamma_entity'),
+    ('query', 'uniform_gamma_q'),
+    ('target', 'uniform_gamma_y'),
+    ('entity', 'uniform_gamma_e'),
 ]
 
 AU_GAMMA_KEY_BY_TERM = {term_key: gamma_key for term_key, gamma_key in AU_UNIFORM_TERMS}
@@ -347,9 +347,9 @@ class UniGammaController(object):
         for term_key in self.active_terms():
             eff = self.effective_gamma(model, term_key, epoch)
             if isinstance(eff, torch.Tensor):
-                log['uni_gamma_eff_{}'.format(term_key)] = eff.item()
+                log['uniform_gamma_eff_{}'.format(term_key)] = eff.item()
             else:
-                log['uni_gamma_eff_{}'.format(term_key)] = float(eff)
+                log['uniform_gamma_eff_{}'.format(term_key)] = float(eff)
         return log
 
 
@@ -395,7 +395,7 @@ class AlignmentUniformityLoss(KGELoss):
     Alignment-uniformity loss - a pairwise uniformity-based loss
     L = alignment_loss + Avg(uniformity_loss)_terms + regularization
     alignment_loss = (query_e - target_e).norm(p=2, dim=1).pow(2).mean()
-    uniformity_loss = torch.pdist(x, p=2).pow(2).mul(-tuni).exp().mean().log()
+    uniformity_loss = torch.pdist(x, p=2).pow(2).mul(-uniform_t).exp().mean().log()
     '''
     
     @staticmethod
@@ -404,13 +404,13 @@ class AlignmentUniformityLoss(KGELoss):
         return (x - y).norm(p=2, dim=1).pow(2).mean()
 
     @staticmethod
-    def uniformity(x, tuni=4):
+    def uniformity(x, uniform_t=4):
         x = F.normalize(x, dim=-1)
         if x.size(0) < 2:
             return (x * 0).sum()
-        return torch.pdist(x, p=2).pow(2).mul(-tuni).exp().mean().log()
+        return torch.pdist(x, p=2).pow(2).mul(-uniform_t).exp().mean().log()
 
-    def _compute_uniform_terms(self, head, relation, tail, query_e, target_e, model, tuni):
+    def _compute_uniform_terms(self, head, relation, tail, query_e, target_e, model, uniform_t=4):
         uniform_loss_sum = query_e.new_zeros(())
         uniform_count = 0
         uniform_log = {}
@@ -425,7 +425,7 @@ class AlignmentUniformityLoss(KGELoss):
             embeddings = get_au_uniform_embeddings(
                 head, relation, tail, query_e, target_e, term_key,
             )
-            uniform_val = self.uniformity(embeddings, tuni=tuni)
+            uniform_val = self.uniformity(embeddings, uniform_t=uniform_t)
             if learnable:
                 gamma_weight = controller.effective_gamma(model, term_key, epoch)
             else:
@@ -439,19 +439,19 @@ class AlignmentUniformityLoss(KGELoss):
                     if isinstance(gamma_weight, torch.Tensor)
                     else float(gamma_weight)
                 )
-                uniform_log['uni_gamma_eff_{}'.format(term_key)] = eff_item
+                uniform_log['uniform_gamma_eff_{}'.format(term_key)] = eff_item
 
         return uniform_loss_sum, uniform_count, uniform_log
 
     def calculate_loss(self, head, relation, tail, model, mode):
-        tuni = getattr(self.args, 'tuni', 4)
+        uniform_t = getattr(self.args, 'uniform_t', 4)
 
         query_e = model.query_encoder(head, relation, tail, mode=mode)
         target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
         align_loss = self.alignment(query_e, target_e)
 
         uniform_loss_sum, uniform_count, uniform_log = self._compute_uniform_terms(
-            head, relation, tail, query_e, target_e, model, tuni,
+            head, relation, tail, query_e, target_e, model, uniform_t,
         )
 
         if uniform_count > 0:

@@ -47,7 +47,7 @@ def parse_args(args=None):
     
     parser.add_argument('-n', '--negative_sample_size', default=128, type=int)
     parser.add_argument('-d', '--dim', default=500, type=int)
-    parser.add_argument('-g', '--gamma', default=12.0, type=float)
+    parser.add_argument('-g', '--margin_gamma', default=12.0, type=float)
     parser.add_argument('-adv', '--negative_adversarial_sampling', action='store_true')
     parser.add_argument('-a', '--adversarial_temperature', default=1.0, type=float)
     parser.add_argument('-b', '--batch_size', default=1024, type=int)
@@ -77,13 +77,13 @@ def parse_args(args=None):
                         choices=['se', 'hinge', 'bce', 'mr', 'bpr', 'ce', 'sans', 'au'],
                         help='Training loss (see codes/loss.py)')
 
-    parser.add_argument('--tuni', default=2, type=float,
+    parser.add_argument('--uniform_t', default=4, type=float,
                         help='Uniformity temperature for AU loss')
-    parser.add_argument('--uni-gamma-query', dest='uni_gamma_query', default=1.0, type=float,
+    parser.add_argument('--uniform-gamma-q', dest='uniform_gamma_q', default=1.0, type=float,
                         help='Initial AU uniformity weight for query embeddings (0=off)')
-    parser.add_argument('--uni-gamma-target', dest='uni_gamma_target', default=1.0, type=float,
+    parser.add_argument('--uniform-gamma-y', dest='uniform_gamma_y', default=1.0, type=float,
                         help='Initial AU uniformity weight for target embeddings (0=off)')
-    parser.add_argument('--uni-gamma-entity', dest='uni_gamma_entity', default=0.0, type=float,
+    parser.add_argument('--uniform-gamma-e', dest='uniform_gamma_e', default=0.0, type=float,
                         help='Initial AU uniformity weight for entity embeddings (0=off)')
 
     parser.add_argument('--learnable_au_gammas', action='store_true',
@@ -260,7 +260,7 @@ def main(args):
         nentity=nentity,
         nrelation=nrelation,
         dim=args.dim,
-        gamma=args.gamma,
+        margin_gamma=args.margin_gamma,
         double_entity_embedding=args.double_entity_embedding,
         double_relation_embedding=args.double_relation_embedding
     )
@@ -331,7 +331,7 @@ def main(args):
     logging.info('batch_size = %d' % args.batch_size)
     logging.info('negative_adversarial_sampling = %d' % args.negative_adversarial_sampling)
     logging.info('dim = %d' % args.dim)
-    logging.info('gamma = %f' % args.gamma)
+    logging.info('margin_gamma = %f' % args.margin_gamma)
     logging.info('negative_adversarial_sampling = %s' % str(args.negative_adversarial_sampling))
     if args.negative_adversarial_sampling:
         logging.info('adversarial_temperature = %f' % args.adversarial_temperature)

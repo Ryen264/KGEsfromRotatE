@@ -263,7 +263,7 @@ def build_model_and_iterator(args, train_triples):
         nentity=args.nentity,
         nrelation=args.nrelation,
         dim=args.dim,
-        gamma=args.gamma,
+        margin_gamma=args.margin_gamma,
         double_entity_embedding=args.double_entity_embedding,
         double_relation_embedding=args.double_relation_embedding,
     )
@@ -323,7 +323,7 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
 
     align_loss = au.alignment(query_e, target_e).item()
     
-    tuni = getattr(args, 'tuni', 2)
+    uniform_t = getattr(args, 'uniform_t', 4)
     uniform_components = {}
 
     embeddings = {
@@ -336,7 +336,7 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     }
 
     for key in uniform_sets:
-        uniform_components[key] = au.uniformity(embeddings[key], tuni=tuni).item()
+        uniform_components[key] = au.uniformity(embeddings[key], uniform_t=uniform_t).item()
 
     uniform_loss = float(np.mean(list(uniform_components.values())))
     return align_loss, uniform_components, uniform_loss

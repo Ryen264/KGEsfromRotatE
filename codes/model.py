@@ -81,7 +81,7 @@ KGE_SCORERS = {
 
 
 class KGEModel(nn.Module):
-    def __init__(self, model_name, nentity, nrelation, dim, gamma, 
+    def __init__(self, model_name, nentity, nrelation, dim, margin_gamma, 
                  double_entity_embedding=False, double_relation_embedding=False):
         super(KGEModel, self).__init__()
         self.model_name = model_name
@@ -90,13 +90,13 @@ class KGEModel(nn.Module):
         self.dim = dim
         self.epsilon = 2.0
         
-        self.gamma = nn.Parameter(
-            torch.Tensor([gamma]), 
+        self.margin_gamma = nn.Parameter(
+            torch.Tensor([margin_gamma]), 
             requires_grad=False
         )
         
         self.embedding_range = nn.Parameter(
-            torch.Tensor([(self.gamma.item() + self.epsilon) / dim]), 
+            torch.Tensor([(self.margin_gamma.item() + self.epsilon) / dim]), 
             requires_grad=False
         )
         

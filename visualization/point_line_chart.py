@@ -20,7 +20,7 @@ class Point:
     dim: int = 0
     batch_size: int = 0
     negative_sample_size: int = 0
-    tuni: int = 0
+    uniform_t: int = 0
 
 def resolve_path(path):
     if os.path.isabs(path):
@@ -155,12 +155,12 @@ if __name__ == "__main__":
         Point(name="DaBR",     year=2025, MRR=0.3730, dim=500,      batch_size=100,     negative_sample_size=10)
     ]
 
-    tuni_points = [
-        Point(name="t=2", tuni=2, MRR=0.3862, hit_1=0.3038),
-        Point(name="t=3", tuni=3, MRR=0.4483, hit_1=0.3866),
-        Point(name="t=4", tuni=4, MRR=0.4658, hit_1=0.4218),
-        Point(name="t=5", tuni=5, MRR=0.4571, hit_1=0.4148),
-        Point(name="t=6", tuni=6, MRR=0.4571, hit_1=0.4145)
+    uniform_t_points = [
+        Point(name="t=2", uniform_t=2, MRR=0.3862, hit_1=0.3038),
+        Point(name="t=3", uniform_t=3, MRR=0.4483, hit_1=0.3866),
+        Point(name="t=4", uniform_t=4, MRR=0.4658, hit_1=0.4218),
+        Point(name="t=5", uniform_t=5, MRR=0.4571, hit_1=0.4148),
+        Point(name="t=6", uniform_t=6, MRR=0.4571, hit_1=0.4145)
     ]
 
     dim_points = [
@@ -197,8 +197,8 @@ if __name__ == "__main__":
     # )
 
     # draw_chart(
-    #     points=tuni_points, 
-    #     x_axis="tuni", x_title="Uniformity Temperature",
+    #     points=uniform_t_points, 
+    #     x_axis="uniform_t", x_title="Uniformity Temperature",
     #     y_axis="MRR", y_title="MRR",
     #     color_axis="hit_1", color_title="Hit@1", color_map="Blues",
     #     title="Analysis of ComplEx-AU over different Uniformity Temperatures on WN18RR",

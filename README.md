@@ -95,7 +95,7 @@ def TransE(self, head, relation, tail, mode):
     else:
         score = (head + relation) - tail
 
-    score = self.gamma.item() - torch.norm(score, p=1, dim=2)
+    score = self.margin_gamma.item() - torch.norm(score, p=1, dim=2)
     return score
 ```
 

@@ -264,7 +264,7 @@ def build_model_and_iterator(args, train_triples):
         nentity=args.nentity,
         nrelation=args.nrelation,
         dim=args.dim,
-        gamma=args.gamma,
+        margin_gamma=args.margin_gamma,
         double_entity_embedding=args.double_entity_embedding,
         double_relation_embedding=args.double_relation_embedding,
     )
@@ -324,7 +324,7 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
 
     align_loss = au.alignment(query_e, target_e).item()
     
-    tuni = getattr(args, 'tuni', 2)
+    uniform_t = getattr(args, 'uniform_t', 4)
     uniform_components = {}
 
     embeddings = {
@@ -337,7 +337,7 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     }
 
     for key in uniform_sets:
-        uniform_components[key] = au.uniformity(embeddings[key], tuni=tuni).item()
+        uniform_components[key] = au.uniformity(embeddings[key], uniform_t=uniform_t).item()
 
     uniform_loss = float(np.mean(list(uniform_components.values())))
     return align_loss, uniform_components, uniform_loss
@@ -397,7 +397,7 @@ def rank_top_tails(model, head, relation, max_tails):
 
 def generate_tsne_visualization(
     model, triples, epoch, target_epochs, max_queries, max_tails_per_query,
-    output_dir, loss_name, running_results,
+    output_dir, config_stem,
 ):
     """
     Builds a t-SNE scatter plot where each point is a tail (target) entity embedding.
@@ -486,7 +486,10 @@ def generate_tsne_visualization(
 
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    save_path = os.path.join(output_dir, f"tsne_{loss_name}_epoch_{epoch}_{timestamp}.png")
+    save_path = os.path.join(
+        output_dir,
+        'tsne_epoch_{}_{}_{}.png'.format(epoch, config_stem, timestamp),
+    )
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"\n[t-SNE Snapshot Triggered] Image saved for Epoch {epoch} to: {save_path}")
@@ -572,8 +575,7 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
                 max_queries=tsne_config['max_queries'],
                 max_tails_per_query=tsne_config['max_tails_per_query'],
                 output_dir=tsne_config['output_dir'],
-                loss_name=loss_name,
-                running_results=metrics,
+                config_stem=tsne_config['config_stem'],
             )
 
         postfix = format_training_postfix(
@@ -597,8 +599,7 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
             max_queries=tsne_config['max_queries'],
             max_tails_per_query=tsne_config['max_tails_per_query'],
             output_dir=tsne_config['output_dir'],
-            loss_name=loss_name,
-            running_results=history['valid_metric'][history['epochs'].index(best_epoch)],
+            config_stem=tsne_config['config_stem'],
         )
         model.load_state_dict(final_model_state)
 
@@ -663,6 +664,7 @@ def visualize_training(
     if tsne_config is not None:
         tsne_config = dict(tsne_config)
         tsne_config['output_dir'] = output_dir
+        tsne_config['config_stem'] = os.path.splitext(os.path.basename(config_path))[0]
 
     history, model, args, datasets, timing = train_and_collect_history(
         args, num_epochs, valid_metric=valid_metric, uniform_sets=uniform_sets, tsne_config=tsne_config

@@ -11,9 +11,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 @dataclass
 class GammaPoint:
     name: str           # Label displayed on the X-axis (e.g., "0" or "1")
-    query_gamma: int    # 0 or 1
-    target_gamma: int   # 0 or 1
-    entity_gamma: int   # 0 or 1 (X-axis value)
+    uniform_gamma_q: int    # 0 or 1
+    uniform_gamma_y: int   # 0 or 1
+    uniform_gamma_e: int   # 0 or 1 (X-axis value)
     MRR: float          # Validation metric (Y-axis value)
 
 
@@ -89,40 +89,40 @@ if __name__ == "__main__":
     # Replace these dummy MRR values with your actual experiment log metrics
     gamma_experimental_results = [
         # Case (Query=0, Target=0)
-        GammaPoint(name="0", query_gamma=0, target_gamma=0, entity_gamma=0, MRR=0.0088),
-        GammaPoint(name="1", query_gamma=0, target_gamma=0, entity_gamma=1, MRR=0.4650),
+        GammaPoint(name="0", uniform_gamma_q=0, uniform_gamma_y=0, uniform_gamma_e=0, MRR=0.0088),
+        GammaPoint(name="1", uniform_gamma_q=0, uniform_gamma_y=0, uniform_gamma_e=1, MRR=0.4650),
         
         # Case (Query=0, Target=1)
-        GammaPoint(name="0", query_gamma=0, target_gamma=1, entity_gamma=0, MRR=0.4551),
-        GammaPoint(name="1", query_gamma=0, target_gamma=1, entity_gamma=1, MRR=0.4636),
+        GammaPoint(name="0", uniform_gamma_q=0, uniform_gamma_y=1, uniform_gamma_e=0, MRR=0.4551),
+        GammaPoint(name="1", uniform_gamma_q=0, uniform_gamma_y=1, uniform_gamma_e=1, MRR=0.4636),
         
         # Case (Query=1, Target=0)
-        GammaPoint(name="0", query_gamma=1, target_gamma=0, entity_gamma=0, MRR=0.4573),
-        GammaPoint(name="1", query_gamma=1, target_gamma=0, entity_gamma=1, MRR=0.4642),
-        
+        GammaPoint(name="0", uniform_gamma_q=1, uniform_gamma_y=0, uniform_gamma_e=0, MRR=0.4573),
+        GammaPoint(name="1", uniform_gamma_q=1, uniform_gamma_y=0, uniform_gamma_e=1, MRR=0.4642),
+
         # Case (Query=1, Target=1)
-        GammaPoint(name="0", query_gamma=1, target_gamma=1, entity_gamma=0, MRR=0.4555),
-        GammaPoint(name="1", query_gamma=1, target_gamma=1, entity_gamma=1, MRR=0.4658),
+        GammaPoint(name="0", uniform_gamma_q=1, uniform_gamma_y=1, uniform_gamma_e=0, MRR=0.4555),
+        GammaPoint(name="1", uniform_gamma_q=1, uniform_gamma_y=1, uniform_gamma_e=1, MRR=0.4658),
     ]
     
-    # Define the 4 target combinations of (query_gamma, target_gamma)
+    # Define the 4 target combinations of (uniform_gamma_q, uniform_gamma_y)
     target_cases = [(0, 0), (0, 1), (1, 0), (1, 1)]
     
     # Palette configuration to distinguish the 4 charts visually
     colors = ["crimson", "teal", "royalblue", "darkorchid"]
 
-    for idx, (q_gamma, t_gamma) in enumerate(target_cases):
+    for idx, (uniform_gamma_q, uniform_gamma_y) in enumerate(target_cases):
         # 1. Filter points matching the precise (Query, Target) background context
         filtered_points = [
             p for p in gamma_experimental_results 
-            if p.query_gamma == q_gamma and p.target_gamma == t_gamma
+            if p.uniform_gamma_q == uniform_gamma_q and p.uniform_gamma_y == uniform_gamma_y
         ]
         
         # 2. Sort by entity gamma to guarantee chronological 0 -> 1 order on X axis
-        filtered_points.sort(key=lambda p: p.entity_gamma)
+        filtered_points.sort(key=lambda p: p.uniform_gamma_e)
         
         # 3. Construct descriptive chart names
-        chart_title = f"Query Gamma={q_gamma}, Target Gamma={t_gamma}"
+        chart_title = f"Query Gamma={uniform_gamma_q}, Target Gamma={uniform_gamma_y}"
         
         # 4. Render and commit image to disk
         draw_chart(

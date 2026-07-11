@@ -20,7 +20,7 @@ SAVE=$SAVE_PATH/"$MODEL"_"$DATASET"_"$SAVE_ID"
 BATCH_SIZE=$6
 NEGATIVE_SAMPLE_SIZE=$7
 DIM=$8
-GAMMA=$9
+MARGIN_GAMMA=$9
 ALPHA=${10}
 LEARNING_RATE=${11}
 EPOCHS=${12}
@@ -38,7 +38,7 @@ CUDA_VISIBLE_DEVICES=$GPU_DEVICE python -u $CODE_PATH/run.py --do_train \
     --data_path $FULL_DATA_PATH \
     --model $MODEL \
     -n $NEGATIVE_SAMPLE_SIZE -b $BATCH_SIZE -d $DIM \
-    -g $GAMMA -a $ALPHA -adv \
+    -g $MARGIN_GAMMA -a $ALPHA -adv \
     -lr $LEARNING_RATE --epochs $EPOCHS \
     -save $SAVE --test_batch_size $TEST_BATCH_SIZE \
     ${14} ${15} ${16} ${17} ${18} ${19} ${20}

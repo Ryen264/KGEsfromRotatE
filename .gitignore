@@ -18,6 +18,9 @@ visualization/outputs/
 nohup/logs/*.log
 nohup/job.pid
 nohup/job.meta
+nohup/emb_tsne/logs/*.log
+nohup/emb_tsne/job.pid
+nohup/emb_tsne/job.meta
 
 # IDE / editor
 .cursor/
