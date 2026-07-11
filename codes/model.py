@@ -117,9 +117,6 @@ class KGEModel(nn.Module):
             b=self.embedding_range.item()
         )
         
-        if model_name == 'pRotatE':
-            self.modulus = nn.Parameter(torch.Tensor([[0.5 * self.embedding_range.item()]]))
-
         if model_name == 'ComplEx' and (not double_entity_embedding or not double_relation_embedding):
             raise ValueError('ComplEx should use --double_entity_embedding and --double_relation_embedding')
 
@@ -317,9 +314,7 @@ class KGEModel(nn.Module):
             )
             
             test_dataset_list = [test_dataloader_head, test_dataloader_tail]
-
             ranks = []
-
             step = 0
             total_steps = sum([len(dataset) for dataset in test_dataset_list])
 
@@ -347,7 +342,5 @@ class KGEModel(nn.Module):
                             logging.info('Evaluating the model... (%d/%d)' % (step, total_steps))
 
                         step += 1
-
             metrics = rotate_ranking_metrics_from_ranks(ranks)
-
         return metrics

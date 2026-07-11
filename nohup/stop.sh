@@ -1,5 +1,5 @@
 #!/bin/sh
-# Stop the background job started by nohup/run.sh.
+# Stop the background job started by nohup/run_main.sh or nohup/run_emb_tsne.sh.
 #
 # Usage:
 #   ./nohup/stop.sh

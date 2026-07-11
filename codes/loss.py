@@ -494,14 +494,14 @@ class KGmAULoss(KGELoss):
     '''
     KGmAU Loss - Margin Alignment-Uniformity Loss for Knowledge Graph Embeddings
     L = margin_alignment_loss + Avg(uniformity_loss)_terms + regularization
-    margin_alignment_loss = max(0, margin + L2-distance(query_e, target_e)^2).mean()
+    margin_alignment_loss = -max(0, margin - L2-distance(query_e, target_e)^2).mean()
     uniformity_loss = log(exp(-uniform_t * L2-distance(x, x')^2).mean())
     '''
     
     @staticmethod
     def margin_alignment(x, y, margin_gamma=200.0):
         x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
-        return F.relu(margin_gamma + (x - y).norm(p=2, dim=1).pow(2).mean())
+        return -F.relu(margin_gamma - (x - y).norm(p=2, dim=1).pow(2).mean())
 
     @staticmethod
     def uniformity(x, uniform_t=4):
@@ -590,21 +590,21 @@ class KGmAmULoss(KGELoss):
     '''
     KGmAmU Loss - Margin Alignment-Margin Alignment-Uniformity Loss for Knowledge Graph Embeddings
     L = margin_alignment_loss + Avg(uniformity_loss)_terms + regularization
-    margin_alignment_loss = max(0, margin + L2-distance(query_e, target_e)^2).mean()
-    margin_uniformity_loss = log(exp(-uniform_t * max(0, margin + L2-distance(x, x')^2)).mean())
+    margin_alignment_loss = -max(0, margin - L2-distance(query_e, target_e)^2).mean()
+    margin_uniformity_loss = -log(exp(-uniform_t * max(0, margin - L2-distance(x, x')^2)).mean())
     '''
     
     @staticmethod
     def margin_alignment(x, y, margin_gamma=200.0):
         x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
-        return F.relu(margin_gamma + (x - y).norm(p=2, dim=1).pow(2).mean())
+        return -F.relu(margin_gamma - (x - y).norm(p=2, dim=1).pow(2).mean())
 
     @staticmethod
     def margin_uniformity(x, margin_gamma=200.0, uniform_t=4):
         x = F.normalize(x, dim=-1)
         if x.size(0) < 2:
             return (x * 0).sum()
-        return F.relu(margin_gamma + torch.pdist(x, p=2).pow(2).mul(-uniform_t).exp().mean().log())
+        return -F.relu(margin_gamma - torch.pdist(x, p=2).pow(2).mul(-uniform_t).exp().mean().log())
 
     def _compute_margin_uniformity_terms(self, head, relation, tail, query_e, target_e, model, margin_gamma=200.0, uniform_t=4):
         margin_uniformity_loss_sum = query_e.new_zeros(())

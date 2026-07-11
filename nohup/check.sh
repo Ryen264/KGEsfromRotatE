@@ -1,5 +1,5 @@
 #!/bin/sh
-# Check status of the background job started by nohup/run.sh.
+# Check status of the background job started by nohup/run_main.sh or nohup/run_emb_tsne.sh.
 #
 # Usage:
 #   ./nohup/check.sh
