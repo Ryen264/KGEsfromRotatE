@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from dataloader import TestDataset
-from loss import compute_kge_loss, UniGammaController, is_learnable_au_gammas
+from loss import compute_kge_loss, UniGammaController, is_learnable_kgau_gammas
 from metrics.classification import classification_metrics
 from metrics.ranking import ranks_from_score_matrix, rotate_ranking_metrics_from_ranks
 
@@ -248,7 +248,7 @@ class KGEModel(nn.Module):
 
         optimizer.step()
 
-        if is_learnable_au_gammas(args):
+        if is_learnable_kgau_gammas(args):
             UniGammaController(args).clamp_log_gammas(model)
 
         return log

@@ -262,20 +262,20 @@ class SelfAdversarialNegativeSamplingLoss(KGELoss):
         return loss, log
 
 
-AU_UNIFORM_TERMS = [
+KGAU_UNIFORM_TERMS = [
     ('query', 'uniform_gamma_q'),
     ('target', 'uniform_gamma_y'),
     ('entity', 'uniform_gamma_e'),
 ]
 
-AU_GAMMA_KEY_BY_TERM = {term_key: gamma_key for term_key, gamma_key in AU_UNIFORM_TERMS}
+KGAU_GAMMA_KEY_BY_TERM = {term_key: gamma_key for term_key, gamma_key in KGAU_UNIFORM_TERMS}
 
 
-def is_learnable_au_gammas(args):
-    return getattr(args, 'loss', '') == 'au' and getattr(args, 'learnable_au_gammas', False)
+def is_learnable_kgau_gammas(args):
+    return getattr(args, 'loss', '') == 'kgau' and getattr(args, 'learnable_kgau_gammas', False)
 
 
-def get_au_uniform_embeddings(head, relation, tail, query_e, target_e, term_key):
+def get_kgau_uniform_embeddings(head, relation, tail, query_e, target_e, term_key):
     if term_key == 'query':
         return query_e
     if term_key == 'target':
@@ -288,7 +288,7 @@ def get_au_uniform_embeddings(head, relation, tail, query_e, target_e, term_key)
         return torch.cat([head, tail], dim=0)
     if term_key == 'relation':
         return relation
-    raise ValueError('Unknown AU uniform term key: {}'.format(term_key))
+    raise ValueError('Unknown KGAU uniform term key: {}'.format(term_key))
 
 
 class UniGammaController(object):
@@ -297,13 +297,13 @@ class UniGammaController(object):
 
     def active_terms(self):
         active = []
-        for term_key, gamma_key in AU_UNIFORM_TERMS:
+        for term_key, gamma_key in KGAU_UNIFORM_TERMS:
             if getattr(self.args, gamma_key, 0.0) > 0:
                 active.append(term_key)
         return active
 
     def gamma_init(self, term_key):
-        gamma_key = AU_GAMMA_KEY_BY_TERM[term_key]
+        gamma_key = KGAU_GAMMA_KEY_BY_TERM[term_key]
         return getattr(self.args, gamma_key, 0.0)
 
     def schedule_mult(self, epoch):
@@ -319,27 +319,27 @@ class UniGammaController(object):
         return 1.0 + progress * (end_mult - 1.0)
 
     def effective_gamma(self, model, term_key, epoch):
-        if not hasattr(model, 'au_log_gamma_adj'):
+        if not hasattr(model, 'kgau_log_gamma_adj'):
             self.ensure_model_params(model)
         gamma_init = self.gamma_init(term_key)
         schedule = self.schedule_mult(epoch)
-        log_adj = torch.clamp(model.au_log_gamma_adj[term_key], max=0.0)
+        log_adj = torch.clamp(model.kgau_log_gamma_adj[term_key], max=0.0)
         return gamma_init * schedule * torch.exp(log_adj)
 
     def ensure_model_params(self, model):
-        if hasattr(model, 'au_log_gamma_adj'):
+        if hasattr(model, 'kgau_log_gamma_adj'):
             return
         active = self.active_terms()
         if not active:
             return
         device = model.entity_embedding.device
-        model.au_log_gamma_adj = nn.ParameterDict({
+        model.kgau_log_gamma_adj = nn.ParameterDict({
             term_key: nn.Parameter(torch.zeros((), device=device))
             for term_key in active
         })
 
     def clamp_log_gammas(self, model):
-        for param in model.au_log_gamma_adj.parameters():
+        for param in model.kgau_log_gamma_adj.parameters():
             param.data.clamp_(max=0.0)
 
     def log_effective_gammas(self, model, epoch):
@@ -353,8 +353,8 @@ class UniGammaController(object):
         return log
 
 
-def update_au_gamma_schedule(args):
-    if not is_learnable_au_gammas(args):
+def update_kgau_gamma_schedule(args):
+    if not is_learnable_kgau_gammas(args):
         return 1.0
     controller = UniGammaController(args)
     epoch = getattr(args, 'current_epoch', 0)
@@ -364,17 +364,17 @@ def update_au_gamma_schedule(args):
 
 def build_training_optimizer(model, args):
     lr = args.learning_rate
-    if not is_learnable_au_gammas(args):
+    if not is_learnable_kgau_gammas(args):
         return torch.optim.Adam(
             filter(lambda p: p.requires_grad, model.parameters()),
             lr=lr,
         )
 
-    gamma_lr = getattr(args, 'log_au_gamma_lr', None) or lr
+    gamma_lr = getattr(args, 'log_kgau_gamma_lr', None) or lr
     embedding_params = []
     gamma_params = []
     for name, param in model.named_parameters():
-        if name.startswith('au_log_gamma_adj.'):
+        if name.startswith('kgau_log_gamma_adj.'):
             gamma_params.append(param)
         else:
             embedding_params.append(param)
@@ -390,9 +390,9 @@ def set_optimizer_learning_rates(optimizer, lr, gamma_lr=None):
         optimizer.param_groups[1]['lr'] = gamma_lr if gamma_lr is not None else lr
 
 
-class AlignmentUniformityLoss(KGELoss):
+class KGAULoss(KGELoss):
     '''
-    Alignment-uniformity loss - a pairwise uniformity-based loss
+    KGAU Loss - Alignment-Uniformity Loss for Knowledge Graph Embeddings
     L = alignment_loss + Avg(uniformity_loss)_terms + regularization
     alignment_loss = (query_e - target_e).norm(p=2, dim=1).pow(2).mean()
     uniformity_loss = torch.pdist(x, p=2).pow(2).mul(-uniform_t).exp().mean().log()
@@ -415,14 +415,14 @@ class AlignmentUniformityLoss(KGELoss):
         uniform_count = 0
         uniform_log = {}
         epoch = getattr(self.args, 'current_epoch', 0)
-        learnable = is_learnable_au_gammas(self.args)
+        learnable = is_learnable_kgau_gammas(self.args)
         controller = UniGammaController(self.args) if learnable else None
 
-        for term_key, gamma_key in AU_UNIFORM_TERMS:
+        for term_key, gamma_key in KGAU_UNIFORM_TERMS:
             gamma_init = getattr(self.args, gamma_key, 0.0)
             if gamma_init <= 0:
                 continue
-            embeddings = get_au_uniform_embeddings(
+            embeddings = get_kgau_uniform_embeddings(
                 head, relation, tail, query_e, target_e, term_key,
             )
             uniform_val = self.uniformity(embeddings, uniform_t=uniform_t)
@@ -478,7 +478,7 @@ class AlignmentUniformityLoss(KGELoss):
 
     def __call__(self, positive_score, negative_score, subsampling_weight, model):
         raise NotImplementedError(
-            'AlignmentUniformityLoss requires positive triple embeddings; '
+            'KGAU Loss requires positive triple embeddings; '
             'use compute_kge_loss with positive_sample and mode.'
         )
 
@@ -491,7 +491,7 @@ LOSS_REGISTRY = {
     'bpr': BayesianPersonalizedRankingLoss,
     'ce': CrossEntropyLoss,
     'sans': SelfAdversarialNegativeSamplingLoss,
-    'au': AlignmentUniformityLoss,
+    'kgau': KGAULoss,
 }
 
 def get_loss(args):
@@ -503,9 +503,9 @@ def get_loss(args):
 def compute_kge_loss(positive_score, negative_score, subsampling_weight, model, args,
                      positive_sample=None, mode=None):
     loss_name = getattr(args, 'loss', 'sans')
-    if loss_name == 'au':
+    if loss_name == 'kgau':
         if positive_sample is None or mode is None:
-            raise ValueError('AlignmentUniformityLoss requires positive_sample and mode')
+            raise ValueError('KGAU Loss requires positive_sample and mode')
         head = model.entity_embedding[positive_sample[:, 0]]
         relation = model.relation_embedding[positive_sample[:, 1]]
         tail = model.entity_embedding[positive_sample[:, 2]]

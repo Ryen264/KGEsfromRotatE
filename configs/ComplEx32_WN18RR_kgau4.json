@@ -1,8 +1,8 @@
 {
   "model": "ComplEx",
   "data_path": "data/wn18rr",
-  "loss": "au",
-  "dim": 256,
+  "loss": "kgau",
+  "dim": 32,
   "batch_size": 512,
   "margin_gamma": 200.0,
   "learning_rate": 0.002,
@@ -13,7 +13,7 @@
   "regularization_coeff": 0.000005,
   "regularization_p": 3,
   "uniform_t": 4,
-  "uniform_gamma_q": 0.0,
-  "uniform_gamma_y": 0.0,
+  "uniform_gamma_q": 1.0,
+  "uniform_gamma_y": 1.0,
   "uniform_gamma_e": 1.0
 }

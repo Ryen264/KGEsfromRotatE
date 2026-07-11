@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(ROOT, 'codes'))
 
 import run as train_run
 from dataloader import BidirectionalOneShotIterator, TrainDataset
-from loss import AlignmentUniformityLoss, compute_kge_loss, UniGammaController, build_training_optimizer, is_learnable_au_gammas, update_au_gamma_schedule
+from loss import KGAULoss, compute_kge_loss, UniGammaController, build_training_optimizer, is_learnable_kgau_gammas, update_kgau_gamma_schedule
 from metrics.classification import classification_metrics_from_probs
 from model import KGEModel
 
@@ -36,7 +36,7 @@ LOSS_DISPLAY_NAMES = {
     'bpr': 'BPR',
     'ce': 'CE',
     'sans': 'SA',
-    'au': 'AU',
+    'kgau': 'KGAU',
 }
 
 
@@ -271,7 +271,7 @@ def build_model_and_iterator(args, train_triples):
     if args.cuda:
         model = model.cuda()
 
-    if is_learnable_au_gammas(args):
+    if is_learnable_kgau_gammas(args):
         UniGammaController(args).ensure_model_params(model)
 
     train_dataloader_head = DataLoader(
@@ -314,7 +314,7 @@ def validate_uniform_sets(uniform_sets):
 
 
 def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
-    au = AlignmentUniformityLoss(args)
+    kgau = KGAULoss(args)
     head = model.entity_embedding[positive_sample[:, 0]]
     relation = model.relation_embedding[positive_sample[:, 1]]
     tail = model.entity_embedding[positive_sample[:, 2]]
@@ -322,7 +322,7 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     query_e = model.query_encoder(head, relation, tail, mode=mode)
     target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
 
-    align_loss = au.alignment(query_e, target_e).item()
+    align_loss = kgau.alignment(query_e, target_e).item()
     
     uniform_t = getattr(args, 'uniform_t', 4)
     uniform_components = {}
@@ -337,7 +337,7 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     }
 
     for key in uniform_sets:
-        uniform_components[key] = au.uniformity(embeddings[key], uniform_t=uniform_t).item()
+        uniform_components[key] = kgau.uniformity(embeddings[key], uniform_t=uniform_t).item()
 
     uniform_loss = float(np.mean(list(uniform_components.values())))
     return align_loss, uniform_components, uniform_loss
@@ -362,7 +362,7 @@ def train_step_with_metrics(model, optimizer, train_iterator, args, uniform_sets
     loss.backward()
     optimizer.step()
 
-    if is_learnable_au_gammas(args):
+    if is_learnable_kgau_gammas(args):
         UniGammaController(args).clamp_log_gammas(model)
 
     align_loss, uniform_components, uniform_loss = compute_au_metrics(
@@ -527,9 +527,9 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
         dynamic_ncols=True,
     )
     for epoch in epoch_bar:
-        if is_learnable_au_gammas(args):
+        if is_learnable_kgau_gammas(args):
             args.current_epoch = epoch
-            update_au_gamma_schedule(args)
+            update_kgau_gamma_schedule(args)
 
         batch_logs = []
         train_start = time.perf_counter()

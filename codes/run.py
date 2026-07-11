@@ -17,7 +17,7 @@ from model import KGEModel
 
 from dataloader import TrainDataset
 from dataloader import BidirectionalOneShotIterator
-from loss import UniGammaController, build_training_optimizer, is_learnable_au_gammas, set_optimizer_learning_rates, update_au_gamma_schedule
+from loss import UniGammaController, build_training_optimizer, is_learnable_kgau_gammas, set_optimizer_learning_rates, update_kgau_gamma_schedule
 
 def steps_per_epoch(num_train_triples, batch_size):
     batches = (num_train_triples + batch_size - 1) // batch_size
@@ -74,30 +74,30 @@ def parse_args(args=None):
     parser.add_argument('--test_log_steps', default=1000, type=int, help='valid/test log every xx steps')
     
     parser.add_argument('--loss', default='sans', type=str,
-                        choices=['se', 'hinge', 'bce', 'mr', 'bpr', 'ce', 'sans', 'au'],
+                        choices=['se', 'hinge', 'bce', 'mr', 'bpr', 'ce', 'sans', 'kgau'],
                         help='Training loss (see codes/loss.py)')
 
     parser.add_argument('--uniform_t', default=4, type=float,
-                        help='Uniformity temperature for AU loss')
+                        help='Uniformity temperature for KGAU loss')
     parser.add_argument('--uniform-gamma-q', dest='uniform_gamma_q', default=1.0, type=float,
-                        help='Initial AU uniformity weight for query embeddings (0=off)')
+                        help='Initial KGAU uniformity weight for query embeddings (0=off)')
     parser.add_argument('--uniform-gamma-y', dest='uniform_gamma_y', default=1.0, type=float,
-                        help='Initial AU uniformity weight for target embeddings (0=off)')
+                        help='Initial KGAU uniformity weight for target embeddings (0=off)')
     parser.add_argument('--uniform-gamma-e', dest='uniform_gamma_e', default=0.0, type=float,
-                        help='Initial AU uniformity weight for entity embeddings (0=off)')
+                        help='Initial KGAU uniformity weight for entity embeddings (0=off)')
 
-    parser.add_argument('--learnable_au_gammas', action='store_true',
-                        help='Learn batch-wise AU gamma down-weighting via log_gamma_adj')
-    parser.add_argument('--log_au_gamma_lr', default=None, type=float,
-                        help='LR for learnable AU gammas (default: learning_rate)')
+    parser.add_argument('--learnable_kgau_gammas', action='store_true',
+                        help='Learn batch-wise KGAU gamma down-weighting via log_gamma_adj')
+    parser.add_argument('--log_kgau_gamma_lr', default=None, type=float,
+                        help='LR for learnable KGAU gammas (default: learning_rate)')
     parser.add_argument('--gamma_linear_schedule', action='store_true',
-                        help='Linearly anneal AU gamma schedule multiplier over training')
+                        help='Linearly anneal KGAU gamma schedule multiplier over training')
     parser.add_argument('--gamma_schedule_end', default=0.1, type=float,
-                        help='Final AU gamma schedule multiplier')
+                        help='Final KGAU gamma schedule multiplier')
     parser.add_argument('--gamma_schedule_start_epoch', default=0, type=int,
-                        help='Epoch when AU gamma schedule starts')
+                        help='Epoch when KGAU gamma schedule starts')
     parser.add_argument('--gamma_schedule_epochs', default=0, type=int,
-                        help='AU gamma schedule length (0=full epochs)')
+                        help='KGKGAU gamma schedule length (0=full epochs)')
     
     parser.add_argument('--nentity', type=int, default=0, help='DO NOT MANUALLY SET')
     parser.add_argument('--nrelation', type=int, default=0, help='DO NOT MANUALLY SET')
@@ -281,7 +281,7 @@ def main(args):
     else:
         logging.info('Ramdomly Initializing %s Model...' % args.model)
 
-    if is_learnable_au_gammas(args):
+    if is_learnable_kgau_gammas(args):
         UniGammaController(args).ensure_model_params(kge_model)
     
     if args.do_train:
@@ -346,11 +346,11 @@ def main(args):
         
         #Training Loop
         for step in range(init_step, max_steps_internal):
-            if is_learnable_au_gammas(args):
+            if is_learnable_kgau_gammas(args):
                 current_epoch = step // steps_per_epoch_val + 1
                 if current_epoch != last_schedule_epoch:
                     args.current_epoch = current_epoch
-                    update_au_gamma_schedule(args)
+                    update_kgau_gamma_schedule(args)
                     last_schedule_epoch = current_epoch
             
             log = kge_model.train_step(kge_model, optimizer, train_iterator, args)
@@ -360,10 +360,10 @@ def main(args):
             if step >= warm_up_steps_internal:
                 current_learning_rate = current_learning_rate / 10
                 logging.info('Change learning_rate to %f at step %d' % (current_learning_rate, step))
-                if is_learnable_au_gammas(args) and len(optimizer.param_groups) > 1:
+                if is_learnable_kgau_gammas(args) and len(optimizer.param_groups) > 1:
                     set_optimizer_learning_rates(
                         optimizer, current_learning_rate,
-                        getattr(args, 'log_au_gamma_lr', None) or current_learning_rate,
+                        getattr(args, 'log_kgau_gamma_lr', None) or current_learning_rate,
                     )
                 else:
                     for group in optimizer.param_groups:
