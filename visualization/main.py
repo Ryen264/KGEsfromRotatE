@@ -342,12 +342,13 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     query_e = model.query_encoder(head, relation, tail, mode=mode)
     target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
 
-    margin_gamma = getattr(args, 'margin_gamma', 200.0)
+    align_margin = getattr(args, 'align_margin', 0.0)
+    uniform_margin = getattr(args, 'uniform_margin', 2.0)
     uniform_t = getattr(args, 'uniform_t', 4)
 
     if loss_name in ('kgmau', 'kgmamu'):
         align_loss = loss_fn.margin_alignment(
-            query_e, target_e, margin_gamma=margin_gamma,
+            query_e, target_e, align_margin=align_margin,
         ).item()
     else:
         align_loss = loss_fn.alignment(query_e, target_e).item()
@@ -365,7 +366,7 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     for key in uniform_sets:
         if loss_name == 'kgmamu':
             uniform_components[key] = loss_fn.margin_uniformity(
-                embeddings[key], margin_gamma=margin_gamma, uniform_t=uniform_t,
+                embeddings[key], uniform_margin=uniform_margin, uniform_t=uniform_t,
             ).item()
         else:
             uniform_components[key] = loss_fn.uniformity(

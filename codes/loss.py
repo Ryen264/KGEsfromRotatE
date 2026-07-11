@@ -494,14 +494,15 @@ class KGmAULoss(KGELoss):
     '''
     KGmAU Loss - Margin Alignment-Uniformity Loss for Knowledge Graph Embeddings
     L = margin_alignment_loss + Avg(uniformity_loss)_terms + regularization
-    margin_alignment_loss = -max(0, margin - L2-distance(query_e, target_e)^2).mean()
+    margin_alignment_loss = ReLU(L2-distance(query_e, target_e)^2 - align_margin).mean()
     uniformity_loss = log(exp(-uniform_t * L2-distance(x, x')^2).mean())
+    After L2-normalize, squared distance is in [0, 4]; use a small align_margin in that range.
     '''
     
     @staticmethod
-    def margin_alignment(x, y, margin_gamma=200.0):
+    def margin_alignment(x, y, align_margin=0.0):
         x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
-        return -F.relu(margin_gamma - (x - y).norm(p=2, dim=1).pow(2).mean())
+        return F.relu((x - y).norm(p=2, dim=1).pow(2) - align_margin).mean()
 
     @staticmethod
     def uniformity(x, uniform_t=4):
@@ -545,12 +546,12 @@ class KGmAULoss(KGELoss):
 
     def calculate_loss(self, head, relation, tail, model, mode):
         uniform_t = getattr(self.args, 'uniform_t', 4)
-        margin_gamma = getattr(self.args, 'margin_gamma', 200.0)
+        align_margin = getattr(self.args, 'align_margin', 0.0)
 
         query_e = model.query_encoder(head, relation, tail, mode=mode)
         target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
         margin_alignment_loss = self.margin_alignment(
-            query_e, target_e, margin_gamma=margin_gamma,
+            query_e, target_e, align_margin=align_margin,
         )
 
         uniform_loss_sum, uniform_count, uniform_log = self._compute_uniform_terms(
@@ -588,25 +589,33 @@ class KGmAULoss(KGELoss):
 
 class KGmAmULoss(KGELoss):
     '''
-    KGmAmU Loss - Margin Alignment-Margin Alignment-Uniformity Loss for Knowledge Graph Embeddings
-    L = margin_alignment_loss + Avg(uniformity_loss)_terms + regularization
-    margin_alignment_loss = -max(0, margin - L2-distance(query_e, target_e)^2).mean()
-    margin_uniformity_loss = -log(exp(-uniform_t * max(0, margin - L2-distance(x, x')^2)).mean())
+    KGmAmU Loss - Margin Alignment + Soft-margin Uniformity for Knowledge Graph Embeddings
+    L = margin_alignment_loss + Avg(soft_margin_uniformity)_terms + regularization
+    margin_alignment_loss = ReLU(L2-distance(query_e, target_e)^2 - align_margin).mean()
+    soft_margin_uniformity = log(exp(uniform_t * ReLU(uniform_margin - L2-distance(x, x')^2)).mean())
+    After L2-normalize, squared distance is in [0, 4].
+    With uniform_margin=4 this matches standard AU up to an additive constant;
+    smaller uniform_margin stops repelling once pairs are far enough.
     '''
     
     @staticmethod
-    def margin_alignment(x, y, margin_gamma=200.0):
+    def margin_alignment(x, y, align_margin=0.0):
         x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
-        return -F.relu(margin_gamma - (x - y).norm(p=2, dim=1).pow(2).mean())
+        return F.relu((x - y).norm(p=2, dim=1).pow(2) - align_margin).mean()
 
     @staticmethod
-    def margin_uniformity(x, margin_gamma=200.0, uniform_t=4):
+    def margin_uniformity(x, uniform_margin=2.0, uniform_t=4):
         x = F.normalize(x, dim=-1)
         if x.size(0) < 2:
             return (x * 0).sum()
-        return -F.relu(margin_gamma - torch.pdist(x, p=2).pow(2).mul(-uniform_t).exp().mean().log())
+        # Soft-margin AU: log E[exp(t * ReLU(m - d^2))]
+        sq = torch.pdist(x, p=2).pow(2)
+        return F.relu(uniform_margin - sq).mul(uniform_t).exp().mean().log()
 
-    def _compute_margin_uniformity_terms(self, head, relation, tail, query_e, target_e, model, margin_gamma=200.0, uniform_t=4):
+    def _compute_margin_uniformity_terms(
+        self, head, relation, tail, query_e, target_e, model,
+        uniform_margin=2.0, uniform_t=4,
+    ):
         margin_uniformity_loss_sum = query_e.new_zeros(())
         margin_uniformity_count = 0
         margin_uniformity_log = {}
@@ -622,7 +631,7 @@ class KGmAmULoss(KGELoss):
                 head, relation, tail, query_e, target_e, term_key,
             )
             margin_uniformity_val = self.margin_uniformity(
-                embeddings, margin_gamma=margin_gamma, uniform_t=uniform_t,
+                embeddings, uniform_margin=uniform_margin, uniform_t=uniform_t,
             )
             if learnable:
                 gamma_weight = controller.effective_gamma(model, term_key, epoch)
@@ -643,16 +652,17 @@ class KGmAmULoss(KGELoss):
 
     def calculate_loss(self, head, relation, tail, model, mode):
         uniform_t = getattr(self.args, 'uniform_t', 4)
-        margin_gamma = getattr(self.args, 'margin_gamma', 200.0)
+        align_margin = getattr(self.args, 'align_margin', 0.0)
+        uniform_margin = getattr(self.args, 'uniform_margin', 2.0)
 
         query_e = model.query_encoder(head, relation, tail, mode=mode)
         target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
         margin_alignment_loss = self.margin_alignment(
-            query_e, target_e, margin_gamma=margin_gamma,
+            query_e, target_e, align_margin=align_margin,
         )
 
         margin_uniformity_loss_sum, margin_uniformity_count, margin_uniformity_log = self._compute_margin_uniformity_terms(
-            head, relation, tail, query_e, target_e, model, margin_gamma, uniform_t,
+            head, relation, tail, query_e, target_e, model, uniform_margin, uniform_t,
         )
 
         if margin_uniformity_count > 0:
