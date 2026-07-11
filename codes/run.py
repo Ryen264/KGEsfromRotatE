@@ -74,7 +74,7 @@ def parse_args(args=None):
     parser.add_argument('--test_log_steps', default=1000, type=int, help='valid/test log every xx steps')
     
     parser.add_argument('--loss', default='sans', type=str,
-                        choices=['se', 'hinge', 'bce', 'mr', 'bpr', 'ce', 'sans', 'kgau'],
+                        choices=['se', 'hinge', 'bce', 'mr', 'bpr', 'ce', 'sans', 'kgau', 'kgmau', 'kgmamu'],
                         help='Training loss (see codes/loss.py)')
 
     parser.add_argument('--uniform_t', default=4, type=float,
@@ -97,7 +97,7 @@ def parse_args(args=None):
     parser.add_argument('--gamma_schedule_start_epoch', default=0, type=int,
                         help='Epoch when KGAU gamma schedule starts')
     parser.add_argument('--gamma_schedule_epochs', default=0, type=int,
-                        help='KGKGAU gamma schedule length (0=full epochs)')
+                        help='KGAU gamma schedule length (0=full epochs)')
     
     parser.add_argument('--nentity', type=int, default=0, help='DO NOT MANUALLY SET')
     parser.add_argument('--nrelation', type=int, default=0, help='DO NOT MANUALLY SET')

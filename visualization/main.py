@@ -20,7 +20,16 @@ sys.path.insert(0, os.path.join(ROOT, 'codes'))
 
 import run as train_run
 from dataloader import BidirectionalOneShotIterator, TrainDataset
-from loss import KGAULoss, compute_kge_loss, UniGammaController, build_training_optimizer, is_learnable_kgau_gammas, update_kgau_gamma_schedule
+from loss import (
+    KGAULoss,
+    KGmAULoss,
+    KGmAmULoss,
+    compute_kge_loss,
+    UniGammaController,
+    build_training_optimizer,
+    is_learnable_kgau_gammas,
+    update_kgau_gamma_schedule,
+)
 from metrics.classification import classification_metrics_from_probs
 from model import KGEModel
 
@@ -45,6 +54,8 @@ LOSS_DISPLAY_NAMES = {
     'ce': 'CE',
     'sans': 'SA',
     'kgau': 'KGAU',
+    'kgmau': 'KGmAU',
+    'kgmamu': 'KGmAmU',
 }
 
 
@@ -312,8 +323,18 @@ def validate_uniform_sets(uniform_sets):
     return list(uniform_sets)
 
 
+def get_kgau_family_loss(args):
+    loss_name = getattr(args, 'loss', 'kgau')
+    if loss_name == 'kgmau':
+        return KGmAULoss(args)
+    if loss_name == 'kgmamu':
+        return KGmAmULoss(args)
+    return KGAULoss(args)
+
+
 def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
-    au = KGAULoss(args)
+    loss_fn = get_kgau_family_loss(args)
+    loss_name = getattr(args, 'loss', 'kgau')
     head = model.entity_embedding[positive_sample[:, 0]]
     relation = model.relation_embedding[positive_sample[:, 1]]
     tail = model.entity_embedding[positive_sample[:, 2]]
@@ -321,11 +342,17 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     query_e = model.query_encoder(head, relation, tail, mode=mode)
     target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
 
-    align_loss = au.alignment(query_e, target_e).item()
-    
+    margin_gamma = getattr(args, 'margin_gamma', 200.0)
     uniform_t = getattr(args, 'uniform_t', 4)
-    uniform_components = {}
 
+    if loss_name in ('kgmau', 'kgmamu'):
+        align_loss = loss_fn.margin_alignment(
+            query_e, target_e, margin_gamma=margin_gamma,
+        ).item()
+    else:
+        align_loss = loss_fn.alignment(query_e, target_e).item()
+
+    uniform_components = {}
     embeddings = {
         'query': query_e,
         'target': target_e,
@@ -336,7 +363,14 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     }
 
     for key in uniform_sets:
-        uniform_components[key] = au.uniformity(embeddings[key], uniform_t=uniform_t).item()
+        if loss_name == 'kgmamu':
+            uniform_components[key] = loss_fn.margin_uniformity(
+                embeddings[key], margin_gamma=margin_gamma, uniform_t=uniform_t,
+            ).item()
+        else:
+            uniform_components[key] = loss_fn.uniformity(
+                embeddings[key], uniform_t=uniform_t,
+            ).item()
 
     uniform_loss = float(np.mean(list(uniform_components.values())))
     return align_loss, uniform_components, uniform_loss
@@ -599,6 +633,8 @@ def visualize_training(
         'ce': 'CE loss',
         'sans': 'SANS loss',
         'kgau': 'KGAU loss',
+        'kgmau': 'KGmAU loss',
+        'kgmamu': 'KGmAmU loss',
     }.get(getattr(args, 'loss', 'sans'), get_loss_display_name(args) + ' loss')
 
     fig_au = plot_alignment_uniformity(

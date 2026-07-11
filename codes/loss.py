@@ -271,8 +271,15 @@ KGAU_UNIFORM_TERMS = [
 KGAU_GAMMA_KEY_BY_TERM = {term_key: gamma_key for term_key, gamma_key in KGAU_UNIFORM_TERMS}
 
 
+KGAU_FAMILY_LOSSES = ('kgau', 'kgmau', 'kgmamu')
+
+
+def is_kgau_family_loss(args):
+    return getattr(args, 'loss', '') in KGAU_FAMILY_LOSSES
+
+
 def is_learnable_kgau_gammas(args):
-    return getattr(args, 'loss', '') == 'kgau' and getattr(args, 'learnable_kgau_gammas', False)
+    return is_kgau_family_loss(args) and getattr(args, 'learnable_kgau_gammas', False)
 
 
 def get_kgau_uniform_embeddings(head, relation, tail, query_e, target_e, term_key):
@@ -394,8 +401,8 @@ class KGAULoss(KGELoss):
     '''
     KGAU Loss - Alignment-Uniformity Loss for Knowledge Graph Embeddings
     L = alignment_loss + Avg(uniformity_loss)_terms + regularization
-    alignment_loss = (query_e - target_e).norm(p=2, dim=1).pow(2).mean()
-    uniformity_loss = torch.pdist(x, p=2).pow(2).mul(-uniform_t).exp().mean().log()
+    alignment_loss = L2-distance(query_e, target_e)^2.mean()
+    uniformity_loss = log(exp(-uniform_t * L2-distance(x, x')^2).mean())
     '''
     
     @staticmethod
@@ -483,6 +490,200 @@ class KGAULoss(KGELoss):
         )
 
 
+class KGmAULoss(KGELoss):
+    '''
+    KGmAU Loss - Margin Alignment-Uniformity Loss for Knowledge Graph Embeddings
+    L = margin_alignment_loss + Avg(uniformity_loss)_terms + regularization
+    margin_alignment_loss = max(0, margin + L2-distance(query_e, target_e)^2).mean()
+    uniformity_loss = log(exp(-uniform_t * L2-distance(x, x')^2).mean())
+    '''
+    
+    @staticmethod
+    def margin_alignment(x, y, margin_gamma=200.0):
+        x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
+        return F.relu(margin_gamma + (x - y).norm(p=2, dim=1).pow(2).mean())
+
+    @staticmethod
+    def uniformity(x, uniform_t=4):
+        x = F.normalize(x, dim=-1)
+        if x.size(0) < 2:
+            return (x * 0).sum()
+        return torch.pdist(x, p=2).pow(2).mul(-uniform_t).exp().mean().log()
+
+    def _compute_uniform_terms(self, head, relation, tail, query_e, target_e, model, uniform_t=4):
+        uniform_loss_sum = query_e.new_zeros(())
+        uniform_count = 0
+        uniform_log = {}
+        epoch = getattr(self.args, 'current_epoch', 0)
+        learnable = is_learnable_kgau_gammas(self.args)
+        controller = UniGammaController(self.args) if learnable else None
+
+        for term_key, gamma_key in KGAU_UNIFORM_TERMS:
+            gamma_init = getattr(self.args, gamma_key, 0.0)
+            if gamma_init <= 0:
+                continue
+            embeddings = get_kgau_uniform_embeddings(
+                head, relation, tail, query_e, target_e, term_key,
+            )
+            uniform_val = self.uniformity(embeddings, uniform_t=uniform_t)
+            if learnable:
+                gamma_weight = controller.effective_gamma(model, term_key, epoch)
+            else:
+                gamma_weight = gamma_init
+            uniform_loss_sum = uniform_loss_sum + gamma_weight * uniform_val
+            uniform_count += 1
+            uniform_log['uniform_{}'.format(term_key)] = uniform_val.item()
+            if learnable:
+                eff_item = (
+                    gamma_weight.item()
+                    if isinstance(gamma_weight, torch.Tensor)
+                    else float(gamma_weight)
+                )
+                uniform_log['uniform_gamma_eff_{}'.format(term_key)] = eff_item
+
+        return uniform_loss_sum, uniform_count, uniform_log
+
+    def calculate_loss(self, head, relation, tail, model, mode):
+        uniform_t = getattr(self.args, 'uniform_t', 4)
+        margin_gamma = getattr(self.args, 'margin_gamma', 200.0)
+
+        query_e = model.query_encoder(head, relation, tail, mode=mode)
+        target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
+        margin_alignment_loss = self.margin_alignment(
+            query_e, target_e, margin_gamma=margin_gamma,
+        )
+
+        uniform_loss_sum, uniform_count, uniform_log = self._compute_uniform_terms(
+            head, relation, tail, query_e, target_e, model, uniform_t,
+        )
+
+        if uniform_count > 0:
+            loss = margin_alignment_loss + uniform_loss_sum / uniform_count
+            uniform_loss_val = (uniform_loss_sum / uniform_count).item()
+        else:
+            loss = margin_alignment_loss
+            uniform_loss_val = 0.0
+
+        regularization_term, regularization_log = regularization(
+            model, self.args.regularization_coeff, p=self.args.regularization_p
+        )
+        if regularization_term is not None:
+            loss = loss + regularization_term
+
+        log = {
+            **regularization_log,
+            **uniform_log,
+            'margin_alignment_loss': margin_alignment_loss.item(),
+            'uniform_loss': uniform_loss_val,
+            'loss': loss.item(),
+        }
+        return loss, log
+
+    def __call__(self, positive_score, negative_score, subsampling_weight, model):
+        raise NotImplementedError(
+            'KGmAU Loss requires positive triple embeddings; '
+            'use compute_kge_loss with positive_sample and mode.'
+        )
+
+
+class KGmAmULoss(KGELoss):
+    '''
+    KGmAmU Loss - Margin Alignment-Margin Alignment-Uniformity Loss for Knowledge Graph Embeddings
+    L = margin_alignment_loss + Avg(uniformity_loss)_terms + regularization
+    margin_alignment_loss = max(0, margin + L2-distance(query_e, target_e)^2).mean()
+    margin_uniformity_loss = log(exp(-uniform_t * max(0, margin + L2-distance(x, x')^2)).mean())
+    '''
+    
+    @staticmethod
+    def margin_alignment(x, y, margin_gamma=200.0):
+        x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
+        return F.relu(margin_gamma + (x - y).norm(p=2, dim=1).pow(2).mean())
+
+    @staticmethod
+    def margin_uniformity(x, margin_gamma=200.0, uniform_t=4):
+        x = F.normalize(x, dim=-1)
+        if x.size(0) < 2:
+            return (x * 0).sum()
+        return F.relu(margin_gamma + torch.pdist(x, p=2).pow(2).mul(-uniform_t).exp().mean().log())
+
+    def _compute_margin_uniformity_terms(self, head, relation, tail, query_e, target_e, model, margin_gamma=200.0, uniform_t=4):
+        margin_uniformity_loss_sum = query_e.new_zeros(())
+        margin_uniformity_count = 0
+        margin_uniformity_log = {}
+        epoch = getattr(self.args, 'current_epoch', 0)
+        learnable = is_learnable_kgau_gammas(self.args)
+        controller = UniGammaController(self.args) if learnable else None
+
+        for term_key, gamma_key in KGAU_UNIFORM_TERMS:
+            gamma_init = getattr(self.args, gamma_key, 0.0)
+            if gamma_init <= 0:
+                continue
+            embeddings = get_kgau_uniform_embeddings(
+                head, relation, tail, query_e, target_e, term_key,
+            )
+            margin_uniformity_val = self.margin_uniformity(
+                embeddings, margin_gamma=margin_gamma, uniform_t=uniform_t,
+            )
+            if learnable:
+                gamma_weight = controller.effective_gamma(model, term_key, epoch)
+            else:
+                gamma_weight = gamma_init
+            margin_uniformity_loss_sum = margin_uniformity_loss_sum + gamma_weight * margin_uniformity_val
+            margin_uniformity_count += 1
+            margin_uniformity_log['margin_uniformity_{}'.format(term_key)] = margin_uniformity_val.item()
+            if learnable:
+                eff_item = (
+                    gamma_weight.item()
+                    if isinstance(gamma_weight, torch.Tensor)
+                    else float(gamma_weight)
+                )
+                margin_uniformity_log['uniform_gamma_eff_{}'.format(term_key)] = eff_item
+
+        return margin_uniformity_loss_sum, margin_uniformity_count, margin_uniformity_log
+
+    def calculate_loss(self, head, relation, tail, model, mode):
+        uniform_t = getattr(self.args, 'uniform_t', 4)
+        margin_gamma = getattr(self.args, 'margin_gamma', 200.0)
+
+        query_e = model.query_encoder(head, relation, tail, mode=mode)
+        target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
+        margin_alignment_loss = self.margin_alignment(
+            query_e, target_e, margin_gamma=margin_gamma,
+        )
+
+        margin_uniformity_loss_sum, margin_uniformity_count, margin_uniformity_log = self._compute_margin_uniformity_terms(
+            head, relation, tail, query_e, target_e, model, margin_gamma, uniform_t,
+        )
+
+        if margin_uniformity_count > 0:
+            loss = margin_alignment_loss + margin_uniformity_loss_sum / margin_uniformity_count
+            margin_uniformity_loss_val = (margin_uniformity_loss_sum / margin_uniformity_count).item()
+        else:
+            loss = margin_alignment_loss
+            margin_uniformity_loss_val = 0.0
+
+        regularization_term, regularization_log = regularization(
+            model, self.args.regularization_coeff, p=self.args.regularization_p
+        )
+        if regularization_term is not None:
+            loss = loss + regularization_term
+
+        log = {
+            **regularization_log,
+            **margin_uniformity_log,
+            'margin_alignment_loss': margin_alignment_loss.item(),
+            'margin_uniformity_loss': margin_uniformity_loss_val,
+            'loss': loss.item(),
+        }
+        return loss, log
+
+    def __call__(self, positive_score, negative_score, subsampling_weight, model):
+        raise NotImplementedError(
+            'KGmAmU Loss requires positive triple embeddings; '
+            'use compute_kge_loss with positive_sample and mode.'
+        )
+
+
 LOSS_REGISTRY = {
     'se': SquaredErrorLoss,
     'hinge': PointwiseHingeLoss,
@@ -492,6 +693,8 @@ LOSS_REGISTRY = {
     'ce': CrossEntropyLoss,
     'sans': SelfAdversarialNegativeSamplingLoss,
     'kgau': KGAULoss,
+    'kgmau': KGmAULoss,
+    'kgmamu': KGmAmULoss,
 }
 
 def get_loss(args):
@@ -503,9 +706,11 @@ def get_loss(args):
 def compute_kge_loss(positive_score, negative_score, subsampling_weight, model, args,
                      positive_sample=None, mode=None):
     loss_name = getattr(args, 'loss', 'sans')
-    if loss_name == 'kgau':
+    if is_kgau_family_loss(args):
         if positive_sample is None or mode is None:
-            raise ValueError('KGAU Loss requires positive_sample and mode')
+            raise ValueError(
+                '{} requires positive_sample and mode'.format(loss_name.upper())
+            )
         head = model.entity_embedding[positive_sample[:, 0]]
         relation = model.relation_embedding[positive_sample[:, 1]]
         tail = model.entity_embedding[positive_sample[:, 2]]
