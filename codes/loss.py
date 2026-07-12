@@ -401,8 +401,8 @@ class KGAULoss(KGELoss):
     '''
     KGAU Loss - Alignment-Uniformity Loss for Knowledge Graph Embeddings
     L = alignment_loss + Avg(uniformity_loss)_terms + regularization
-    alignment_loss = L2-distance(query_e, target_e)^2.mean()
-    uniformity_loss = log(exp(-uniform_t * L2-distance(x, x')^2).mean())
+        alignment_loss = L2-distance(query_e, target_e)^2.mean()
+        uniformity_loss = log(exp(-uniform_t * L2-distance(x, x')^2).mean())
     '''
     
     @staticmethod
@@ -494,15 +494,22 @@ class KGmAULoss(KGELoss):
     '''
     KGmAU Loss - Margin Alignment-Uniformity Loss for Knowledge Graph Embeddings
     L = margin_alignment_loss + Avg(uniformity_loss)_terms + regularization
-    margin_alignment_loss = ReLU(L2-distance(query_e, target_e)^2 - align_margin).mean()
-    uniformity_loss = log(exp(-uniform_t * L2-distance(x, x')^2).mean())
-    After L2-normalize, squared distance is in [0, 4]; use a small align_margin in that range.
+        margin_alignment_loss = max(0, L2-distance(query_e, target_e) - align_margin)^2.mean()
+        uniformity_loss = log(exp(-uniform_t * L2-distance(x, x')^2).mean())
     '''
-    
+
     @staticmethod
     def margin_alignment(x, y, align_margin=0.0):
+        """
+        Margin Alignment Loss by Squared Hinge
+        """
         x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
-        return F.relu((x - y).norm(p=2, dim=1).pow(2) - align_margin).mean()
+        l2_distance = torch.norm(x - y, p=2, dim=1)
+
+        hinge_step = F.relu(l2_distance - align_margin)
+        squared_hinge_loss = hinge_step.pow(2)
+
+        return squared_hinge_loss.mean()
 
     @staticmethod
     def uniformity(x, uniform_t=4):
@@ -591,17 +598,23 @@ class KGmAmULoss(KGELoss):
     '''
     KGmAmU Loss - Margin Alignment + Soft-margin Uniformity for Knowledge Graph Embeddings
     L = margin_alignment_loss + Avg(soft_margin_uniformity)_terms + regularization
-    margin_alignment_loss = ReLU(L2-distance(query_e, target_e)^2 - align_margin).mean()
-    soft_margin_uniformity = log(exp(uniform_t * ReLU(uniform_margin - L2-distance(x, x')^2)).mean())
-    After L2-normalize, squared distance is in [0, 4].
-    With uniform_margin=4 this matches standard AU up to an additive constant;
-    smaller uniform_margin stops repelling once pairs are far enough.
+        margin_alignment_loss = max(0, L2-distance(query_e, target_e) - align_margin)^2.mean()
+        soft_margin_uniformity = log(exp(uniform_t * ReLU(uniform_margin - L2-distance(x, x')^2)).mean())
     '''
     
     @staticmethod
+    @staticmethod
     def margin_alignment(x, y, align_margin=0.0):
+        """
+        Margin Alignment Loss by Squared Hinge
+        """
         x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
-        return F.relu((x - y).norm(p=2, dim=1).pow(2) - align_margin).mean()
+        l2_distance = torch.norm(x - y, p=2, dim=1)
+
+        hinge_step = F.relu(l2_distance - align_margin)
+        squared_hinge_loss = hinge_step.pow(2)
+
+        return squared_hinge_loss.mean()
 
     @staticmethod
     def margin_uniformity(x, uniform_margin=2.0, uniform_t=4):
