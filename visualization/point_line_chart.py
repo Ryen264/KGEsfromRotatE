@@ -135,8 +135,8 @@ if __name__ == "__main__":
         Point(name="TransE",    year=2013, MRR=0.2260, dim=500,     batch_size=512,     negative_sample_size=1024),
         Point(name="DistMult",  year=2015, MRR=0.4300, dim=100,     batch_size=868,     negative_sample_size=1),
         Point(name="ComplEx",   year=2016, MRR=0.4400, dim=100,     batch_size=868,     negative_sample_size=1),
-        Point(name="RotatE",    year=2019, MRR=0.4760, dim=500,     batch_size=512,     negative_sample_size=32),
-        Point(name="pRotatE",   year=2019, MRR=0.4620, dim=1000,    batch_size=512,     negative_sample_size=32),
+        Point(name="RotatE",    year=2019, MRR=0.4760, dim=500,     batch_size=512,     negative_sample_size=1024),
+        Point(name="pRotatE",   year=2019, MRR=0.4620, dim=500,     batch_size=512,     negative_sample_size=1024),
         Point(name="TuckER",    year=2019, MRR=0.4700, dim=200,     batch_size=128,     negative_sample_size=40942),
         Point(name="SimKGC",    year=2022, MRR=0.6850, dim=768,     batch_size=1024,    negative_sample_size=3072),
         Point(name="TransERR",  year=2024, MRR=0.5010, dim=1000,    batch_size=2048,    negative_sample_size=128),
@@ -144,11 +144,11 @@ if __name__ == "__main__":
     ]
 
     fb15k237_points = [
-        Point(name="TransE",   year=2013, MRR=0.2940, dim=1000,     batch_size=1000,    negative_sample_size=256),
+        Point(name="TransE",   year=2013, MRR=0.2940, dim=1000,     batch_size=1024,    negative_sample_size=256),
         Point(name="DistMult", year=2015, MRR=0.2410, dim=100,      batch_size=2721,    negative_sample_size=1),
         Point(name="ComplEx",  year=2016, MRR=0.2470, dim=100,      batch_size=2721,    negative_sample_size=1),
-        Point(name="RotatE",   year=2019, MRR=0.3380, dim=1000,     batch_size=1000,    negative_sample_size=256),
-        Point(name="pRotatE",  year=2019, MRR=0.3280, dim=2000,     batch_size=1000,    negative_sample_size=256),
+        Point(name="RotatE",   year=2019, MRR=0.3380, dim=1000,     batch_size=1024,    negative_sample_size=256),
+        Point(name="pRotatE",  year=2019, MRR=0.3280, dim=1000,     batch_size=1024,    negative_sample_size=256),
         Point(name="TuckER",   year=2019, MRR=0.3580, dim=200,      batch_size=128,     negative_sample_size=14540),
         Point(name="SimKGC",   year=2022, MRR=0.3360, dim=768,      batch_size=1024,    negative_sample_size=3072),
         Point(name="TransERR", year=2024, MRR=0.3600, dim=1000,     batch_size=1000,    negative_sample_size=128),
@@ -178,23 +178,23 @@ if __name__ == "__main__":
         Point(name="b=1024", batch_size=1024, MRR=0.4695, hit_1=0.4247)
     ]
 
-    # draw_chart(
-    #     points=wn18rr_points, 
-    #     x_axis="year", x_title="Year",
-    #     y_axis="dim", y_title="Embedding Dimension",
-    #     color_axis="MRR", color_title="MRR", color_map="Blues",
-    #     title="Overview of Embedding Dimensions of different KGE models over time on WN18RR",
-    #     plot_line=False
-    # )
+    draw_chart(
+        points=wn18rr_points, 
+        x_axis="year", x_title="Year",
+        y_axis="dim", y_title="Embedding Dimension",
+        color_axis="MRR", color_title="MRR", color_map="Blues",
+        title="Overview of Embedding Dimensions of different KGE models over time on WN18RR",
+        plot_line=False
+    )
 
-    # draw_chart(
-    #     points=fb15k237_points, 
-    #     x_axis="year", x_title="Year",
-    #     y_axis="dim", y_title="Embedding Dimension",
-    #     color_axis="MRR", color_title="MRR", color_map="Blues",
-    #     title="Overview of Embedding Dimensions of different KGE models over time on FB15K237",
-    #     plot_line=False
-    # )
+    draw_chart(
+        points=fb15k237_points, 
+        x_axis="year", x_title="Year",
+        y_axis="dim", y_title="Embedding Dimension",
+        color_axis="MRR", color_title="MRR", color_map="Blues",
+        title="Overview of Embedding Dimensions of different KGE models over time on FB15k237",
+        plot_line=False
+    )
 
     # draw_chart(
     #     points=uniform_t_points, 
@@ -205,40 +205,40 @@ if __name__ == "__main__":
     #     plot_line=True
     # )
 
-    draw_chart(
-        points=dim_points, 
-        x_axis="dim", x_title="Embedding Dimension",
-        y_axis="MRR", y_title="MRR",
-        color_axis="hit_1", color_title="Hit@1", color_map="Blues",
-        title="Analysis of ComplEx-AU over different Embedding Dimensions on WN18RR",
-        plot_line=True
-    )
-
-    draw_chart(
-        points=batch_size_points, 
-        x_axis="batch_size", x_title="Batch Size",
-        y_axis="MRR", y_title="MRR",
-        color_axis="hit_1", color_title="Hit@1", color_map="Blues",
-        title="Analysis of ComplEx-AU over different Batch Sizes on WN18RR",
-        plot_line=True
-    )
-
     # draw_chart(
-    #     points=wn18rr_points,
-    #     x_axis="batch_size", x_title="Batch Size (log scale)",
-    #     y_axis="negative_sample_size", y_title="Negative Sample Size (log scale)",
-    #     color_axis="MRR", color_title="MRR", color_map="Blues",
-    #     title="Overview of Batch Sizes and Negative Sample Sizes in of different KGE models on WN18RR",
-    #     plot_line=False,
-    #     x_log_scale=True, y_log_scale=True,
+    #     points=dim_points, 
+    #     x_axis="dim", x_title="Embedding Dimension",
+    #     y_axis="MRR", y_title="MRR",
+    #     color_axis="hit_1", color_title="Hit@1", color_map="Blues",
+    #     title="Analysis of ComplEx-AU over different Embedding Dimensions on WN18RR",
+    #     plot_line=True
     # )
 
     # draw_chart(
-    #     points=fb15k237_points,
-    #     x_axis="batch_size", x_title="Batch Size (log scale)",
-    #     y_axis="negative_sample_size", y_title="Negative Sample Size (log scale)",
-    #     color_axis="MRR", color_title="MRR", color_map="Blues",
-    #     title="Overview of Batch Sizes and Negative Sample Sizes of different KGE models on FB15K237",
-    #     plot_line=False,
-    #     x_log_scale=True, y_log_scale=True,
+    #     points=batch_size_points, 
+    #     x_axis="batch_size", x_title="Batch Size",
+    #     y_axis="MRR", y_title="MRR",
+    #     color_axis="hit_1", color_title="Hit@1", color_map="Blues",
+    #     title="Analysis of ComplEx-AU over different Batch Sizes on WN18RR",
+    #     plot_line=True
     # )
+
+    draw_chart(
+        points=wn18rr_points,
+        x_axis="batch_size", x_title="Batch Size (log scale)",
+        y_axis="negative_sample_size", y_title="Negative Sample Size (log scale)",
+        color_axis="MRR", color_title="MRR", color_map="Blues",
+        title="Overview of Batch Sizes and Negative Sample Sizes in of different KGE models on WN18RR",
+        plot_line=False,
+        x_log_scale=True, y_log_scale=True,
+    )
+
+    draw_chart(
+        points=fb15k237_points,
+        x_axis="batch_size", x_title="Batch Size (log scale)",
+        y_axis="negative_sample_size", y_title="Negative Sample Size (log scale)",
+        color_axis="MRR", color_title="MRR", color_map="Blues",
+        title="Overview of Batch Sizes and Negative Sample Sizes of different KGE models on FB15k237",
+        plot_line=False,
+        x_log_scale=True, y_log_scale=True,
+    )

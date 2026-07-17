@@ -1,5 +1,0 @@
-pid=3602705
-started=2026-07-07T14:43:10+07:00
-config=configs/ComplEx64_WN18RR_mr.json
-log=/home/lngbao/KGEsfromRotatE/nohup/emb_tsne/logs/ComplEx64_WN18RR_mr_20260707_144310.log
-cmd=python -u visualization/emb_tsne.py configs/ComplEx64_WN18RR_mr.json 

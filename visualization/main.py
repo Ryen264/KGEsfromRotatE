@@ -33,16 +33,16 @@ from loss import (
 from metrics.classification import classification_metrics_from_probs
 from model import KGEModel
 
-UNIFORM_SET_KEYS = ('query', 'target', 'head', 'tail', 'entity', 'relation')
-DEFAULT_UNIFORM_SETS = ['query', 'target', 'head', 'tail', 'entity', 'relation']
+DEFAULT_UNIFORM_KEYS = ['query', 'target', 'entity', 'relation']
+DEFAULT_UNIFORM_T = 4
 
 UNIFORM_COLORS = {
-    'query': '#6aa84f',
-    'target': '#38761d',
-    'head': '#93c47d',
-    'tail': '#b6d7a8',
-    'entity': '#274e13',
-    'relation': '#d9ead3',
+    'query': '#1f77b4',    # blue
+    'target': '#2ca02c',   # green
+    'entity': '#9467bd',   # purple
+    'relation': '#d62728', # red
+    'head': '#8c564b',     # brown (secondary)
+    'tail': '#bcbd22',     # olive (secondary)
 }
 
 LOSS_DISPLAY_NAMES = {
@@ -109,47 +109,84 @@ def build_results_report(
     best_epoch,
     best_valid_value,
     timing,
+    model_name,
+    loss_name,
+    dim,
+    batch_size
 ):
+    mr = format_metric_value(link_metrics.get('MR') if link_metrics else None)
+    mrr = format_metric_value(link_metrics.get('MRR') if link_metrics else None)
+    hit_1 = format_metric_value(link_metrics.get('HITS@1') if link_metrics else None)
+    hit_3 = format_metric_value(link_metrics.get('HITS@3') if link_metrics else None)
+    hit_10 = format_metric_value(link_metrics.get('HITS@10') if link_metrics else None)
+    
+    acc = format_metric_value(classification_metrics_dict.get('accuracy') if classification_metrics_dict else None)
+    prec = format_metric_value(classification_metrics_dict.get('precision') if classification_metrics_dict else None)
+    rec = format_metric_value(classification_metrics_dict.get('recall') if classification_metrics_dict else None)
+    f1 = format_metric_value(classification_metrics_dict.get('f1') if classification_metrics_dict else None)
+    pr_auc = format_metric_value(classification_metrics_dict.get('pr_auc') if classification_metrics_dict else None)
+    roc_auc = format_metric_value(classification_metrics_dict.get('roc_auc') if classification_metrics_dict else None)
+    
+    best_epoch = format_metric_value(best_epoch)
+    best_valid_value = format_metric_value(best_valid_value)
+    
+    train_time = format_duration(timing['train_time'])
+    valid_time = format_duration(timing['valid_time'])
+    test_time = format_duration(timing['test_time'])
+    total_time = format_duration(timing['total_time'])
+    
+    time_per_epoch = format_duration(timing['train_time'] / max(num_epochs, 1))
+    peak_gpu_memory = format_duration(timing['peak_gpu_memory_gb'])
+
     lines = [
-        'MR: {}'.format(format_metric_value(link_metrics.get('MR') if link_metrics else None)),
-        'MRR: {}'.format(format_metric_value(link_metrics.get('MRR') if link_metrics else None)),
-        'Hit@1: {}'.format(format_metric_value(link_metrics.get('HITS@1') if link_metrics else None)),
-        'Hit@3: {}'.format(format_metric_value(link_metrics.get('HITS@3') if link_metrics else None)),
-        'Hit@10: {}'.format(format_metric_value(link_metrics.get('HITS@10') if link_metrics else None)),
-        '',
-        'Acc: {}'.format(format_metric_value(
-            classification_metrics_dict.get('accuracy') if classification_metrics_dict else None
-        )),
-        'Prec: {}'.format(format_metric_value(
-            classification_metrics_dict.get('precision') if classification_metrics_dict else None
-        )),
-        'Rec: {}'.format(format_metric_value(
-            classification_metrics_dict.get('recall') if classification_metrics_dict else None
-        )),
-        'F1: {}'.format(format_metric_value(
-            classification_metrics_dict.get('f1') if classification_metrics_dict else None
-        )),
-        'PR-AUC: {}'.format(format_metric_value(
-            classification_metrics_dict.get('pr_auc') if classification_metrics_dict else None
-        )),
-        'ROC-AUC: {}'.format(format_metric_value(
-            classification_metrics_dict.get('roc_auc') if classification_metrics_dict else None
-        )),
-        '',
-        'Best Epoch: {}'.format(best_epoch),
-        'Best {}: {}'.format(valid_metric, format_metric_value(best_valid_value)),
-        '',
-        'Training: {}'.format(format_duration(timing['train_time'])),
-        'Valid: {}'.format(format_duration(timing['valid_time'])),
-        'Test: {}'.format(format_duration(timing['test_time'])),
-        'Total: {}'.format(format_duration(timing['total_time'])),
-        '',
-        'Time per epoch: {}'.format(format_duration(timing['train_time'] / max(num_epochs, 1))),
-        'Peak GPU memory: {}'.format(
-            '{:.2f} GB'.format(timing['peak_gpu_memory_gb'])
-            if timing['peak_gpu_memory_gb'] is not None else 'N/A'
-        ),
+        'Model: {}'.format(model_name),
+        'Loss: {}'.format(loss_name),
+        'Dim: {}'.format(dim),
+        'Batch Size: {}'.format(batch_size),
+        ''
     ]
+    
+    if mrr is not None:
+        lines += [
+            'MR: {}'.format(mr),
+            'MRR: {}'.format(mrr),
+            'Hit@1: {}'.format(hit_1),
+            'Hit@3: {}'.format(hit_3),
+            'Hit@10: {}'.format(hit_10),
+            ''
+        ]
+
+    if acc is not None:
+        lines += [
+            'Acc: {}'.format(acc),
+            'Prec: {}'.format(prec),
+            'Rec: {}'.format(rec),
+            'F1: {}'.format(f1),
+            'PR-AUC: {}'.format(pr_auc),
+            'ROC-AUC: {}'.format(roc_auc),
+            '',
+        ]
+
+    lines += [
+        'Best Epoch: {}'.format(best_epoch),
+        'Best {}: {}'.format(valid_metric, best_valid_value),
+        '',
+        'Training: {}'.format(train_time),
+        'Valid: {}'.format(valid_time),
+        'Test: {}'.format(test_time),
+        'Total: {}'.format(total_time),
+        ''
+    ]
+
+    if time_per_epoch is not None:
+        lines += [
+            'Time per epoch: {}'.format(time_per_epoch),
+            ''
+        ]
+    if peak_gpu_memory is not None:
+        lines += [
+            'Peak GPU memory: {}'.format(peak_gpu_memory)
+        ]
     return '\n'.join(lines) + '\n'
 
 
@@ -312,12 +349,12 @@ def build_model_and_iterator(args, train_triples):
 def validate_uniform_sets(uniform_sets):
     if not uniform_sets:
         raise ValueError('uniform_sets must be non-empty')
-    allowed = set(UNIFORM_SET_KEYS)
+    allowed = set(DEFAULT_UNIFORM_KEYS)
     unknown = [key for key in uniform_sets if key not in allowed]
     if unknown:
         raise ValueError(
             'Unknown uniform_sets: {}. Allowed: {}'.format(
-                unknown, ', '.join(UNIFORM_SET_KEYS)
+                unknown, ', '.join(DEFAULT_UNIFORM_KEYS)
             )
         )
     return list(uniform_sets)
@@ -344,7 +381,7 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
 
     align_margin = getattr(args, 'align_margin', 0.0)
     uniform_margin = getattr(args, 'uniform_margin', 2.0)
-    uniform_t = getattr(args, 'uniform_t', 4)
+    uniform_t = DEFAULT_UNIFORM_T
 
     if loss_name in ('kgmau', 'kgmamu'):
         align_loss = loss_fn.margin_alignment(
@@ -409,7 +446,7 @@ def train_step_with_metrics(model, optimizer, train_iterator, args, uniform_sets
 
 
 def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets=None):
-    uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_SETS)
+    uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_KEYS)
     train_triples, valid_triples, test_triples, all_true_triples = load_dataset(args)
     model, train_iterator, optimizer = build_model_and_iterator(args, train_triples)
     epoch_steps = train_run.steps_per_epoch(len(train_triples), args.batch_size)
@@ -536,7 +573,7 @@ def plot_alignment_uniformity(history, display_epochs, uniform_sets, output_path
 
     uniform_lines = []
     for key in uniform_sets:
-        color = UNIFORM_COLORS.get(key, '#6aa84f')
+        color = UNIFORM_COLORS.get(key, '#1f77b4')
         line, = ax_right.plot(
             epochs, history['uniform'][key],
             color=color, linewidth=2,
@@ -546,9 +583,9 @@ def plot_alignment_uniformity(history, display_epochs, uniform_sets, output_path
 
     ax_left.set_xlabel('training epochs')
     ax_left.set_ylabel('alignment', color='#e69138')
-    ax_right.set_ylabel('uniformity', color='#6aa84f')
+    ax_right.set_ylabel('uniformity', color='#444444')
     ax_left.tick_params(axis='y', labelcolor='#e69138')
-    ax_right.tick_params(axis='y', labelcolor='#6aa84f')
+    ax_right.tick_params(axis='y', labelcolor='#444444')
     ax_left.set_xlim(min(epochs), max(epochs))
 
     fig.tight_layout()
@@ -604,12 +641,17 @@ def visualize_training(
     config, config_path = load_config(resolve_path(config_path))
     num_epochs = resolve_num_epochs(config, display_epochs)
     args = build_args(config)
-    uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_SETS)
+    uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_KEYS)
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
+
+    model_name = config.get('model')
+    loss_name = getattr(args, 'loss', 'NoneLoss')
+    dim = getattr(args, 'dim', 'NoneDim')
+    batch_size = getattr(args, 'batch_size', 'NoneBatchSize')
 
     print('Config: {}'.format(config_path))
     print('Model: {}  Loss: {}  Dataset: {}'.format(
-        config.get('model'), getattr(args, 'loss', 'sans'), config.get('data_path')
+        model_name, loss_name, config.get('data_path')
     ))
     print('Training for {} epochs (displaying first {})'.format(num_epochs, display_epochs))
     print('Uniform sets: {}'.format(', '.join(uniform_sets)))
@@ -636,7 +678,7 @@ def visualize_training(
         'kgau': 'KGAU loss',
         'kgmau': 'KGmAU loss',
         'kgmamu': 'KGmAmU loss',
-    }.get(getattr(args, 'loss', 'sans'), get_loss_display_name(args) + ' loss')
+    }.get(loss_name, get_loss_display_name(args) + ' loss')
 
     fig_au = plot_alignment_uniformity(
         history,
@@ -677,6 +719,10 @@ def visualize_training(
         best_epoch=best_epoch,
         best_valid_value=best_valid_value,
         timing=timing,
+        model_name=model_name,
+        loss_name=loss_name,
+        dim=dim,
+        batch_size=batch_size,
     )
     write_results_report(output_dir, report_text)
 
@@ -703,7 +749,7 @@ def parse_cli():
     parser.add_argument('--no-show', action='store_true', help='Save figures without opening a window')
     parser.add_argument(
         '--uniform-sets', nargs='+', default=None,
-        choices=list(UNIFORM_SET_KEYS),
+        choices=list(DEFAULT_UNIFORM_KEYS),
         help='Uniformity embedding pools to track and plot (default: query target)',
     )
     return parser.parse_args()
