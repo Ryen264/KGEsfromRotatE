@@ -154,8 +154,8 @@ def build_results_report(
     return '\n'.join(lines) + '\n'
 
 
-def write_results_report(output_dir, report_text):
-    results_path = os.path.join(output_dir, 'results.txt')
+def write_results_report(output_dir, report_text, loss_name):
+    results_path = os.path.join(output_dir, f'results_{loss_name}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.txt')
     with open(results_path, 'w') as fout:
         fout.write(report_text)
     print('Results saved to {}'.format(results_path))
@@ -672,6 +672,7 @@ def visualize_training(
     tsne_config=None,
 ):
     config, config_path = load_config(resolve_path(config_path))
+    loss_name = get_loss_display_name(config)
     num_epochs = resolve_num_epochs(config, display_epochs)
     args = build_args(config)
     uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_SETS)
@@ -725,7 +726,7 @@ def visualize_training(
         best_valid_value=best_valid_value,
         timing=timing,
     )
-    write_results_report(output_dir, report_text)
+    write_results_report(output_dir, report_text, loss_name)
 
     return history, model, timing
 
