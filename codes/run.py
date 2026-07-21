@@ -1,7 +1,3 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import argparse
 import json
 import logging
@@ -11,13 +7,10 @@ import random
 import numpy as np
 import torch
 
-from torch.utils.data import DataLoader
-
 from model import KGEModel
 
-from dataloader import TrainDataset
-from dataloader import BidirectionalOneShotIterator
 from loss import UniGammaController, build_training_optimizer, is_learnable_kgau_gammas, set_optimizer_learning_rates, update_kgau_gamma_schedule
+from strategy import get_strategy, resolve_strategy_name
 
 def steps_per_epoch(num_train_triples, batch_size):
     batches = (num_train_triples + batch_size - 1) // batch_size
@@ -50,6 +43,12 @@ def parse_args(args=None):
     parser.add_argument('-g', '--margin_gamma', default=12.0, type=float)
     parser.add_argument('-adv', '--negative_adversarial_sampling', action='store_true')
     parser.add_argument('-a', '--adversarial_temperature', default=1.0, type=float)
+    parser.add_argument(
+        '--strategy', default=None, type=str,
+        choices=['uniform', 'bernoulli', 'selfadv', '1vsall', 'kvsall', 'kgau'],
+        help='Training strategy: NegSamp (uniform|bernoulli|selfadv), AllNeg (1vsall|kvsall), '
+             'or kgau (positives only). Default: kgau for KGAU-family loss, selfadv for sans, else uniform.',
+    )
     parser.add_argument('-b', '--batch_size', default=1024, type=int)
     parser.add_argument('-r', '--regularization_coeff', default=0.0, type=float,
                         help='Lp embedding regularization coefficient')
@@ -289,24 +288,9 @@ def main(args):
         UniGammaController(args).ensure_model_params(kge_model)
     
     if args.do_train:
-        # Set training dataloader iterator
-        train_dataloader_head = DataLoader(
-            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, 'head-batch'), 
-            batch_size=args.batch_size,
-            shuffle=True, 
-            num_workers=4,
-            collate_fn=TrainDataset.collate_fn
-        )
-        
-        train_dataloader_tail = DataLoader(
-            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, 'tail-batch'), 
-            batch_size=args.batch_size,
-            shuffle=True, 
-            num_workers=4,
-            collate_fn=TrainDataset.collate_fn
-        )
-        
-        train_iterator = BidirectionalOneShotIterator(train_dataloader_head, train_dataloader_tail)
+        # Set training dataloader iterator (strategy-dependent)
+        strategy = get_strategy(args)
+        train_iterator = strategy.build_train_iterator(train_triples, nentity, nrelation)
         
         # Set training configuration
         current_learning_rate = args.learning_rate
@@ -333,11 +317,13 @@ def main(args):
     logging.info('epochs = %d' % args.epochs)
     logging.info('steps_per_epoch = %d' % steps_per_epoch_val)
     logging.info('batch_size = %d' % args.batch_size)
-    logging.info('negative_adversarial_sampling = %d' % args.negative_adversarial_sampling)
+    logging.info('strategy = %s' % resolve_strategy_name(args))
+    logging.info('negative_adversarial_sampling = %s' % str(
+        getattr(args, 'negative_adversarial_sampling', False)
+    ))
     logging.info('dim = %d' % args.dim)
     logging.info('margin_gamma = %f' % args.margin_gamma)
-    logging.info('negative_adversarial_sampling = %s' % str(args.negative_adversarial_sampling))
-    if args.negative_adversarial_sampling:
+    if getattr(args, 'negative_adversarial_sampling', False):
         logging.info('adversarial_temperature = %f' % args.adversarial_temperature)
     
     # Set valid dataloader as it would be evaluated during training

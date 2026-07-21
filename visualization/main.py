@@ -1,7 +1,3 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import argparse
 import json
 import os
@@ -12,14 +8,12 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, 'codes'))
 
 import run as train_run
-from dataloader import BidirectionalOneShotIterator, TrainDataset
 from loss import (
     KGAULoss,
     KGmAULoss,
@@ -32,6 +26,7 @@ from loss import (
 )
 from metrics.classification import classification_metrics_from_probs
 from model import KGEModel
+from strategy import get_strategy, resolve_strategy_name
 
 DEFAULT_UNIFORM_KEYS = ['query', 'target', 'entity', 'relation']
 DEFAULT_UNIFORM_T = 4
@@ -156,7 +151,7 @@ def build_results_report(
             ''
         ]
 
-    if acc is not None:
+    if acc is not None and acc != 'N/A':
         lines += [
             'Acc: {}'.format(acc),
             'Prec: {}'.format(prec),
@@ -180,8 +175,7 @@ def build_results_report(
 
     if time_per_epoch is not None:
         lines += [
-            'Time per epoch: {}'.format(time_per_epoch),
-            ''
+            'Time per epoch: {}'.format(time_per_epoch)
         ]
     if peak_gpu_memory is not None:
         lines += [
@@ -261,6 +255,9 @@ def build_args(config):
     args.do_valid = True
     args.do_test = False
     args.cpu_num = config.get('cpu_num', 10)
+    # Resolve strategy defaults (sans -> selfadv, else uniform)
+    args.strategy = resolve_strategy_name(args)
+    get_strategy(args)
 
     return args
 
@@ -321,27 +318,10 @@ def build_model_and_iterator(args, train_triples):
     if is_learnable_kgau_gammas(args):
         UniGammaController(args).ensure_model_params(model)
 
-    train_dataloader_head = DataLoader(
-        TrainDataset(
-            train_triples, args.nentity, args.nrelation,
-            args.negative_sample_size, 'head-batch'
-        ),
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
-        collate_fn=TrainDataset.collate_fn,
+    strategy = get_strategy(args)
+    train_iterator = strategy.build_train_iterator(
+        train_triples, args.nentity, args.nrelation
     )
-    train_dataloader_tail = DataLoader(
-        TrainDataset(
-            train_triples, args.nentity, args.nrelation,
-            args.negative_sample_size, 'tail-batch'
-        ),
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
-        collate_fn=TrainDataset.collate_fn,
-    )
-    train_iterator = BidirectionalOneShotIterator(train_dataloader_head, train_dataloader_tail)
     optimizer = build_training_optimizer(model, args)
     return model, train_iterator, optimizer
 
@@ -418,17 +398,16 @@ def train_step_with_metrics(model, optimizer, train_iterator, args, uniform_sets
     model.train()
     optimizer.zero_grad()
 
-    positive_sample, negative_sample, subsampling_weight, mode = next(train_iterator)
-    if args.cuda:
-        positive_sample = positive_sample.cuda()
-        negative_sample = negative_sample.cuda()
-        subsampling_weight = subsampling_weight.cuda()
-
-    negative_score = model((positive_sample, negative_sample), mode=mode)
-    positive_score = model(positive_sample)
+    strategy = get_strategy(args)
+    batch = next(train_iterator)
+    (
+        positive_score, negative_score, subsampling_weight,
+        positive_sample, mode, negative_weights,
+    ) = strategy.prepare_train_batch(batch, model)
     loss, log = compute_kge_loss(
         positive_score, negative_score, subsampling_weight, model, args,
         positive_sample=positive_sample, mode=mode,
+        negative_weights=negative_weights,
     )
     loss.backward()
     optimizer.step()
@@ -650,8 +629,8 @@ def visualize_training(
     batch_size = getattr(args, 'batch_size', 'NoneBatchSize')
 
     print('Config: {}'.format(config_path))
-    print('Model: {}  Loss: {}  Dataset: {}'.format(
-        model_name, loss_name, config.get('data_path')
+    print('Model: {}  Loss: {}  Strategy: {}  Dataset: {}'.format(
+        model_name, loss_name, getattr(args, 'strategy', 'uniform'), config.get('data_path')
     ))
     print('Training for {} epochs (displaying first {})'.format(num_epochs, display_epochs))
     print('Uniform sets: {}'.format(', '.join(uniform_sets)))

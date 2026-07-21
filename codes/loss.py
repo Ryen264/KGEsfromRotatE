@@ -1,7 +1,3 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -214,11 +210,15 @@ class CrossEntropyLoss(KGELoss):
 
 class SelfAdversarialNegativeSamplingLoss(KGELoss):
     '''
-    Self-adversarial negative sampling loss (RotatE Eq. 6).
+    Self-adversarial / uniform negative sampling loss (RotatE Eq. 6).
 
     L = -log(sigmoid(positive_score))
-        - sum_j softmax(alpha * negative_score_j).detach() * log(sigmoid(-negative_score_j))
+        - sum_j w_j * log(sigmoid(-negative_score_j))
         + regularization
+
+    Negative weights w come from the training strategy (computed once in
+    prepare_train_batch): UniformNS/BernoulliNS use 1/n; SelfAdvNS uses
+    detached softmax(alpha * score). This loss must not recompute softmax.
     '''
 
     def _weighted_mean(self, loss, subsampling_weight):
@@ -229,21 +229,24 @@ class SelfAdversarialNegativeSamplingLoss(KGELoss):
         positive_log_prob = F.logsigmoid(positive_score).squeeze(dim=1)
         return -self._weighted_mean(positive_log_prob, subsampling_weight)
 
-    def _negative_sample_loss(self, negative_score, subsampling_weight):
-        if self.args.negative_adversarial_sampling:
-            # RotatE: softmax weights are detached from the computation graph.
-            negative_log_prob = (
-                F.softmax(negative_score * self.args.adversarial_temperature, dim=1).detach()
-                * F.logsigmoid(-negative_score)
-            ).sum(dim=1)
-        else:
-            negative_log_prob = F.logsigmoid(-negative_score).mean(dim=1)
+    def _resolve_negative_weights(self, negative_score, negative_weights):
+        if negative_weights is not None:
+            return negative_weights
+        # Fallback when caller did not pass strategy weights (e.g. unit tests).
+        from strategy import get_strategy
+        return get_strategy(self.args).weight_negatives(negative_score)
 
+    def _negative_sample_loss(self, negative_score, subsampling_weight, negative_weights=None):
+        weights = self._resolve_negative_weights(negative_score, negative_weights)
+        negative_log_prob = (weights * F.logsigmoid(-negative_score)).sum(dim=1)
         return -self._weighted_mean(negative_log_prob, subsampling_weight)
 
-    def __call__(self, positive_score, negative_score, subsampling_weight, model):
+    def __call__(self, positive_score, negative_score, subsampling_weight, model,
+                 negative_weights=None):
         positive_sample_loss_val = self._positive_sample_loss(positive_score, subsampling_weight)
-        negative_sample_loss_val = self._negative_sample_loss(negative_score, subsampling_weight)
+        negative_sample_loss_val = self._negative_sample_loss(
+            negative_score, subsampling_weight, negative_weights=negative_weights,
+        )
 
         loss = (positive_sample_loss_val + negative_sample_loss_val) / 2
 
@@ -727,7 +730,7 @@ def get_loss(args):
     return LOSS_REGISTRY[loss_name](args)
 
 def compute_kge_loss(positive_score, negative_score, subsampling_weight, model, args,
-                     positive_sample=None, mode=None):
+                     positive_sample=None, mode=None, negative_weights=None):
     loss_name = getattr(args, 'loss', 'sans')
     if is_kgau_family_loss(args):
         if positive_sample is None or mode is None:
@@ -738,4 +741,10 @@ def compute_kge_loss(positive_score, negative_score, subsampling_weight, model, 
         relation = model.relation_embedding[positive_sample[:, 1]]
         tail = model.entity_embedding[positive_sample[:, 2]]
         return get_loss(args).calculate_loss(head, relation, tail, model, mode)
-    return get_loss(args)(positive_score, negative_score, subsampling_weight, model)
+    loss_fn = get_loss(args)
+    if loss_name == 'sans':
+        return loss_fn(
+            positive_score, negative_score, subsampling_weight, model,
+            negative_weights=negative_weights,
+        )
+    return loss_fn(positive_score, negative_score, subsampling_weight, model)

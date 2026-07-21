@@ -1,9 +1,5 @@
 """Preprocess Hetionet v1.0 into RotatE-style dataset files."""
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import argparse
 import bz2
 import json

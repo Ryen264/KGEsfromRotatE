@@ -1,8 +1,9 @@
 {
   "model": "ComplEx",
   "data_path": "data/wn18rr",
-  "loss": "hinge",
-  "dim": 64,
+  "loss": "mr",
+  "strategy": "uniform",
+  "dim": 100,
   "batch_size": 512,
   "negative_sample_size": 1024,
   "margin_gamma": 200.0,
@@ -11,6 +12,6 @@
   "test_batch_size": 8,
   "double_entity_embedding": true,
   "double_relation_embedding": true,
-  "regularization_coeff": 0.000005,
+  "regularization_coeff": 5e-06,
   "regularization_p": 3
 }

@@ -10,11 +10,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 @dataclass
 class GammaPoint:
-    name: str           # Label displayed on the X-axis (e.g., "0" or "1")
-    uniform_gamma_q: int    # 0 or 1
+    name: str              # Label displayed on the X-axis (e.g., "0" or "1")
+    uniform_gamma_q: int   # 0 or 1
     uniform_gamma_y: int   # 0 or 1
     uniform_gamma_e: int   # 0 or 1 (X-axis value)
-    MRR: float          # Validation metric (Y-axis value)
+    MRR: float             # Validation metric (Y-axis value)
 
 
 def resolve_path(path):

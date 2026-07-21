@@ -1,7 +1,3 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import logging
 
 import numpy as np
@@ -15,9 +11,10 @@ from dataloader import TestDataset
 from loss import compute_kge_loss, UniGammaController, is_learnable_kgau_gammas
 from metrics.classification import classification_metrics
 from metrics.ranking import ranks_from_score_matrix, rotate_ranking_metrics_from_ranks
+from strategy import get_strategy
 
 
-class BaseKGE(object):
+class KGEBase(object):
     def score(self, head, relation, tail, mode):
         raise NotImplementedError
 
@@ -28,7 +25,7 @@ class BaseKGE(object):
         raise NotImplementedError
 
 
-class ComplEx(BaseKGE):
+class ComplEx(KGEBase):
     @staticmethod
     def _split_complex(x):
         return torch.chunk(x, 2, dim=-1)
@@ -226,19 +223,17 @@ class KGEModel(nn.Module):
 
         optimizer.zero_grad()
 
-        positive_sample, negative_sample, subsampling_weight, mode = next(train_iterator)
-
-        if args.cuda:
-            positive_sample = positive_sample.cuda()
-            negative_sample = negative_sample.cuda()
-            subsampling_weight = subsampling_weight.cuda()
-
-        negative_score = model((positive_sample, negative_sample), mode=mode)
-        positive_score = model(positive_sample)
+        strategy = get_strategy(args)
+        batch = next(train_iterator)
+        (
+            positive_score, negative_score, subsampling_weight,
+            positive_sample, mode, negative_weights,
+        ) = strategy.prepare_train_batch(batch, model)
 
         loss, log = compute_kge_loss(
             positive_score, negative_score, subsampling_weight, model, args,
             positive_sample=positive_sample, mode=mode,
+            negative_weights=negative_weights,
         )
 
         loss.backward()
