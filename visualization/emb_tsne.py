@@ -219,7 +219,7 @@ def build_args(config):
     args.do_train = True
     args.do_valid = True
     args.do_test = False
-    args.cpu_num = config.get('cpu_num', 10)
+    args.cpu_num = config.get('cpu_num', 4)
     args.strategy = resolve_strategy_name(args)
     get_strategy(args)
 

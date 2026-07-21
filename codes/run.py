@@ -59,7 +59,8 @@ def parse_args(args=None):
                         help='Otherwise use subsampling weighting like in word2vec')
     
     parser.add_argument('-lr', '--learning_rate', default=0.0001, type=float)
-    parser.add_argument('-cpu', '--cpu_num', default=10, type=int)
+    parser.add_argument('-cpu', '--cpu_num', default=4, type=int,
+                        help='DataLoader workers (clamped to system-suggested max)')
     parser.add_argument('-init', '--init_checkpoint', default=None, type=str)
     parser.add_argument('-save', '--save_path', default=None, type=str)
     parser.add_argument('--epochs', default=100, type=int,

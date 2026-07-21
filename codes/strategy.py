@@ -2,6 +2,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import os
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -12,6 +14,29 @@ from dataloader import BidirectionalOneShotIterator, TrainDataset
 
 
 STRATEGY_CHOICES = ('uniform', 'bernoulli', 'selfadv', '1vsall', 'kvsall', 'kgau')
+
+
+def suggested_max_workers():
+    '''PyTorch DataLoader soft cap: CPUs available to this process.'''
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def resolve_num_workers(args, num_loaders=1):
+    '''
+    Clamp DataLoader workers to the system-suggested max.
+
+    When several loaders are alive at once (e.g. head+tail), split the budget
+    so total workers stay within the suggested limit.
+    '''
+    requested = int(getattr(args, 'cpu_num', 4) or 0)
+    suggested = suggested_max_workers()
+    budget = max(0, suggested // max(int(num_loaders), 1))
+    if requested <= 0:
+        return budget
+    return min(requested, budget if budget > 0 else requested)
 
 
 class KGEStrategy(object):
@@ -74,7 +99,7 @@ class KGAUStrategy(KGEStrategy):
 
     def build_train_iterator(self, train_triples, nentity, nrelation):
         batch_size = self.args.batch_size
-        num_workers = getattr(self.args, 'cpu_num', 4)
+        num_workers = resolve_num_workers(self.args, num_loaders=2)
 
         train_dataloader_head = DataLoader(
             PositiveOnlyTrainDataset(train_triples, nentity, nrelation, 'head-batch'),
@@ -112,7 +137,7 @@ class NegSampStrategy(KGEStrategy):
     def build_train_iterator(self, train_triples, nentity, nrelation):
         neg_size = self.args.negative_sample_size
         batch_size = self.args.batch_size
-        num_workers = getattr(self.args, 'cpu_num', 4)
+        num_workers = resolve_num_workers(self.args, num_loaders=2)
 
         train_dataloader_head = DataLoader(
             TrainDataset(train_triples, nentity, nrelation, neg_size, 'head-batch'),
@@ -177,7 +202,7 @@ class BernoulliNS(NegSampStrategy):
     def build_train_iterator(self, train_triples, nentity, nrelation):
         neg_size = self.args.negative_sample_size
         batch_size = self.args.batch_size
-        num_workers = getattr(self.args, 'cpu_num', 4)
+        num_workers = resolve_num_workers(self.args, num_loaders=1)
 
         dataset = BernoulliTrainDataset(
             train_triples, nentity, nrelation, neg_size
@@ -244,7 +269,7 @@ class AllNegStrategy(KGEStrategy):
 
     def build_train_iterator(self, train_triples, nentity, nrelation):
         batch_size = self.args.batch_size
-        num_workers = getattr(self.args, 'cpu_num', 4)
+        num_workers = resolve_num_workers(self.args, num_loaders=2)
         dataset_cls = self._dataset_class()
 
         train_dataloader_head = DataLoader(
