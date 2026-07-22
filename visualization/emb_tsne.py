@@ -366,12 +366,13 @@ def train_step_with_metrics(model, optimizer, train_iterator, args, uniform_sets
     batch = next(train_iterator)
     (
         positive_score, negative_score, subsampling_weight,
-        positive_sample, mode, negative_weights,
+        positive_sample, mode, negative_weights, scores, labels,
     ) = strategy.prepare_train_batch(batch, model)
     loss, log = compute_kge_loss(
         positive_score, negative_score, subsampling_weight, model, args,
         positive_sample=positive_sample, mode=mode,
         negative_weights=negative_weights,
+        scores=scores, labels=labels,
     )
     loss.backward()
     optimizer.step()

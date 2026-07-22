@@ -76,9 +76,12 @@ class KGEStrategy(object):
         '''
         Convert a dataloader batch into
         (positive_score, negative_score, subsampling_weight,
-         positive_sample, mode, negative_weights) for compute_kge_loss.
+         positive_sample, mode, negative_weights, scores, labels).
 
-        negative_weights come from weight_negatives() (once); KGAU returns None.
+        NegSamp: scores/labels are None; use positive/negative scores.
+        1vsAll / KvsAll: scores is [B, E]; labels are one-hot / multi-hot
+        (also keep pos/neg split for pairwise losses).
+        KGAU: scores unused.
         '''
         raise NotImplementedError
 
@@ -122,8 +125,7 @@ class KGAUStrategy(KGEStrategy):
         if self.args.cuda:
             positive_sample = positive_sample.cuda()
             subsampling_weight = subsampling_weight.cuda()
-        # Scores / negative weights unused by KGAU-family losses.
-        return None, None, subsampling_weight, positive_sample, mode, None
+        return None, None, subsampling_weight, positive_sample, mode, None, None, None
 
 
 class NegSampStrategy(KGEStrategy):
@@ -167,7 +169,7 @@ class NegSampStrategy(KGEStrategy):
         negative_weights = self.weight_negatives(negative_score)
         return (
             positive_score, negative_score, subsampling_weight,
-            positive_sample, mode, negative_weights,
+            positive_sample, mode, negative_weights, None, None,
         )
 
 
@@ -256,7 +258,7 @@ class BernoulliNS(NegSampStrategy):
         negative_weights = self.weight_negatives(negative_score)
         return (
             positive_score, negative_score, subsampling_weight,
-            positive_sample, mode, negative_weights,
+            positive_sample, mode, negative_weights, None, None,
         )
 
 
@@ -294,6 +296,16 @@ class AllNegStrategy(KGEStrategy):
     def _candidate_entities(self, nentity, device):
         return torch.arange(nentity, device=device, dtype=torch.long)
 
+    def _score_all_entities(self, model, positive_sample, mode):
+        '''Full [B, E] scores without building [B, E, dim] embeddings.'''
+        if hasattr(model, 'score_all_entities'):
+            return model.score_all_entities(positive_sample, mode=mode)
+        # Legacy fallback (may OOM on large graphs / dims).
+        nentity = model.nentity
+        candidates = self._candidate_entities(nentity, positive_sample.device)
+        negative_sample = candidates.unsqueeze(0).expand(positive_sample.size(0), -1)
+        return model((positive_sample, negative_sample), mode=mode)
+
     def prepare_train_batch(self, batch, model):
         positive_sample, label_matrix, subsampling_weight, mode = batch
         if self.args.cuda:
@@ -301,19 +313,22 @@ class AllNegStrategy(KGEStrategy):
             label_matrix = label_matrix.cuda()
             subsampling_weight = subsampling_weight.cuda()
 
-        nentity = label_matrix.size(1)
-        candidates = self._candidate_entities(nentity, positive_sample.device)
-        # [B, E] entity ids for full ranking
-        negative_sample = candidates.unsqueeze(0).expand(positive_sample.size(0), -1)
-        all_scores = model((positive_sample, negative_sample), mode=mode)
+        all_scores = self._score_all_entities(model, positive_sample, mode)
         positive_score, negative_score = self._split_scores(
             all_scores, positive_sample, label_matrix, mode
         )
+        # Pairwise losses use pos/neg; BCE/CE use full scores + labels
+        # (one-hot for 1vsAll, multi-hot for KvsAll).
+        labels = self._labels_for_loss(all_scores, positive_sample, label_matrix, mode)
         negative_weights = self.weight_negatives(negative_score)
         return (
             positive_score, negative_score, subsampling_weight,
-            positive_sample, mode, negative_weights,
+            positive_sample, mode, negative_weights, all_scores, labels,
         )
+
+    def _labels_for_loss(self, all_scores, positive_sample, label_matrix, mode):
+        '''Default: multi-hot / one-hot matrix from the dataset.'''
+        return label_matrix
 
     def _split_scores(self, all_scores, positive_sample, label_matrix, mode):
         raise NotImplementedError
@@ -330,6 +345,15 @@ class OneVsAll(AllNegStrategy):
     def _dataset_class(self):
         return OneVsAllTrainDataset
 
+    def _labels_for_loss(self, all_scores, positive_sample, label_matrix, mode):
+        loss_name = getattr(self.args, 'loss', '')
+        # CE single-label prefers class indices; BCE uses one-hot matrix.
+        if loss_name == 'ce':
+            if mode == 'tail-batch':
+                return positive_sample[:, 2].long()
+            return positive_sample[:, 0].long()
+        return label_matrix
+
     def _split_scores(self, all_scores, positive_sample, label_matrix, mode):
         batch_size = all_scores.size(0)
         if mode == 'tail-batch':
@@ -338,7 +362,6 @@ class OneVsAll(AllNegStrategy):
             pos_idx = positive_sample[:, 0]
 
         positive_score = all_scores.gather(1, pos_idx.view(-1, 1))
-        # Mask out the positive column to form negatives
         mask = torch.ones_like(all_scores, dtype=torch.bool)
         mask.scatter_(1, pos_idx.view(-1, 1), False)
         negative_score = all_scores[mask].view(batch_size, -1)
@@ -350,16 +373,18 @@ class KvsAll(AllNegStrategy):
     KvsAll: for (h, r, *) [or (*, r, t)], all known training completions are
     positives (label 1); remaining entities are negatives (label 0).
 
-    Scores are reduced to one positive column (true entity of the instance) and
-    negatives = all entities with label 0, so existing pointwise/pairwise losses
-    still apply. Multi-label BCE over the full matrix is available via
-    prepare_multilabel_batch().
+    BCE/CE use full [B, E] scores with multi-hot labels. Pairwise losses still
+    receive a pos/neg split (instance positive vs label-0 entities).
     '''
 
     name = 'kvsall'
 
     def _dataset_class(self):
         return KvsAllTrainDataset
+
+    def _labels_for_loss(self, all_scores, positive_sample, label_matrix, mode):
+        # Always multi-hot for KvsAll (BCE and multi-label CE).
+        return label_matrix
 
     def _split_scores(self, all_scores, positive_sample, label_matrix, mode):
         batch_size = all_scores.size(0)
@@ -369,42 +394,31 @@ class KvsAll(AllNegStrategy):
             pos_idx = positive_sample[:, 0]
 
         positive_score = all_scores.gather(1, pos_idx.view(-1, 1))
-        # Negatives: entities that are not known true completions for this query
         neg_mask = label_matrix < 0.5
-        # Ensure at least one negative slot by falling back to "not the instance positive"
         if not neg_mask.any():
             neg_mask = torch.ones_like(all_scores, dtype=torch.bool)
             neg_mask.scatter_(1, pos_idx.view(-1, 1), False)
 
-        # Variable number of negatives per row — pad by sampling from masked scores
-        # via a dense [B, E] mask fill with a large negative for ignored positions
-        # then take all label-0 columns. Use gather of flattened indices per row.
-        nentity = all_scores.size(1)
         neg_counts = neg_mask.sum(dim=1)
         max_neg = int(neg_counts.max().item())
-        # Build padded negative scores
         negative_score = all_scores.new_full((batch_size, max_neg), 0.0)
         for i in range(batch_size):
             row = all_scores[i][neg_mask[i]]
             negative_score[i, : row.numel()] = row
             if row.numel() < max_neg:
-                # repeat last / mean fill unused slots so .mean(dim=1) is stable
                 fill = row.mean() if row.numel() > 0 else all_scores.new_zeros(())
                 negative_score[i, row.numel():] = fill
         return positive_score, negative_score
 
     def prepare_multilabel_batch(self, batch, model):
-        '''Full [B, E] scores and multi-hot labels for multi-label BCE.'''
+        '''Full [B, E] scores and multi-hot labels for multi-label BCE/CE.'''
         positive_sample, label_matrix, subsampling_weight, mode = batch
         if self.args.cuda:
             positive_sample = positive_sample.cuda()
             label_matrix = label_matrix.cuda()
             subsampling_weight = subsampling_weight.cuda()
 
-        nentity = label_matrix.size(1)
-        candidates = self._candidate_entities(nentity, positive_sample.device)
-        negative_sample = candidates.unsqueeze(0).expand(positive_sample.size(0), -1)
-        all_scores = model((positive_sample, negative_sample), mode=mode)
+        all_scores = self._score_all_entities(model, positive_sample, mode)
         return all_scores, label_matrix, subsampling_weight, positive_sample, mode
 
 

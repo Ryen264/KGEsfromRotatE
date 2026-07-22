@@ -106,6 +106,7 @@ def build_results_report(
     timing,
     model_name,
     loss_name,
+    strategy_name,
     dim,
     batch_size
 ):
@@ -122,7 +123,7 @@ def build_results_report(
     pr_auc = format_metric_value(classification_metrics_dict.get('pr_auc') if classification_metrics_dict else None)
     roc_auc = format_metric_value(classification_metrics_dict.get('roc_auc') if classification_metrics_dict else None)
     
-    best_epoch = format_metric_value(best_epoch)
+    best_epoch = int(best_epoch)
     best_valid_value = format_metric_value(best_valid_value)
     
     train_time = format_duration(timing['train_time'])
@@ -136,6 +137,7 @@ def build_results_report(
     lines = [
         'Model: {}'.format(model_name),
         'Loss: {}'.format(loss_name),
+        'Strategy: {}'.format(strategy_name),
         'Dim: {}'.format(dim),
         'Batch Size: {}'.format(batch_size),
         ''
@@ -402,12 +404,13 @@ def train_step_with_metrics(model, optimizer, train_iterator, args, uniform_sets
     batch = next(train_iterator)
     (
         positive_score, negative_score, subsampling_weight,
-        positive_sample, mode, negative_weights,
+        positive_sample, mode, negative_weights, scores, labels,
     ) = strategy.prepare_train_batch(batch, model)
     loss, log = compute_kge_loss(
         positive_score, negative_score, subsampling_weight, model, args,
         positive_sample=positive_sample, mode=mode,
         negative_weights=negative_weights,
+        scores=scores, labels=labels,
     )
     loss.backward()
     optimizer.step()
@@ -625,6 +628,7 @@ def visualize_training(
 
     model_name = config.get('model')
     loss_name = getattr(args, 'loss', 'NoneLoss')
+    strategy_name = getattr(args, 'strategy', 'NoneStrategy')
     dim = getattr(args, 'dim', 'NoneDim')
     batch_size = getattr(args, 'batch_size', 'NoneBatchSize')
 
@@ -700,6 +704,7 @@ def visualize_training(
         timing=timing,
         model_name=model_name,
         loss_name=loss_name,
+        strategy_name=strategy_name,
         dim=dim,
         batch_size=batch_size,
     )

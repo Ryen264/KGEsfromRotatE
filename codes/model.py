@@ -71,6 +71,15 @@ class ComplEx(KGEBase):
         target = self.target_encoder(head, relation, tail, mode)
         return self._hermitian_dot(query, target)
 
+    def score_query_entities(self, query, entity_embedding):
+        '''
+        Score queries against all entity embeddings without expanding to [B, E, D].
+        query: [B, D], entity_embedding: [E, D] -> scores [B, E]
+        '''
+        re_q, im_q = self._split_complex(query)
+        re_e, im_e = self._split_complex(entity_embedding)
+        return re_q @ re_e.transpose(0, 1) + im_q @ im_e.transpose(0, 1)
+
 
 KGE_SCORERS = {
     'ComplEx': ComplEx,
@@ -212,7 +221,50 @@ class KGEModel(nn.Module):
             score_mode = mode
 
         return self.kge_scorer.score(head, relation, tail, score_mode)
-    
+
+    def score_all_entities(self, positive_sample, mode='tail-batch'):
+        '''
+        Score each positive query against all entities.
+
+        Avoids materializing [B, nentity, dim] candidate embeddings (OOM on
+        AllNeg / 1vsAll / KvsAll). Uses a query-[B,D] x entity-[E,D] path when
+        the scorer supports it; otherwise falls back to chunked forward().
+        '''
+        head = self.entity_embedding[positive_sample[:, 0]].unsqueeze(1)
+        relation = self.relation_embedding[positive_sample[:, 1]].unsqueeze(1)
+        tail = self.entity_embedding[positive_sample[:, 2]].unsqueeze(1)
+
+        if mode == 'head-batch':
+            query = self.kge_scorer.query_encoder(head, relation, tail, mode)
+        else:
+            query = self.kge_scorer.query_encoder(head, relation, tail, 'tail-batch')
+
+        query = query.squeeze(1)  # [B, D]
+        scorer = self.kge_scorer
+        if hasattr(scorer, 'score_query_entities'):
+            return scorer.score_query_entities(query, self.entity_embedding)
+        return self._score_all_entities_chunked(positive_sample, mode)
+
+    def _score_all_entities_chunked(self, positive_sample, mode, chunk_size=None):
+        '''Fallback: score entity id chunks through forward().'''
+        nentity = self.nentity
+        batch_size = positive_sample.size(0)
+        device = positive_sample.device
+        if chunk_size is None:
+            entity_dim = self.entity_embedding.size(1)
+            # Keep ~512MiB peak for [B, C, D] float32 (+ mul intermediates).
+            bytes_budget = 512 * 1024 * 1024
+            per_entity = max(batch_size * entity_dim * 4 * 2, 1)
+            chunk_size = max(256, min(nentity, bytes_budget // per_entity))
+
+        chunks = []
+        for start in range(0, nentity, chunk_size):
+            end = min(start + chunk_size, nentity)
+            candidates = torch.arange(start, end, device=device, dtype=torch.long)
+            negative_sample = candidates.unsqueeze(0).expand(batch_size, -1)
+            chunks.append(self((positive_sample, negative_sample), mode=mode))
+        return torch.cat(chunks, dim=1)
+
     @staticmethod
     def train_step(model, optimizer, train_iterator, args):
         '''
@@ -227,13 +279,14 @@ class KGEModel(nn.Module):
         batch = next(train_iterator)
         (
             positive_score, negative_score, subsampling_weight,
-            positive_sample, mode, negative_weights,
+            positive_sample, mode, negative_weights, scores, labels,
         ) = strategy.prepare_train_batch(batch, model)
 
         loss, log = compute_kge_loss(
             positive_score, negative_score, subsampling_weight, model, args,
             positive_sample=positive_sample, mode=mode,
             negative_weights=negative_weights,
+            scores=scores, labels=labels,
         )
 
         loss.backward()

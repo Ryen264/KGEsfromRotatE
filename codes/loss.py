@@ -90,14 +90,21 @@ class PointwiseHingeLoss(KGELoss):
 
 class BinaryCrossEntropyLoss(KGELoss):
     '''
-    Binary cross-entropy loss - treats positive/negative scores as binary labels
-    L = BCE(sigmoid(positive), 1) + BCE(sigmoid(negative), 0) + regularization
+    Binary cross-entropy loss.
+
+    Single-label / NegSamp (positive_score, negative_score):
+        L = 1/2 * (BCE(pos, 1) + mean_j BCE(neg_j, 0))
+
+    Labeled (scores [B, C], labels [B, C] in {0,1}):
+        L = mean_c BCE(scores_c, labels_c)
+        - 1vsAll: labels are one-hot over entities
+        - KvsAll: labels are multi-hot over known training completions
     '''
 
     def _weighted_mean(self, loss, subsampling_weight):
         return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
 
-    def __call__(self, positive_score, negative_score, subsampling_weight, model):
+    def _from_pos_neg(self, positive_score, negative_score, subsampling_weight):
         positive_loss = F.binary_cross_entropy_with_logits(
             positive_score.squeeze(dim=1),
             torch.ones(positive_score.size(0), device=positive_score.device),
@@ -108,7 +115,21 @@ class BinaryCrossEntropyLoss(KGELoss):
             torch.zeros_like(negative_score),
             reduction='none',
         ).mean(dim=1)
-        loss = self._weighted_mean((positive_loss + negative_loss) / 2, subsampling_weight)
+        return self._weighted_mean((positive_loss + negative_loss) / 2, subsampling_weight)
+
+    def _from_labels(self, scores, labels, subsampling_weight):
+        labels = labels.float()
+        per_sample = F.binary_cross_entropy_with_logits(
+            scores, labels, reduction='none',
+        ).mean(dim=1)
+        return self._weighted_mean(per_sample, subsampling_weight)
+
+    def __call__(self, positive_score, negative_score, subsampling_weight, model,
+                 scores=None, labels=None, **_kwargs):
+        if scores is not None and labels is not None:
+            loss = self._from_labels(scores, labels, subsampling_weight)
+        else:
+            loss = self._from_pos_neg(positive_score, negative_score, subsampling_weight)
 
         regularization_term, regularization_log = regularization(
             model, self.args.regularization_coeff, p=self.args.regularization_p
@@ -181,20 +202,47 @@ class BayesianPersonalizedRankingLoss(KGELoss):
 
 class CrossEntropyLoss(KGELoss):
     '''
-    Cross-entropy loss - a listwise softmax loss
-    L = -log(softmax(positive_score)) + regularization
+    Cross-entropy / softmax loss.
+
+    Single-label / NegSamp (positive_score, negative_score):
+        L = -log softmax([pos, neg...])[0]
+
+    Labeled:
+        - labels long [B]: class indices (1vsAll single-label)
+              L = -log softmax(scores)[y]
+        - labels float [B, C] multi-hot (KvsAll):
+              L = - sum_c y_c log softmax(scores)_c / sum_c y_c
     '''
 
     def _weighted_mean(self, loss, subsampling_weight):
         return weighted_mean(loss, subsampling_weight, self.args.uni_weight)
 
-    def __call__(self, positive_score, negative_score, subsampling_weight, model):
+    def _from_pos_neg(self, positive_score, negative_score, subsampling_weight):
         scores = torch.cat([positive_score, negative_score], dim=1)
         target = torch.zeros(scores.size(0), dtype=torch.long, device=scores.device)
-        loss = self._weighted_mean(
+        return self._weighted_mean(
             F.cross_entropy(scores, target, reduction='none'),
             subsampling_weight,
         )
+
+    def _from_labels(self, scores, labels, subsampling_weight):
+        if labels.dtype in (torch.long, torch.int64, torch.int32) and labels.dim() == 1:
+            per_sample = F.cross_entropy(scores, labels.long(), reduction='none')
+        else:
+            labels = labels.float()
+            log_probs = F.log_softmax(scores, dim=1)
+            # Multi-label softmax CE (LibKGE-style shared softmax over entities).
+            denom = labels.sum(dim=1).clamp_min(1.0)
+            per_sample = -(labels * log_probs).sum(dim=1) / denom
+        return self._weighted_mean(per_sample, subsampling_weight)
+
+    def __call__(self, positive_score, negative_score, subsampling_weight, model,
+                 scores=None, labels=None, **_kwargs):
+        if scores is not None and labels is not None:
+            loss = self._from_labels(scores, labels, subsampling_weight)
+        else:
+            loss = self._from_pos_neg(positive_score, negative_score, subsampling_weight)
+
         regularization_term, regularization_log = regularization(
             model, self.args.regularization_coeff, p=self.args.regularization_p
         )
@@ -730,7 +778,8 @@ def get_loss(args):
     return LOSS_REGISTRY[loss_name](args)
 
 def compute_kge_loss(positive_score, negative_score, subsampling_weight, model, args,
-                     positive_sample=None, mode=None, negative_weights=None):
+                     positive_sample=None, mode=None, negative_weights=None,
+                     scores=None, labels=None):
     loss_name = getattr(args, 'loss', 'sans')
     if is_kgau_family_loss(args):
         if positive_sample is None or mode is None:
@@ -746,5 +795,10 @@ def compute_kge_loss(positive_score, negative_score, subsampling_weight, model, 
         return loss_fn(
             positive_score, negative_score, subsampling_weight, model,
             negative_weights=negative_weights,
+        )
+    if loss_name in ('bce', 'ce'):
+        return loss_fn(
+            positive_score, negative_score, subsampling_weight, model,
+            scores=scores, labels=labels,
         )
     return loss_fn(positive_score, negative_score, subsampling_weight, model)
