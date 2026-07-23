@@ -195,8 +195,10 @@ class SelfAdvNS(NegSampStrategy):
 class BernoulliNS(NegSampStrategy):
     '''
     Bernoulli negative sampling (TransE): for relation r, corrupt the head with
-    probability tph/(tph+hpt) and the tail with probability hpt/(tph+hpt),
-    where tph / hpt are average tails-per-head and heads-per-tail for r.
+    probability tph/(tph+hpt) and the tail with probability hpt/(tph+hpt).
+
+    Uses separate head/tail loaders (same batch shape as UniformNS) so each
+    training step scores a full batch in one mode — fair peak-memory comparison.
     '''
 
     name = 'bernoulli'
@@ -204,62 +206,27 @@ class BernoulliNS(NegSampStrategy):
     def build_train_iterator(self, train_triples, nentity, nrelation):
         neg_size = self.args.negative_sample_size
         batch_size = self.args.batch_size
-        num_workers = resolve_num_workers(self.args, num_loaders=1)
+        num_workers = resolve_num_workers(self.args, num_loaders=2)
 
-        dataset = BernoulliTrainDataset(
-            train_triples, nentity, nrelation, neg_size
-        )
-        loader = DataLoader(
-            dataset,
+        train_dataloader_head = DataLoader(
+            BernoulliTrainDataset(
+                train_triples, nentity, nrelation, neg_size, 'head-batch'
+            ),
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
             collate_fn=BernoulliTrainDataset.collate_fn,
         )
-        return BernoulliOneShotIterator(loader)
-
-    def prepare_train_batch(self, batch, model):
-        '''
-        A Bernoulli batch may mix head-batch and tail-batch rows. Score each
-        mode subset separately, then concatenate scores in original order.
-        '''
-        positive_sample, negative_sample, subsampling_weight, modes = batch
-        if self.args.cuda:
-            positive_sample = positive_sample.cuda()
-            negative_sample = negative_sample.cuda()
-            subsampling_weight = subsampling_weight.cuda()
-
-        batch_size = positive_sample.size(0)
-        device = positive_sample.device
-        positive_score = model(positive_sample)
-        negative_score = positive_score.new_zeros(batch_size, negative_sample.size(1))
-
-        modes_list = list(modes)
-        head_idx = [i for i, m in enumerate(modes_list) if m == 'head-batch']
-        tail_idx = [i for i, m in enumerate(modes_list) if m == 'tail-batch']
-
-        if head_idx:
-            idx = torch.LongTensor(head_idx).to(device)
-            neg = model(
-                (positive_sample.index_select(0, idx), negative_sample.index_select(0, idx)),
-                mode='head-batch',
-            )
-            negative_score[idx] = neg
-        if tail_idx:
-            idx = torch.LongTensor(tail_idx).to(device)
-            neg = model(
-                (positive_sample.index_select(0, idx), negative_sample.index_select(0, idx)),
-                mode='tail-batch',
-            )
-            negative_score[idx] = neg
-
-        # Representative mode for KGAU query/target encoders (prefer majority).
-        mode = 'head-batch' if len(head_idx) >= len(tail_idx) else 'tail-batch'
-        negative_weights = self.weight_negatives(negative_score)
-        return (
-            positive_score, negative_score, subsampling_weight,
-            positive_sample, mode, negative_weights, None, None,
+        train_dataloader_tail = DataLoader(
+            BernoulliTrainDataset(
+                train_triples, nentity, nrelation, neg_size, 'tail-batch'
+            ),
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=BernoulliTrainDataset.collate_fn,
         )
+        return BidirectionalOneShotIterator(train_dataloader_head, train_dataloader_tail)
 
 
 class AllNegStrategy(KGEStrategy):
@@ -460,12 +427,23 @@ class PositiveOnlyTrainDataset(Dataset):
 
 
 class BernoulliTrainDataset(Dataset):
-    def __init__(self, triples, nentity, nrelation, negative_sample_size):
+    '''
+    Fixed-mode Bernoulli dataset for fair head/tail loaders.
+
+    Each item corrupts only ``mode`` (head-batch or tail-batch). Triples are
+    accepted with TransE Bernoulli probability for that side (rejection
+    sampling), so batches stay full-size and single-mode like UniformNS.
+    '''
+
+    def __init__(self, triples, nentity, nrelation, negative_sample_size, mode):
+        if mode not in ('head-batch', 'tail-batch'):
+            raise ValueError('BernoulliTrainDataset mode %s not supported' % mode)
         self.len = len(triples)
         self.triples = triples
         self.nentity = nentity
         self.nrelation = nrelation
         self.negative_sample_size = negative_sample_size
+        self.mode = mode
         self.count = TrainDataset.count_frequency(triples)
         self.true_head, self.true_tail = TrainDataset.get_true_head_and_tail(triples)
         self.tph, self.hpt = self._relation_tph_hpt(triples, nrelation)
@@ -495,12 +473,12 @@ class BernoulliTrainDataset(Dataset):
     def __len__(self):
         return self.len
 
-    def _sample_negatives(self, mode, head, relation, tail):
+    def _sample_negatives(self, head, relation, tail):
         negative_sample_list = []
         negative_sample_size = 0
         while negative_sample_size < self.negative_sample_size:
             negative_sample = np.random.randint(self.nentity, size=self.negative_sample_size * 2)
-            if mode == 'head-batch':
+            if self.mode == 'head-batch':
                 mask = np.isin(negative_sample, self.true_head[(relation, tail)], invert=True)
             else:
                 mask = np.isin(negative_sample, self.true_tail[(head, relation)], invert=True)
@@ -509,22 +487,35 @@ class BernoulliTrainDataset(Dataset):
             negative_sample_size += negative_sample.size
         return np.concatenate(negative_sample_list)[: self.negative_sample_size]
 
+    def _bernoulli_accepts_mode(self, relation):
+        p_corrupt_head = self.tph[relation] / (self.tph[relation] + self.hpt[relation])
+        corrupt_head = np.random.rand() < p_corrupt_head
+        if self.mode == 'head-batch':
+            return corrupt_head
+        return not corrupt_head
+
     def __getitem__(self, idx):
-        positive_sample = self.triples[idx]
+        positive_sample = None
+        for offset in range(self.len):
+            i = (idx + offset) % self.len
+            candidate = self.triples[i]
+            head, relation, tail = candidate
+            if self._bernoulli_accepts_mode(relation):
+                positive_sample = candidate
+                break
+        if positive_sample is None:
+            positive_sample = self.triples[idx]
         head, relation, tail = positive_sample
 
         subsampling_weight = self.count[(head, relation)] + self.count[(tail, -relation - 1)]
         subsampling_weight = torch.sqrt(1 / torch.Tensor([subsampling_weight]))
-
-        p_corrupt_head = self.tph[relation] / (self.tph[relation] + self.hpt[relation])
-        mode = 'head-batch' if np.random.rand() < p_corrupt_head else 'tail-batch'
-        negative_sample = self._sample_negatives(mode, head, relation, tail)
+        negative_sample = self._sample_negatives(head, relation, tail)
 
         return (
             torch.LongTensor(positive_sample),
             torch.LongTensor(negative_sample),
             subsampling_weight,
-            mode,
+            self.mode,
         )
 
     @staticmethod
@@ -532,24 +523,8 @@ class BernoulliTrainDataset(Dataset):
         positive_sample = torch.stack([_[0] for _ in data], dim=0)
         negative_sample = torch.stack([_[1] for _ in data], dim=0)
         subsample_weight = torch.cat([_[2] for _ in data], dim=0)
-        modes = [_[3] for _ in data]
-        return positive_sample, negative_sample, subsample_weight, modes
-
-
-class BernoulliOneShotIterator(object):
-    def __init__(self, dataloader):
-        self.iterator = self.one_shot_iterator(dataloader)
-        self.step = 0
-
-    def __next__(self):
-        self.step += 1
-        return next(self.iterator)
-
-    @staticmethod
-    def one_shot_iterator(dataloader):
-        while True:
-            for data in dataloader:
-                yield data
+        mode = data[0][3]
+        return positive_sample, negative_sample, subsample_weight, mode
 
 
 class _AllNegTrainDatasetBase(Dataset):

@@ -132,7 +132,14 @@ def build_results_report(
     total_time = format_duration(timing['total_time'])
     
     time_per_epoch = format_duration(timing['train_time'] / max(num_epochs, 1))
-    peak_gpu_memory = format_duration(timing['peak_gpu_memory_gb'])
+    # Prefer train-only peak when available (excludes valid/test).
+    peak_value = timing.get('train_peak_gpu_memory_gb')
+    if peak_value is None:
+        peak_value = timing.get('peak_gpu_memory_gb')
+    if peak_value is None:
+        peak_gpu_memory = None
+    else:
+        peak_gpu_memory = '{:.2f} GB'.format(float(peak_value))
 
     lines = [
         'Model: {}'.format(model_name),
@@ -192,6 +199,80 @@ def write_results_report(output_dir, report_text):
         fout.write(report_text)
     print('Results saved to {}'.format(results_path))
     return results_path
+
+
+def _sync_cuda(args):
+    if getattr(args, 'cuda', False) and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def candidates_per_positive(args):
+    strategy = getattr(args, 'strategy', 'uniform')
+    if strategy in ('1vsall', 'kvsall'):
+        return int(getattr(args, 'nentity', 0) or 0)
+    if strategy in ('uniform', 'bernoulli', 'selfadv'):
+        return int(getattr(args, 'negative_sample_size', 0) or 0)
+    return 0
+
+
+def build_eff_report(args, timing, num_epochs, epoch_steps):
+    '''Train-only efficiency metrics for fair strategy comparison.'''
+    train_epoch_times = timing.get('train_epoch_times') or []
+    if len(train_epoch_times) > 1:
+        # Skip first epoch as warmup (allocator / cudnn).
+        steady = train_epoch_times[1:]
+    else:
+        steady = train_epoch_times
+    time_per_epoch = float(np.mean(steady)) if steady else 0.0
+
+    peak = timing.get('train_peak_gpu_memory_gb')
+    peak_str = '{:.4f}'.format(peak) if peak is not None else 'N/A'
+    reserved = timing.get('train_peak_gpu_memory_reserved_gb')
+    reserved_str = '{:.4f}'.format(reserved) if reserved is not None else 'N/A'
+
+    lines = [
+        'Efficiency report (train-only)',
+        '==============================',
+        'Model: {}'.format(getattr(args, 'model', None)),
+        'Loss: {}'.format(getattr(args, 'loss', None)),
+        'Strategy: {}'.format(getattr(args, 'strategy', None)),
+        'Dim: {}'.format(getattr(args, 'dim', None)),
+        'Batch size: {}'.format(getattr(args, 'batch_size', None)),
+        'Negative sample size: {}'.format(
+            getattr(args, 'negative_sample_size', None)
+        ),
+        'Nentity: {}'.format(getattr(args, 'nentity', None)),
+        'Candidates per positive: {}'.format(candidates_per_positive(args)),
+        'Steps per epoch: {}'.format(epoch_steps),
+        'Num epochs measured: {}'.format(num_epochs),
+        'Warmup epochs excluded from mean time: {}'.format(
+            1 if len(train_epoch_times) > 1 else 0
+        ),
+        '',
+        'Train time total (s): {:.4f}'.format(timing.get('train_time', 0.0)),
+        'Train time per epoch (s): {:.4f}'.format(time_per_epoch),
+        'Train time per epoch (formatted): {}'.format(format_duration(time_per_epoch)),
+        'Valid time total (s): {:.4f}'.format(timing.get('valid_time', 0.0)),
+        'Test time total (s): {:.4f}'.format(timing.get('test_time', 0.0)),
+        '',
+        'Train peak GPU memory allocated (GB): {}'.format(peak_str),
+        'Train peak GPU memory reserved (GB): {}'.format(reserved_str),
+        '',
+        'Notes:',
+        '- Peak memory is max_memory_allocated during train steps only',
+        '  (reset each epoch before train; excludes valid/test).',
+        '- Time per epoch averages train-only wall time with CUDA sync;',
+        '  first epoch excluded when num_epochs > 1.',
+    ]
+    return '\n'.join(lines) + '\n'
+
+
+def write_eff_report(output_dir, report_text):
+    path = os.path.join(output_dir, 'eff-report.txt')
+    with open(path, 'w') as fout:
+        fout.write(report_text)
+    print('Efficiency report saved to {}'.format(path))
+    return path
 
 
 def run_post_training_evaluation(model, args, test_triples, all_true_triples):
@@ -434,9 +515,6 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
     epoch_steps = train_run.steps_per_epoch(len(train_triples), args.batch_size)
     loss_name = get_loss_display_name(args)
 
-    if args.cuda:
-        torch.cuda.reset_peak_memory_stats()
-
     history = {
         'epochs': [],
         'align_loss': [],
@@ -447,6 +525,9 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
     }
     train_time = 0.0
     valid_time = 0.0
+    train_epoch_times = []
+    train_peak_gpu_memory_gb = None
+    train_peak_gpu_memory_reserved_gb = None
 
     epoch_bar = tqdm(
         range(1, num_epochs + 1),
@@ -460,6 +541,9 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
             update_kgau_gamma_schedule(args)
 
         batch_logs = []
+        if args.cuda:
+            torch.cuda.reset_peak_memory_stats()
+        _sync_cuda(args)
         train_start = time.perf_counter()
         step_bar = tqdm(
             range(epoch_steps),
@@ -472,7 +556,22 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
             batch_logs.append(
                 train_step_with_metrics(model, optimizer, train_iterator, args, uniform_sets)
             )
-        train_time += time.perf_counter() - train_start
+        _sync_cuda(args)
+        epoch_train_time = time.perf_counter() - train_start
+        train_time += epoch_train_time
+        train_epoch_times.append(epoch_train_time)
+
+        if args.cuda:
+            epoch_peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            epoch_reserved = torch.cuda.max_memory_reserved() / (1024 ** 3)
+            if train_peak_gpu_memory_gb is None:
+                train_peak_gpu_memory_gb = epoch_peak
+                train_peak_gpu_memory_reserved_gb = epoch_reserved
+            else:
+                train_peak_gpu_memory_gb = max(train_peak_gpu_memory_gb, epoch_peak)
+                train_peak_gpu_memory_reserved_gb = max(
+                    train_peak_gpu_memory_reserved_gb, epoch_reserved
+                )
 
         history['epochs'].append(epoch)
         history['align_loss'].append(np.mean([log['align_loss'] for log in batch_logs]))
@@ -498,16 +597,16 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
         )
         epoch_bar.set_postfix_str(postfix, refresh=True)
 
-    peak_gpu_memory_gb = None
-    if args.cuda:
-        peak_gpu_memory_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
-
     timing = {
         'train_time': train_time,
         'valid_time': valid_time,
         'test_time': 0.0,
         'total_time': train_time + valid_time,
-        'peak_gpu_memory_gb': peak_gpu_memory_gb,
+        'peak_gpu_memory_gb': train_peak_gpu_memory_gb,
+        'train_peak_gpu_memory_gb': train_peak_gpu_memory_gb,
+        'train_peak_gpu_memory_reserved_gb': train_peak_gpu_memory_reserved_gb,
+        'train_epoch_times': train_epoch_times,
+        'epoch_steps': epoch_steps,
     }
 
     datasets = {
@@ -709,6 +808,14 @@ def visualize_training(
         batch_size=batch_size,
     )
     write_results_report(output_dir, report_text)
+
+    eff_text = build_eff_report(
+        args,
+        timing,
+        num_epochs=num_epochs,
+        epoch_steps=timing.get('epoch_steps', 0),
+    )
+    write_eff_report(output_dir, eff_text)
 
     return history, fig_au, fig_curve
 
