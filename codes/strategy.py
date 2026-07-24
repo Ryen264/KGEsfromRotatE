@@ -8,12 +8,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Dataset
 
 from dataloader import BidirectionalOneShotIterator, TrainDataset
 
 
 STRATEGY_CHOICES = ('uniform', 'bernoulli', 'selfadv', '1vsall', 'kvsall', 'kgau')
+
+# Shared with AllNeg chunked fallback: cap peak [B, C, D] float32 (+ mul intermediates).
+_NEG_CHUNK_BYTES_BUDGET = 512 * 1024 * 1024
 
 
 def suggested_max_workers():
@@ -129,12 +133,71 @@ class KGAUStrategy(KGEStrategy):
 
 
 class NegSampStrategy(KGEStrategy):
+    '''
+    NegSamp family (uniform / bernoulli / selfadv).
+
+    Memory: scoring all N negatives at once materializes [B, N, D] candidate
+    embeddings. When N is large, score negatives in chunks and use gradient
+    checkpointing so only one [B, C, D] block is live at a time (same ~512MiB
+    budget heuristic as AllNeg's chunked fallback).
+    '''
+
     family = 'negsamp'
 
     def weight_negatives(self, negative_score):
         # Equal weights; sum_j w_j * L_j with w_j = 1/n equals mean.
         n_neg = negative_score.size(1)
         return negative_score.new_full(negative_score.shape, 1.0 / n_neg)
+
+    def resolve_negative_chunk_size(self, batch_size, n_neg, entity_dim):
+        '''Return C such that scoring uses at most ~512MiB for [B, C, D], unless overridden.'''
+        if n_neg <= 0:
+            return 0
+        explicit = int(getattr(self.args, 'negative_chunk_size', 0) or 0)
+        if explicit > 0:
+            return min(explicit, n_neg)
+        per_neg = max(batch_size * entity_dim * 4 * 2, 1)
+        auto = max(256, _NEG_CHUNK_BYTES_BUDGET // per_neg)
+        return min(int(auto), n_neg)
+
+    def score_negatives(self, model, positive_sample, negative_sample, mode):
+        '''Score [B, N] negatives, chunking (+ checkpoint) when N exceeds the budget.'''
+        n_neg = negative_sample.size(1)
+        if n_neg == 0:
+            return torch.zeros(
+                positive_sample.size(0), 0,
+                device=positive_sample.device,
+                dtype=model.entity_embedding.dtype,
+            )
+
+        chunk_size = self.resolve_negative_chunk_size(
+            positive_sample.size(0),
+            n_neg,
+            model.entity_embedding.size(1),
+        )
+        if chunk_size >= n_neg:
+            return model((positive_sample, negative_sample), mode=mode)
+
+        score_chunks = []
+        for start in range(0, n_neg, chunk_size):
+            end = min(start + chunk_size, n_neg)
+            neg_chunk = negative_sample[:, start:end]
+
+            def _forward_chunk(pos, neg, _mode=mode):
+                return model((pos, neg), mode=_mode)
+
+            if model.training:
+                # Recompute chunk activations on backward → peak ≈ one chunk.
+                chunk_score = checkpoint(
+                    _forward_chunk,
+                    positive_sample,
+                    neg_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                chunk_score = _forward_chunk(positive_sample, neg_chunk)
+            score_chunks.append(chunk_score)
+        return torch.cat(score_chunks, dim=1)
 
     def build_train_iterator(self, train_triples, nentity, nrelation):
         neg_size = self.args.negative_sample_size
@@ -164,7 +227,9 @@ class NegSampStrategy(KGEStrategy):
             negative_sample = negative_sample.cuda()
             subsampling_weight = subsampling_weight.cuda()
 
-        negative_score = model((positive_sample, negative_sample), mode=mode)
+        negative_score = self.score_negatives(
+            model, positive_sample, negative_sample, mode,
+        )
         positive_score = model(positive_sample)
         negative_weights = self.weight_negatives(negative_score)
         return (

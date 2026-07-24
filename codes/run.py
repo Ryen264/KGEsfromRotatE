@@ -39,6 +39,11 @@ def parse_args(args=None):
     parser.add_argument('-dr', '--double_relation_embedding', action='store_true')
     
     parser.add_argument('-n', '--negative_sample_size', default=128, type=int)
+    parser.add_argument(
+        '--negative_chunk_size', default=0, type=int,
+        help='NegSamp only: max negatives scored per chunk (0=auto ~512MiB [B,C,D] budget). '
+             'When chunking, uses gradient checkpointing to cap peak GPU memory.',
+    )
     parser.add_argument('-d', '--dim', default=500, type=int)
     parser.add_argument('-g', '--margin_gamma', default=12.0, type=float)
     parser.add_argument('-adv', '--negative_adversarial_sampling', action='store_true')

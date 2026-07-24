@@ -241,6 +241,9 @@ def build_eff_report(args, timing, num_epochs, epoch_steps):
         'Negative sample size: {}'.format(
             getattr(args, 'negative_sample_size', None)
         ),
+        'Negative chunk size: {}'.format(
+            getattr(args, 'negative_chunk_size', 0) or 'auto'
+        ),
         'Nentity: {}'.format(getattr(args, 'nentity', None)),
         'Candidates per positive: {}'.format(candidates_per_positive(args)),
         'Steps per epoch: {}'.format(epoch_steps),
