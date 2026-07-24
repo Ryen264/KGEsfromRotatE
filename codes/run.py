@@ -88,6 +88,11 @@ def parse_args(args=None):
                         help='Margin m_u for KGmAmU soft-margin AU: log E[exp(t*ReLU(m_u-d^2))]; in (0, 4]')
     parser.add_argument('--uniform_t', default=4, type=float,
                         help='Uniformity temperature for KGAU loss')
+    parser.add_argument(
+        '--uniform_pair_chunk_size', default=0, type=int,
+        help='KGAU-family: pairwise block size for uniformity (0=auto, cap 256). '
+             'Exact i<j reduction; lowers peak memory vs torch.pdist.',
+    )
     parser.add_argument('--uniform-gamma-q', dest='uniform_gamma_q', default=1.0, type=float,
                         help='Initial KGAU uniformity weight for query embeddings (0=off)')
     parser.add_argument('--uniform-gamma-y', dest='uniform_gamma_y', default=1.0, type=float,

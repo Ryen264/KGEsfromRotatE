@@ -333,6 +333,9 @@ KGAU_GAMMA_KEY_BY_TERM = {term_key: gamma_key for term_key, gamma_key in KGAU_UN
 
 KGAU_FAMILY_LOSSES = ('kgau', 'kgmau', 'kgmamu')
 
+# Cap peak [C, C] pairwise blocks for uniformity (exact reduction over all i<j pairs).
+_UNIFORM_PAIR_CHUNK_BYTES_BUDGET = 512 * 1024 * 1024
+
 
 def is_kgau_family_loss(args):
     return getattr(args, 'loss', '') in KGAU_FAMILY_LOSSES
@@ -340,6 +343,106 @@ def is_kgau_family_loss(args):
 
 def is_learnable_kgau_gammas(args):
     return is_kgau_family_loss(args) and getattr(args, 'learnable_kgau_gammas', False)
+
+
+def resolve_uniform_pair_chunk_size(n, dim, explicit=0):
+    '''
+    Pair-block width C for chunked uniformity.
+
+    explicit > 0: use min(explicit, n).
+    Else: choose C so a [C, C] float32 block (+ matmul workspace) stays near the
+    shared ~512MiB budget (same order as NegSamp / AllNeg chunk heuristics).
+    '''
+    if n <= 1:
+        return max(n, 1)
+    explicit = int(explicit or 0)
+    if explicit > 0:
+        return min(explicit, n)
+    # [C,C] scores + ~1x workspace; also keep 2*[C,D] views cheap relative to budget.
+    max_by_pair = int((_UNIFORM_PAIR_CHUNK_BYTES_BUDGET / 8.0) ** 0.5)
+    max_by_dim = max(_UNIFORM_PAIR_CHUNK_BYTES_BUDGET // max(dim * 4 * 4, 1), 32)
+    # Soft cap keeps peak predictable for B=512 entity term (n=1024) on mid GPUs.
+    auto = max(32, min(max_by_pair, max_by_dim, n, 256))
+    return int(auto)
+
+
+def _normalized_sqdist_block(xi, xj):
+    '''||a-b||^2 for L2-normalized rows via 2 - 2 a·b. Shape [Ci, Cj].'''
+    return (2.0 - 2.0 * (xi @ xj.transpose(0, 1))).clamp_min(0)
+
+
+def chunked_pairwise_uniformity(x, uniform_t=4, pair_chunk_size=0):
+    '''
+    Exact Wang-Isola uniformity: log(mean_{i<j} exp(-t ||x_i-x_j||^2)).
+
+    Same pairs as torch.pdist, but accumulates over [C,C] blocks so peak memory
+    stays O(C^2 + n·D) instead of pdist's backward spike ~O(n^2·D).
+    '''
+    x = F.normalize(x, dim=-1)
+    n = x.size(0)
+    if n < 2:
+        return (x * 0).sum()
+
+    chunk = resolve_uniform_pair_chunk_size(n, x.size(1), pair_chunk_size)
+    sum_exp = x.new_zeros(())
+    count = 0
+
+    for i0 in range(0, n, chunk):
+        i1 = min(i0 + chunk, n)
+        xi = x[i0:i1]
+        for j0 in range(i0, n, chunk):
+            j1 = min(j0 + chunk, n)
+            xj = x[j0:j1]
+            sq = _normalized_sqdist_block(xi, xj)
+            if i0 == j0:
+                tri = torch.triu(
+                    torch.ones(i1 - i0, j1 - j0, device=x.device, dtype=torch.bool),
+                    diagonal=1,
+                )
+                vals = sq.masked_select(tri)
+            else:
+                vals = sq.reshape(-1)
+            sum_exp = sum_exp + (-uniform_t * vals).exp().sum()
+            count += vals.numel()
+
+    return (sum_exp / max(count, 1)).log()
+
+
+def chunked_pairwise_margin_uniformity(
+    x, uniform_margin=2.0, uniform_t=4, pair_chunk_size=0,
+):
+    '''
+    Exact soft-margin uniformity:
+    log(mean_{i<j} exp(t * ReLU(m - ||x_i-x_j||^2))).
+    '''
+    x = F.normalize(x, dim=-1)
+    n = x.size(0)
+    if n < 2:
+        return (x * 0).sum()
+
+    chunk = resolve_uniform_pair_chunk_size(n, x.size(1), pair_chunk_size)
+    sum_exp = x.new_zeros(())
+    count = 0
+
+    for i0 in range(0, n, chunk):
+        i1 = min(i0 + chunk, n)
+        xi = x[i0:i1]
+        for j0 in range(i0, n, chunk):
+            j1 = min(j0 + chunk, n)
+            xj = x[j0:j1]
+            sq = _normalized_sqdist_block(xi, xj)
+            if i0 == j0:
+                tri = torch.triu(
+                    torch.ones(i1 - i0, j1 - j0, device=x.device, dtype=torch.bool),
+                    diagonal=1,
+                )
+                vals = sq.masked_select(tri)
+            else:
+                vals = sq.reshape(-1)
+            sum_exp = sum_exp + F.relu(uniform_margin - vals).mul(uniform_t).exp().sum()
+            count += vals.numel()
+
+    return (sum_exp / max(count, 1)).log()
 
 
 def get_kgau_uniform_embeddings(head, relation, tail, query_e, target_e, term_key):
@@ -463,6 +566,9 @@ class KGAULoss(KGELoss):
     L = alignment_loss + Avg(uniformity_loss)_terms + regularization
         alignment_loss = L2-distance(query_e, target_e)^2.mean()
         uniformity_loss = log(exp(-uniform_t * L2-distance(x, x')^2).mean())
+
+    Uniformity uses chunked pairwise reduction (exact same i<j pairs as pdist)
+    to avoid pdist backward spikes ~O(n^2·D) when dim/batch are large.
     '''
     
     @staticmethod
@@ -471,11 +577,13 @@ class KGAULoss(KGELoss):
         return (x - y).norm(p=2, dim=1).pow(2).mean()
 
     @staticmethod
-    def uniformity(x, uniform_t=4):
-        x = F.normalize(x, dim=-1)
-        if x.size(0) < 2:
-            return (x * 0).sum()
-        return torch.pdist(x, p=2).pow(2).mul(-uniform_t).exp().mean().log()
+    def uniformity(x, uniform_t=4, pair_chunk_size=0):
+        return chunked_pairwise_uniformity(
+            x, uniform_t=uniform_t, pair_chunk_size=pair_chunk_size,
+        )
+
+    def _pair_chunk_size(self):
+        return int(getattr(self.args, 'uniform_pair_chunk_size', 0) or 0)
 
     def _compute_uniform_terms(self, head, relation, tail, query_e, target_e, model, uniform_t=4):
         uniform_loss_sum = query_e.new_zeros(())
@@ -484,6 +592,7 @@ class KGAULoss(KGELoss):
         epoch = getattr(self.args, 'current_epoch', 0)
         learnable = is_learnable_kgau_gammas(self.args)
         controller = UniGammaController(self.args) if learnable else None
+        pair_chunk_size = self._pair_chunk_size()
 
         for term_key, gamma_key in KGAU_UNIFORM_TERMS:
             gamma_init = getattr(self.args, gamma_key, 0.0)
@@ -492,7 +601,9 @@ class KGAULoss(KGELoss):
             embeddings = get_kgau_uniform_embeddings(
                 head, relation, tail, query_e, target_e, term_key,
             )
-            uniform_val = self.uniformity(embeddings, uniform_t=uniform_t)
+            uniform_val = self.uniformity(
+                embeddings, uniform_t=uniform_t, pair_chunk_size=pair_chunk_size,
+            )
             if learnable:
                 gamma_weight = controller.effective_gamma(model, term_key, epoch)
             else:
@@ -572,11 +683,13 @@ class KGmAULoss(KGELoss):
         return squared_hinge_loss.mean()
 
     @staticmethod
-    def uniformity(x, uniform_t=4):
-        x = F.normalize(x, dim=-1)
-        if x.size(0) < 2:
-            return (x * 0).sum()
-        return torch.pdist(x, p=2).pow(2).mul(-uniform_t).exp().mean().log()
+    def uniformity(x, uniform_t=4, pair_chunk_size=0):
+        return chunked_pairwise_uniformity(
+            x, uniform_t=uniform_t, pair_chunk_size=pair_chunk_size,
+        )
+
+    def _pair_chunk_size(self):
+        return int(getattr(self.args, 'uniform_pair_chunk_size', 0) or 0)
 
     def _compute_uniform_terms(self, head, relation, tail, query_e, target_e, model, uniform_t=4):
         uniform_loss_sum = query_e.new_zeros(())
@@ -585,6 +698,7 @@ class KGmAULoss(KGELoss):
         epoch = getattr(self.args, 'current_epoch', 0)
         learnable = is_learnable_kgau_gammas(self.args)
         controller = UniGammaController(self.args) if learnable else None
+        pair_chunk_size = self._pair_chunk_size()
 
         for term_key, gamma_key in KGAU_UNIFORM_TERMS:
             gamma_init = getattr(self.args, gamma_key, 0.0)
@@ -593,7 +707,9 @@ class KGmAULoss(KGELoss):
             embeddings = get_kgau_uniform_embeddings(
                 head, relation, tail, query_e, target_e, term_key,
             )
-            uniform_val = self.uniformity(embeddings, uniform_t=uniform_t)
+            uniform_val = self.uniformity(
+                embeddings, uniform_t=uniform_t, pair_chunk_size=pair_chunk_size,
+            )
             if learnable:
                 gamma_weight = controller.effective_gamma(model, term_key, epoch)
             else:
@@ -661,8 +777,7 @@ class KGmAmULoss(KGELoss):
         margin_alignment_loss = max(0, L2-distance(query_e, target_e) - align_margin)^2.mean()
         soft_margin_uniformity = log(exp(uniform_t * ReLU(uniform_margin - L2-distance(x, x')^2)).mean())
     '''
-    
-    @staticmethod
+
     @staticmethod
     def margin_alignment(x, y, align_margin=0.0):
         """
@@ -677,13 +792,16 @@ class KGmAmULoss(KGELoss):
         return squared_hinge_loss.mean()
 
     @staticmethod
-    def margin_uniformity(x, uniform_margin=2.0, uniform_t=4):
-        x = F.normalize(x, dim=-1)
-        if x.size(0) < 2:
-            return (x * 0).sum()
-        # Soft-margin AU: log E[exp(t * ReLU(m - d^2))]
-        sq = torch.pdist(x, p=2).pow(2)
-        return F.relu(uniform_margin - sq).mul(uniform_t).exp().mean().log()
+    def margin_uniformity(x, uniform_margin=2.0, uniform_t=4, pair_chunk_size=0):
+        return chunked_pairwise_margin_uniformity(
+            x,
+            uniform_margin=uniform_margin,
+            uniform_t=uniform_t,
+            pair_chunk_size=pair_chunk_size,
+        )
+
+    def _pair_chunk_size(self):
+        return int(getattr(self.args, 'uniform_pair_chunk_size', 0) or 0)
 
     def _compute_margin_uniformity_terms(
         self, head, relation, tail, query_e, target_e, model,
@@ -695,6 +813,7 @@ class KGmAmULoss(KGELoss):
         epoch = getattr(self.args, 'current_epoch', 0)
         learnable = is_learnable_kgau_gammas(self.args)
         controller = UniGammaController(self.args) if learnable else None
+        pair_chunk_size = self._pair_chunk_size()
 
         for term_key, gamma_key in KGAU_UNIFORM_TERMS:
             gamma_init = getattr(self.args, gamma_key, 0.0)
@@ -704,7 +823,10 @@ class KGmAmULoss(KGELoss):
                 head, relation, tail, query_e, target_e, term_key,
             )
             margin_uniformity_val = self.margin_uniformity(
-                embeddings, uniform_margin=uniform_margin, uniform_t=uniform_t,
+                embeddings,
+                uniform_margin=uniform_margin,
+                uniform_t=uniform_t,
+                pair_chunk_size=pair_chunk_size,
             )
             if learnable:
                 gamma_weight = controller.effective_gamma(model, term_key, epoch)

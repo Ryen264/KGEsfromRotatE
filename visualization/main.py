@@ -244,6 +244,9 @@ def build_eff_report(args, timing, num_epochs, epoch_steps):
         'Negative chunk size: {}'.format(
             getattr(args, 'negative_chunk_size', 0) or 'auto'
         ),
+        'Uniform pair chunk size: {}'.format(
+            getattr(args, 'uniform_pair_chunk_size', 0) or 'auto'
+        ),
         'Nentity: {}'.format(getattr(args, 'nentity', None)),
         'Candidates per positive: {}'.format(candidates_per_positive(args)),
         'Steps per epoch: {}'.format(epoch_steps),
@@ -467,13 +470,19 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     }
 
     for key in uniform_sets:
+        pair_chunk = int(getattr(args, 'uniform_pair_chunk_size', 0) or 0)
         if loss_name == 'kgmamu':
             uniform_components[key] = loss_fn.margin_uniformity(
-                embeddings[key], uniform_margin=uniform_margin, uniform_t=uniform_t,
+                embeddings[key],
+                uniform_margin=uniform_margin,
+                uniform_t=uniform_t,
+                pair_chunk_size=pair_chunk,
             ).item()
         else:
             uniform_components[key] = loss_fn.uniformity(
-                embeddings[key], uniform_t=uniform_t,
+                embeddings[key],
+                uniform_t=uniform_t,
+                pair_chunk_size=pair_chunk,
             ).item()
 
     uniform_loss = float(np.mean(list(uniform_components.values())))
