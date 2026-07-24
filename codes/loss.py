@@ -96,9 +96,13 @@ class BinaryCrossEntropyLoss(KGELoss):
         L = 1/2 * (BCE(pos, 1) + mean_j BCE(neg_j, 0))
 
     Labeled (scores [B, C], labels [B, C] in {0,1}):
-        L = mean_c BCE(scores_c, labels_c)
+        L = 1/2 * (mean_{c:y=1} BCE + mean_{c:y=0} BCE)
         - 1vsAll: labels are one-hot over entities
         - KvsAll: labels are multi-hot over known training completions
+
+    Pos/neg are averaged separately so 1vsAll/KvsAll match NegSamp BCE.
+    A plain mean over all entities is dominated by negatives (|E| ≫ k) and
+    collapses to predicting near-zero probability for every candidate.
     '''
 
     def _weighted_mean(self, loss, subsampling_weight):
@@ -119,9 +123,14 @@ class BinaryCrossEntropyLoss(KGELoss):
 
     def _from_labels(self, scores, labels, subsampling_weight):
         labels = labels.float()
-        per_sample = F.binary_cross_entropy_with_logits(
-            scores, labels, reduction='none',
-        ).mean(dim=1)
+        bce = F.binary_cross_entropy_with_logits(scores, labels, reduction='none')
+        pos_mask = labels > 0.5
+        neg_mask = ~pos_mask
+        pos_denom = pos_mask.sum(dim=1).clamp_min(1).to(bce.dtype)
+        neg_denom = neg_mask.sum(dim=1).clamp_min(1).to(bce.dtype)
+        positive_loss = (bce * pos_mask.to(bce.dtype)).sum(dim=1) / pos_denom
+        negative_loss = (bce * neg_mask.to(bce.dtype)).sum(dim=1) / neg_denom
+        per_sample = (positive_loss + negative_loss) / 2
         return self._weighted_mean(per_sample, subsampling_weight)
 
     def __call__(self, positive_score, negative_score, subsampling_weight, model,

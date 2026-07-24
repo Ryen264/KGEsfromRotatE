@@ -37,13 +37,24 @@ def draw_chart(points: list[Point],
     left_y_axis: str, left_y_color: str, left_y_title: str,
     right_y_axis: str, right_y_color: str, right_y_title: str,
     output_dir: str="visualization/outputs/charts", show_values: bool=True,
-    legend_loc: str="lower left"):
+    legend_loc: str="lower left",
+    show_line: bool=False,
+    line_y_axis: str="", line_y_color: str="red", line_y_title: str="",
+    line_on: str="left"):
     try:
         labels = [p.name for p in points]
         left_vals = [getattr(p, left_y_axis) for p in points]
         right_vals = [getattr(p, right_y_axis) for p in points]
+        line_vals = [getattr(p, line_y_axis) for p in points] if show_line else None
     except AttributeError as e:
         print(f"Error: One of the provided axis attributes does not exist. {e}")
+        return
+
+    if show_line and not line_y_axis:
+        print("Error: show_line=True requires line_y_axis to be set.")
+        return
+    if show_line and line_on not in ("left", "right"):
+        print("Error: line_on must be 'left' or 'right'.")
         return
 
     x = np.arange(len(labels))
@@ -72,6 +83,22 @@ def draw_chart(points: list[Point],
     ax2.set_ylabel(right_y_title, color=right_y_color, fontsize=12)
     ax2.tick_params(axis='y', labelcolor=right_y_color)
 
+    if show_line:
+        line_ax = ax1 if line_on == "left" else ax2
+        line_label = line_y_title or line_y_axis
+        line_ax.plot(
+            x, line_vals,
+            color=line_y_color, marker='o', linewidth=2, markersize=6,
+            label=line_label, zorder=5,
+        )
+        if show_values:
+            for xi, yi in zip(x, line_vals):
+                line_ax.annotate(
+                    f'{yi:g}', (xi, yi),
+                    textcoords='offset points', xytext=(0, 8),
+                    ha='center', color=line_y_color, fontweight='bold', fontsize=9,
+                )
+
     if show_values:
         ax1.bar_label(rects1, padding=3, color=left_y_color, fontweight='bold', fontsize=10)
         ax2.bar_label(rects2, padding=3, color=right_y_color, fontweight='bold', fontsize=10)
@@ -98,15 +125,15 @@ def draw_chart(points: list[Point],
 
 if __name__ == "__main__":
     loss_points = [
-        Point(name="SE (d=500)",      dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.58),
-        Point(name="SE (d=64)",       dim=64,     peak_gpu_memory=0.74, time_per_epoch=24.80),
-        Point(name="MR (d=500)",      dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.01),
-        Point(name="MR (d=64)",       dim=64,     peak_gpu_memory=0.74, time_per_epoch=24.25),
-        Point(name="Hinge (d=500)",   dim=500,    peak_gpu_memory=5.51, time_per_epoch=41.95),
-        Point(name="Hinge (d=64)",    dim=64,     peak_gpu_memory=0.74, time_per_epoch=15.35),
-        Point(name="BCE (d=500)",     dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.02),
-        Point(name="BCE (d=64)",      dim=64,     peak_gpu_memory=0.74, time_per_epoch=23.94),
-        Point(name="SANS (d=500)",    dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.04),
+        # Point(name="SE (d=500)",      dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.58),
+        # Point(name="SE (d=64)",       dim=64,     peak_gpu_memory=0.74, time_per_epoch=24.80),
+        # Point(name="MR (d=500)",      dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.01),
+        # Point(name="MR (d=64)",       dim=64,     peak_gpu_memory=0.74, time_per_epoch=24.25),
+        # Point(name="Hinge (d=500)",   dim=500,    peak_gpu_memory=5.51, time_per_epoch=41.95),
+        # Point(name="Hinge (d=64)",    dim=64,     peak_gpu_memory=0.74, time_per_epoch=15.35),
+        # Point(name="BCE (d=500)",     dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.02),
+        # Point(name="BCE (d=64)",      dim=64,     peak_gpu_memory=0.74, time_per_epoch=23.94),
+        # Point(name="SANS (d=500)",    dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.04),
         Point(name="SANS (d=64)",     dim=64,     peak_gpu_memory=0.74, time_per_epoch=15.12),
         Point(name="BPR (d=500)",     dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.02),
         Point(name="BPR (d=64)",      dim=64,     peak_gpu_memory=0.74, time_per_epoch=24.00),
@@ -120,6 +147,7 @@ if __name__ == "__main__":
         title="Peak GPU Memory and Time per Epoch of ComplEx training on different Loss Functions",
         left_y_axis="peak_gpu_memory", left_y_color="blue", left_y_title="Peak GPU Memory (GB)",
         right_y_axis="time_per_epoch", right_y_color="green", right_y_title="Time per Epoch (s)",
-        output_dir="visualization/outputs/charts", show_values=True,
-        legend_loc="lower left",
+        output_dir="visualization/outputs/charts", show_values=False, show_line=True,
+        line_y_axis="dim", line_y_color="red", line_y_title="Dimension",
+        legend_loc="lower left"
     )
