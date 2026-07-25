@@ -28,6 +28,7 @@ from metrics.classification import classification_metrics_from_probs
 from model import KGEModel
 from strategy import get_strategy, resolve_strategy_name
 
+DEFAULT_DISPLAY_EPOCHS = 200
 DEFAULT_UNIFORM_KEYS = ['query', 'target', 'entity', 'relation']
 DEFAULT_UNIFORM_T = 4
 
@@ -108,8 +109,7 @@ def build_results_report(
     loss_name,
     strategy_name,
     dim,
-    batch_size
-):
+    batch_size):
     mr = format_metric_value(link_metrics.get('MR') if link_metrics else None)
     mrr = format_metric_value(link_metrics.get('MRR') if link_metrics else None)
     hit_1 = format_metric_value(link_metrics.get('HITS@1') if link_metrics else None)
@@ -725,12 +725,11 @@ def plot_loss_and_metric(history, valid_metric, display_epochs, loss_label='loss
 def visualize_training(
     config_path,
     valid_metric='MRR',
-    display_epochs=100,
+    display_epochs=DEFAULT_DISPLAY_EPOCHS,
     gpu=1,
     output_dir=None,
     show=True,
-    uniform_sets=None,
-):
+    uniform_sets=None):
     config, config_path = load_config(resolve_path(config_path))
     num_epochs = resolve_num_epochs(config, display_epochs)
     args = build_args(config)
@@ -843,7 +842,10 @@ def parse_cli():
         help='Path to config JSON (default: configs/ComplEx_WN18RR.json)',
     )
     parser.add_argument('--valid-metric', default='MRR', help='Validation metric for learning curve')
-    parser.add_argument('--display-epochs', type=int, default=100, help='First N epochs to train and plot')
+    parser.add_argument(
+        '--display-epochs', type=int, default=DEFAULT_DISPLAY_EPOCHS,
+        help='First N epochs to train and plot',
+    )
     parser.add_argument('--gpu', type=int, default=1, help='GPU device id')
     parser.add_argument(
         '--output-dir', default=None,

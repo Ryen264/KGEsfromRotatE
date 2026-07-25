@@ -12,7 +12,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 class Point:
     name: str
     year: int = 0
-    MRR: float = 0.0
+    mrr: float = 0.0
     hit_1: float = 0.0
     hit_3: float = 0.0
     hit_10: float = 0.0
@@ -33,10 +33,11 @@ def build_output_path(output_dir, title):
     return os.path.join(resolve_path(output_dir), filename)
 
 def draw_chart(points: list[Point],
-    title: str,
+    title: str, x_title: str,
     left_y_axis: str, left_y_color: str, left_y_title: str,
     right_y_axis: str, right_y_color: str, right_y_title: str,
-    output_dir: str="visualization/outputs/charts", show_values: bool=True,
+    output_dir: str="visualization/outputs/charts",
+    show_bar_values: bool=True, show_line_values: bool=True,
     legend_loc: str="lower left",
     show_line: bool=False,
     line_y_axis: str="", line_y_color: str="red", line_y_title: str="",
@@ -65,9 +66,10 @@ def draw_chart(points: list[Point],
     rects1 = ax1.bar(
         x - width / 2, left_vals, width,
         label=left_y_title, color=left_y_color, alpha=0.7,
+        zorder=1,
     )
 
-    ax1.set_xlabel('Loss Functions', fontsize=12, labelpad=10)
+    ax1.set_xlabel(x_title, fontsize=12, labelpad=10)
     ax1.set_ylabel(left_y_title, color=left_y_color, fontsize=12)
     ax1.tick_params(axis='y', labelcolor=left_y_color)
     ax1.set_xticks(x)
@@ -78,6 +80,7 @@ def draw_chart(points: list[Point],
     rects2 = ax2.bar(
         x + width / 2, right_vals, width,
         label=right_y_title, color=right_y_color, alpha=0.7,
+        zorder=1,
     )
 
     ax2.set_ylabel(right_y_title, color=right_y_color, fontsize=12)
@@ -91,27 +94,39 @@ def draw_chart(points: list[Point],
             color=line_y_color, marker='o', linewidth=2, markersize=6,
             label=line_label, zorder=5,
         )
-        if show_values:
+        if show_line_values:
             for xi, yi in zip(x, line_vals):
                 line_ax.annotate(
                     f'{yi:g}', (xi, yi),
                     textcoords='offset points', xytext=(0, 8),
                     ha='center', color=line_y_color, fontweight='bold', fontsize=9,
+                    zorder=6,
                 )
 
-    if show_values:
+    # Twin axes stack by axes zorder: put the line's axis in front of the other
+    # so the line is not buried under the twin's bars.
+    if show_line and line_on == "right":
+        ax2.set_zorder(ax1.get_zorder() + 1)
+        ax2.patch.set_visible(False)
+    else:
+        ax1.set_zorder(ax2.get_zorder() + 1)
+        ax1.patch.set_visible(False)
+
+    if show_bar_values:
         ax1.bar_label(rects1, padding=3, color=left_y_color, fontweight='bold', fontsize=10)
         ax2.bar_label(rects2, padding=3, color=right_y_color, fontweight='bold', fontsize=10)
 
     plt.title(title, fontsize=14, pad=20, fontweight='bold')
-    ax1.grid(True, linestyle='--', alpha=0.3)
+    ax1.grid(True, linestyle='--', alpha=0.3, zorder=0)
 
     lines1, legend_labels1 = ax1.get_legend_handles_labels()
     lines2, legend_labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(
+    legend = ax1.legend(
         lines1 + lines2, legend_labels1 + legend_labels2,
         loc=legend_loc,
+        framealpha=0.95,
     )
+    legend.set_zorder(20)
 
     plt.tight_layout()
 
@@ -124,30 +139,42 @@ def draw_chart(points: list[Point],
     plt.close()
 
 if __name__ == "__main__":
+    # loss_points = [
+    #     Point(name="SE (d=500)",      dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.58),
+    #     Point(name="SE (d=64)",       dim=64,     peak_gpu_memory=0.74, time_per_epoch=24.80),
+    #     Point(name="MR (d=500)",      dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.01),
+    #     Point(name="MR (d=64)",       dim=64,     peak_gpu_memory=0.74, time_per_epoch=24.25),
+    #     Point(name="Hinge (d=500)",   dim=500,    peak_gpu_memory=5.51, time_per_epoch=41.95),
+    #     Point(name="Hinge (d=64)",    dim=64,     peak_gpu_memory=0.74, time_per_epoch=15.35),
+    #     Point(name="BCE (d=500)",     dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.02),
+    #     Point(name="BCE (d=64)",      dim=64,     peak_gpu_memory=0.74, time_per_epoch=23.94),
+    #     Point(name="SANS (d=500)",    dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.04),
+    #     Point(name="SANS (d=64)",     dim=64,     peak_gpu_memory=0.74, time_per_epoch=15.12),
+    #     Point(name="BPR (d=500)",     dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.02),
+    #     Point(name="BPR (d=64)",      dim=64,     peak_gpu_memory=0.74, time_per_epoch=24.00),
+    #     Point(name="CE (d=500)",      dim=500,    peak_gpu_memory=5.51, time_per_epoch=41.97),
+    #     Point(name="CE (d=64)",       dim=64,     peak_gpu_memory=0.76, time_per_epoch=13.35),
+    #     Point(name="KGAU (d=64)",     dim=64,     peak_gpu_memory=0.62, time_per_epoch=27.70)
+    # ]
+
     loss_points = [
-        # Point(name="SE (d=500)",      dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.58),
-        # Point(name="SE (d=64)",       dim=64,     peak_gpu_memory=0.74, time_per_epoch=24.80),
-        # Point(name="MR (d=500)",      dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.01),
-        # Point(name="MR (d=64)",       dim=64,     peak_gpu_memory=0.74, time_per_epoch=24.25),
-        # Point(name="Hinge (d=500)",   dim=500,    peak_gpu_memory=5.51, time_per_epoch=41.95),
-        # Point(name="Hinge (d=64)",    dim=64,     peak_gpu_memory=0.74, time_per_epoch=15.35),
-        # Point(name="BCE (d=500)",     dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.02),
-        # Point(name="BCE (d=64)",      dim=64,     peak_gpu_memory=0.74, time_per_epoch=23.94),
-        # Point(name="SANS (d=500)",    dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.04),
-        Point(name="SANS (d=64)",     dim=64,     peak_gpu_memory=0.74, time_per_epoch=15.12),
-        Point(name="BPR (d=500)",     dim=500,    peak_gpu_memory=5.51, time_per_epoch=42.02),
-        Point(name="BPR (d=64)",      dim=64,     peak_gpu_memory=0.74, time_per_epoch=24.00),
-        Point(name="CE (d=500)",      dim=500,    peak_gpu_memory=5.51, time_per_epoch=41.97),
-        Point(name="CE (d=64)",       dim=64,     peak_gpu_memory=0.76, time_per_epoch=13.35),
-        Point(name="KGAU (d=64)",     dim=64,     peak_gpu_memory=0.62, time_per_epoch=27.70)
+        Point(name="Uniform (BCE, d=500)",      dim=500, peak_gpu_memory=1.85, time_per_epoch=90.0,  mrr=0.4383),
+        Point(name="Bernoulli (BCE, d=500)",    dim=500, peak_gpu_memory=1.85, time_per_epoch=92.0,  mrr=0.4341),
+        Point(name="SelfAdv (SANS, d=500)",     dim=500, peak_gpu_memory=1.85, time_per_epoch=92.0,  mrr=0.4433),
+        Point(name="1vsAll (BCE, d=500)",       dim=500, peak_gpu_memory=1.27, time_per_epoch=60.0,  mrr=0.4363),
+        Point(name="kvsAll (BCE, d=500)",       dim=500, peak_gpu_memory=1.27, time_per_epoch=89.0,  mrr=0.4390),
+        Point(name="KGAU (d=500)",              dim=500, peak_gpu_memory=0.81, time_per_epoch=7.11,  mrr=0.4560),
+        Point(name="KGAU (d=64)",               dim=64,  peak_gpu_memory=0.13, time_per_epoch=2.49,  mrr=0.4643),
     ]
     
     draw_chart(
         points=loss_points,
-        title="Peak GPU Memory and Time per Epoch of ComplEx training on different Loss Functions",
+        title="Peak GPU Memory and Time per Epoch of ComplEx on different Training Strategies",
+        x_title="Training Strategies",
         left_y_axis="peak_gpu_memory", left_y_color="blue", left_y_title="Peak GPU Memory (GB)",
         right_y_axis="time_per_epoch", right_y_color="green", right_y_title="Time per Epoch (s)",
-        output_dir="visualization/outputs/charts", show_values=False, show_line=True,
-        line_y_axis="dim", line_y_color="red", line_y_title="Dimension",
+        output_dir="visualization/outputs/charts",
+        show_bar_values=True, show_line_values=True, show_line=True,
+        line_y_axis="mrr", line_y_color="darkred", line_y_title="MRR",
         legend_loc="lower left"
     )
