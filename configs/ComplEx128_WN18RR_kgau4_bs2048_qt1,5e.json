@@ -1,0 +1,20 @@
+{
+  "model": "ComplEx",
+  "data_path": "data/wn18rr",
+  "loss": "kgau",
+  "strategy": "kgau",
+  "dim": 128,
+  "batch_size": 2048,
+  "margin_gamma": 200.0,
+  "learning_rate": 0.002,
+  "epochs": 400,
+  "test_batch_size": 8,
+  "double_entity_embedding": true,
+  "double_relation_embedding": true,
+  "regularization_coeff": 5e-06,
+  "regularization_p": 3,
+  "uniform_t": 4,
+  "uniform_gamma_q": 1.0,
+  "uniform_gamma_y": 1.0,
+  "uniform_gamma_e": 1.5
+}
