@@ -16,9 +16,6 @@ from dataloader import BidirectionalOneShotIterator, TrainDataset
 
 STRATEGY_CHOICES = ('uniform', 'bernoulli', 'selfadv', '1vsall', 'kvsall', 'kgau')
 
-# Shared with AllNeg chunked fallback: cap peak [B, C, D] float32 (+ mul intermediates).
-_NEG_CHUNK_BYTES_BUDGET = 512 * 1024 * 1024
-
 
 def suggested_max_workers():
     '''PyTorch DataLoader soft cap: CPUs available to this process.'''
@@ -150,15 +147,13 @@ class NegSampStrategy(KGEStrategy):
         return negative_score.new_full(negative_score.shape, 1.0 / n_neg)
 
     def resolve_negative_chunk_size(self, batch_size, n_neg, entity_dim):
-        '''Return C such that scoring uses at most ~512MiB for [B, C, D], unless overridden.'''
+        '''Return configured chunk width C (default 256). C<=0 disables chunking (use all N).'''
         if n_neg <= 0:
             return 0
-        explicit = int(getattr(self.args, 'negative_chunk_size', 0) or 0)
-        if explicit > 0:
-            return min(explicit, n_neg)
-        per_neg = max(batch_size * entity_dim * 4 * 2, 1)
-        auto = max(256, _NEG_CHUNK_BYTES_BUDGET // per_neg)
-        return min(int(auto), n_neg)
+        chunk = int(getattr(self.args, 'negative_chunk_size', 256) or 0)
+        if chunk <= 0:
+            return n_neg
+        return min(chunk, n_neg)
 
     def score_negatives(self, model, positive_sample, negative_sample, mode):
         '''Score [B, N] negatives, chunking (+ checkpoint) when N exceeds the budget.'''

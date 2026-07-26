@@ -134,6 +134,7 @@ def build_results_report(
         '',
         'Best Epoch: {}'.format(best_epoch),
         'Best {}: {}'.format(valid_metric, format_metric_value(best_valid_value)),
+        'Test checkpoint: best-valid (epoch {})'.format(best_epoch),
         '',
         'Training: {}'.format(format_duration(timing['train_time'])),
         'Valid: {}'.format(format_duration(timing['valid_time'])),
@@ -165,79 +166,6 @@ def write_results_report(output_dir, report_text, loss_name):
 def _sync_cuda(args):
     if getattr(args, 'cuda', False) and torch.cuda.is_available():
         torch.cuda.synchronize()
-
-
-def candidates_per_positive(args):
-    strategy = getattr(args, 'strategy', 'uniform')
-    if strategy in ('1vsall', 'kvsall'):
-        return int(getattr(args, 'nentity', 0) or 0)
-    if strategy in ('uniform', 'bernoulli', 'selfadv'):
-        return int(getattr(args, 'negative_sample_size', 0) or 0)
-    return 0
-
-
-def build_eff_report(args, timing, num_epochs, epoch_steps):
-    train_epoch_times = timing.get('train_epoch_times') or []
-    if len(train_epoch_times) > 1:
-        steady = train_epoch_times[1:]
-    else:
-        steady = train_epoch_times
-    time_per_epoch = float(np.mean(steady)) if steady else 0.0
-
-    peak = timing.get('train_peak_gpu_memory_gb')
-    peak_str = '{:.4f}'.format(peak) if peak is not None else 'N/A'
-    reserved = timing.get('train_peak_gpu_memory_reserved_gb')
-    reserved_str = '{:.4f}'.format(reserved) if reserved is not None else 'N/A'
-
-    lines = [
-        'Efficiency report (train-only)',
-        '==============================',
-        'Model: {}'.format(getattr(args, 'model', None)),
-        'Loss: {}'.format(getattr(args, 'loss', None)),
-        'Strategy: {}'.format(getattr(args, 'strategy', None)),
-        'Dim: {}'.format(getattr(args, 'dim', None)),
-        'Batch size: {}'.format(getattr(args, 'batch_size', None)),
-        'Negative sample size: {}'.format(
-            getattr(args, 'negative_sample_size', None)
-        ),
-        'Negative chunk size: {}'.format(
-            getattr(args, 'negative_chunk_size', 0) or 'auto'
-        ),
-        'Uniform pair chunk size: {}'.format(
-            getattr(args, 'uniform_pair_chunk_size', 0) or 'auto'
-        ),
-        'Nentity: {}'.format(getattr(args, 'nentity', None)),
-        'Candidates per positive: {}'.format(candidates_per_positive(args)),
-        'Steps per epoch: {}'.format(epoch_steps),
-        'Num epochs measured: {}'.format(num_epochs),
-        'Warmup epochs excluded from mean time: {}'.format(
-            1 if len(train_epoch_times) > 1 else 0
-        ),
-        '',
-        'Train time total (s): {:.4f}'.format(timing.get('train_time', 0.0)),
-        'Train time per epoch (s): {:.4f}'.format(time_per_epoch),
-        'Train time per epoch (formatted): {}'.format(format_duration(time_per_epoch)),
-        'Valid time total (s): {:.4f}'.format(timing.get('valid_time', 0.0)),
-        'Test time total (s): {:.4f}'.format(timing.get('test_time', 0.0)),
-        '',
-        'Train peak GPU memory allocated (GB): {}'.format(peak_str),
-        'Train peak GPU memory reserved (GB): {}'.format(reserved_str),
-        '',
-        'Notes:',
-        '- Peak memory is max_memory_allocated during train steps only',
-        '  (reset each epoch before train; excludes valid/test).',
-        '- Time per epoch averages train-only wall time with CUDA sync;',
-        '  first epoch excluded when num_epochs > 1.',
-    ]
-    return '\n'.join(lines) + '\n'
-
-
-def write_eff_report(output_dir, report_text):
-    path = os.path.join(output_dir, 'eff-report.txt')
-    with open(path, 'w') as fout:
-        fout.write(report_text)
-    print('Efficiency report saved to {}'.format(path))
-    return path
 
 
 def run_post_training_evaluation(model, args, test_triples, all_true_triples):
@@ -304,13 +232,17 @@ def build_args(config):
     args.do_test = False
     args.cpu_num = config.get('cpu_num', 4)
     args.strategy = resolve_strategy_name(args)
+    if args.strategy in ('1vsall', 'kvsall', 'kgau') and 'negative_sample_size' not in config:
+        args.negative_sample_size = 0
+    if args.strategy not in ('uniform', 'bernoulli', 'selfadv') and 'negative_chunk_size' not in config:
+        args.negative_chunk_size = 0
     get_strategy(args)
 
     return args
 
 
-def resolve_num_epochs(config, display_epochs):
-    return min(int(config['epochs']), int(display_epochs))
+def resolve_num_epochs(config):
+    return int(config['epochs'])
 
 
 def load_dataset(args):
@@ -710,20 +642,25 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
         )
         epoch_bar.set_postfix_str(postfix, refresh=True)
 
-    if tsne_config is not None and best_epoch is not None and best_epoch not in milestone_epochs:
-        final_model_state = clone_model_state(model)
+    # Test / reports use best-valid weights, not the last training epoch.
+    if best_model_state is not None:
         model.load_state_dict(best_model_state)
-        generate_tsne_visualization(
-            model=model,
-            triples=valid_triples,
-            epoch=best_epoch,
-            target_epochs={best_epoch},
-            max_queries=tsne_config['max_queries'],
-            max_tails_per_query=tsne_config['max_tails_per_query'],
-            output_dir=tsne_config['output_dir'],
-            config_stem=tsne_config['config_stem'],
+        if tsne_config is not None and best_epoch is not None and best_epoch not in milestone_epochs:
+            generate_tsne_visualization(
+                model=model,
+                triples=valid_triples,
+                epoch=best_epoch,
+                target_epochs={best_epoch},
+                max_queries=tsne_config['max_queries'],
+                max_tails_per_query=tsne_config['max_tails_per_query'],
+                output_dir=tsne_config['output_dir'],
+                config_stem=tsne_config['config_stem'],
+            )
+        print(
+            'Restored best model at epoch {} ({}={:.4f}) for evaluation'.format(
+                best_epoch, valid_metric, best_valid_value,
+            )
         )
-        model.load_state_dict(final_model_state)
 
     timing = {
         'train_time': train_time,
@@ -735,6 +672,8 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
         'train_peak_gpu_memory_reserved_gb': train_peak_gpu_memory_reserved_gb,
         'train_epoch_times': train_epoch_times,
         'epoch_steps': epoch_steps,
+        'best_epoch': best_epoch,
+        'best_valid_value': best_valid_value,
     }
 
     datasets = {
@@ -752,7 +691,6 @@ def resolve_default_gpu():
 def visualize_training(
     config_path,
     valid_metric='MRR',
-    display_epochs=100,
     gpu=None,
     output_dir='visualization/outputs/charts',
     uniform_sets=None,
@@ -760,7 +698,7 @@ def visualize_training(
 ):
     config, config_path = load_config(resolve_path(config_path))
     loss_name = get_loss_display_name(config)
-    num_epochs = resolve_num_epochs(config, display_epochs)
+    num_epochs = resolve_num_epochs(config)
     args = build_args(config)
     uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_SETS)
     if gpu is None:
@@ -771,7 +709,7 @@ def visualize_training(
     print('Model: {}  Loss: {}  Dataset: {}'.format(
         config.get('model'), getattr(args, 'loss', 'sans'), config.get('data_path')
     ))
-    print('Training for {} epochs (displaying first {})'.format(num_epochs, display_epochs))
+    print('Training for {} epochs (from config)'.format(num_epochs))
     print('Uniform sets: {}'.format(', '.join(uniform_sets)))
     if tsne_config is not None:
         print('t-SNE snapshots at epochs: 1, best valid, {}'.format(num_epochs))
@@ -814,15 +752,6 @@ def visualize_training(
         timing=timing,
     )
     write_results_report(output_dir, report_text, loss_name)
-    write_eff_report(
-        output_dir,
-        build_eff_report(
-            args,
-            timing,
-            num_epochs=num_epochs,
-            epoch_steps=timing.get('epoch_steps', 0),
-        ),
-    )
 
     return history, model, timing
 
@@ -846,7 +775,6 @@ def parse_cli():
 
 
 def main():
-    display_epochs = 100
     tsne_max_queries = 10
     tsne_max_tails_per_query = 30
     output_dir = 'visualization/outputs/charts'
@@ -861,7 +789,6 @@ def main():
     visualize_training(
         cli.config,
         valid_metric=cli.valid_metric,
-        display_epochs=display_epochs,
         gpu=gpu,
         output_dir=output_dir,
         uniform_sets=cli.uniform_sets,

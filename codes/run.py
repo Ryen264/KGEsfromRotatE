@@ -40,8 +40,8 @@ def parse_args(args=None):
     
     parser.add_argument('-n', '--negative_sample_size', default=128, type=int)
     parser.add_argument(
-        '--negative_chunk_size', default=0, type=int,
-        help='NegSamp only: max negatives scored per chunk (0=auto ~512MiB [B,C,D] budget). '
+        '--negative_chunk_size', default=256, type=int,
+        help='NegSamp only: max negatives scored per chunk (default 256; <=0 = no chunking). '
              'When chunking, uses gradient checkpointing to cap peak GPU memory.',
     )
     parser.add_argument('-d', '--dim', default=500, type=int)
@@ -89,8 +89,8 @@ def parse_args(args=None):
     parser.add_argument('--uniform_t', default=4, type=float,
                         help='Uniformity temperature for KGAU loss')
     parser.add_argument(
-        '--uniform_pair_chunk_size', default=0, type=int,
-        help='KGAU-family: pairwise block size for uniformity (0=auto, cap 256). '
+        '--uniform_pair_chunk_size', default=256, type=int,
+        help='KGAU-family: pairwise block size for uniformity (default 256; <=0 = no blocking). '
              'Exact i<j reduction; lowers peak memory vs torch.pdist.',
     )
     parser.add_argument('--uniform-gamma-q', dest='uniform_gamma_q', default=1.0, type=float,
@@ -135,12 +135,11 @@ def override_config(args):
     args.dim = argparse_dict['dim']
     args.test_batch_size = argparse_dict['test_batch_size']
     
-def save_model(model, optimizer, save_variable_list, args):
+def save_model(model, optimizer, save_variable_list, args, checkpoint_name='checkpoint'):
     '''
     Save the parameters of the model and the optimizer,
-    as well as some other variables such as step and learning_rate
+    as well as some other variables such as step and learning_rate.
     '''
-    
     argparse_dict = vars(args)
     with open(os.path.join(args.save_path, 'config.json'), 'w') as fjson:
         json.dump(argparse_dict, fjson)
@@ -149,20 +148,25 @@ def save_model(model, optimizer, save_variable_list, args):
         **save_variable_list,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict()},
-        os.path.join(args.save_path, 'checkpoint')
+        os.path.join(args.save_path, checkpoint_name)
     )
-    
+
     entity_embedding = model.entity_embedding.detach().cpu().numpy()
     np.save(
-        os.path.join(args.save_path, 'entity_embedding'), 
+        os.path.join(args.save_path, 'entity_embedding'),
         entity_embedding
     )
-    
+
     relation_embedding = model.relation_embedding.detach().cpu().numpy()
     np.save(
-        os.path.join(args.save_path, 'relation_embedding'), 
+        os.path.join(args.save_path, 'relation_embedding'),
         relation_embedding
     )
+
+
+def clone_model_state(model):
+    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
 
 def read_triple(file_path, entity2id, relation2id):
     '''
@@ -344,6 +348,10 @@ def main(args):
 
         training_logs = []
         last_schedule_epoch = None
+        best_valid_metric = float('-inf')
+        best_valid_step = None
+        best_model_state = None
+        valid_metric_key = 'MRR'
         
         #Training Loop
         for step in range(init_step, max_steps_internal):
@@ -391,6 +399,26 @@ def main(args):
                 logging.info('Evaluating on Valid Dataset...')
                 metrics = kge_model.test_step(kge_model, valid_triples, all_true_triples, args)
                 log_metrics('Valid', step, metrics)
+                if valid_metric_key in metrics and metrics[valid_metric_key] > best_valid_metric:
+                    best_valid_metric = metrics[valid_metric_key]
+                    best_valid_step = step
+                    best_model_state = clone_model_state(kge_model)
+                    save_variable_list = {
+                        'step': step,
+                        'current_learning_rate': current_learning_rate,
+                        'warm_up_epochs': warm_up_epochs_val,
+                        'best_valid_metric': best_valid_metric,
+                        'best_valid_metric_name': valid_metric_key,
+                    }
+                    save_model(
+                        kge_model, optimizer, save_variable_list, args,
+                        checkpoint_name='checkpoint_best',
+                    )
+                    logging.info(
+                        'New best valid %s = %f at step %d' % (
+                            valid_metric_key, best_valid_metric, step,
+                        )
+                    )
         
         save_variable_list = {
             'step': step, 
@@ -398,6 +426,14 @@ def main(args):
             'warm_up_epochs': warm_up_epochs_val
         }
         save_model(kge_model, optimizer, save_variable_list, args)
+
+        if best_model_state is not None:
+            kge_model.load_state_dict(best_model_state)
+            logging.info(
+                'Restored best model at step %d (valid %s = %f) for evaluation' % (
+                    best_valid_step, valid_metric_key, best_valid_metric,
+                )
+            )
         
     if args.do_valid:
         logging.info('Evaluating on Valid Dataset...')

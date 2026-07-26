@@ -56,12 +56,12 @@ CUDA_VISIBLE_DEVICES=0 python -u codes/run.py --do_train \
  --cuda \
  --do_valid \
  --do_test \
- --data_path data/FB15k \
+ --data_path data/fb15k \
  --model RotatE \
  -n 256 -b 1024 -d 1000 \
  -g 24.0 -a 1.0 -adv \
  -lr 0.0001 --epochs 159 \
- -save models/RotatE_FB15k_0 --test_batch_size 16 -de
+ -save models/RotatE_fb15k_0 --test_batch_size 16 -de
 ```
    Check argparse configuration at codes/run.py for more arguments and more details.
 
@@ -71,11 +71,11 @@ CUDA_VISIBLE_DEVICES=0 python -u codes/run.py --do_train \
 
 **Reproducing the best results**
 
-To reprocude the results in the ICLR 2019 paper [RotatE: Knowledge Graph Embedding by Relational Rotation in Complex Space](https://openreview.net/forum?id=HkgEQnRqYQ), you can run the bash commands in best_config.sh to get the best performance of RotatE, TransE, and ComplEx on five widely used datasets (FB15k, FB15k-237, wn18, wn18rr, Countries).
+To reprocude the results in the ICLR 2019 paper [RotatE: Knowledge Graph Embedding by Relational Rotation in Complex Space](https://openreview.net/forum?id=HkgEQnRqYQ), you can run the bash commands in best_config.sh to get the best performance of RotatE, TransE, and ComplEx on five widely used datasets (fb15k, fb15k_237, wn18, wn18rr, countries).
 
 The run.sh script provides an easy way to search hyper-parameters:
 
-    bash run.sh train RotatE FB15k 0 0 1024 256 1000 24.0 1.0 0.0001 212 16 -de
+    bash run.sh train RotatE fb15k 0 0 1024 256 1000 24.0 1.0 0.0001 212 16 -de
 
 **Using the library**
 

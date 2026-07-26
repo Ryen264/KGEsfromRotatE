@@ -3,7 +3,7 @@
 #
 # Usage:
 #   ./nohup/run.sh configs/ComplEx64_WN18RR_ce_uniform.json
-#   ./nohup/run.sh configs/ComplEx64_WN18RR_ce_uniform.json --gpu 0 --display-epochs 100 --no-show
+#   ./nohup/run.sh configs/ComplEx64_WN18RR_ce_uniform.json --gpu 0 --no-show
 #
 # Logs:  nohup/logs/<config-stem>_<timestamp>.log
 # PID:   nohup/job.pid

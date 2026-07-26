@@ -95,13 +95,13 @@ def dataset_statistic(dataset_path: str, with_labels: bool = False) -> dict:
 
 if __name__ == '__main__':
     # Pass dataset_path by command line argument, default is the first argument
-    # dataset_path: data/FB15k-237, data/FB15k, data/wn18rr, data/wn18, data/hetionet
+    # dataset_path: data/fb15k_237, data/fb15k, data/wn18rr, data/wn18, data/hetionet
     parser = argparse.ArgumentParser()
-    parser.add_argument('dataset_path', type=str, default='data/FB15k-237', help='Dataset path')
+    parser.add_argument('dataset_path', type=str, default='data/fb15k_237', help='Dataset path')
     args = parser.parse_args()
     dataset_path = args.dataset_path
 
-    if dataset_path in ['data/FB15k-237', 'data/wn18rr', 'data/hetionet']:
+    if dataset_path in ['data/fb15k_237', 'data/wn18rr', 'data/hetionet']:
         with_labels = True
     else:
         with_labels = False

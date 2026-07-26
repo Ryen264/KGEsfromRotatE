@@ -333,10 +333,6 @@ KGAU_GAMMA_KEY_BY_TERM = {term_key: gamma_key for term_key, gamma_key in KGAU_UN
 
 KGAU_FAMILY_LOSSES = ('kgau', 'kgmau', 'kgmamu')
 
-# Cap peak [C, C] pairwise blocks for uniformity (exact reduction over all i<j pairs).
-_UNIFORM_PAIR_CHUNK_BYTES_BUDGET = 512 * 1024 * 1024
-
-
 def is_kgau_family_loss(args):
     return getattr(args, 'loss', '') in KGAU_FAMILY_LOSSES
 
@@ -345,25 +341,19 @@ def is_learnable_kgau_gammas(args):
     return is_kgau_family_loss(args) and getattr(args, 'learnable_kgau_gammas', False)
 
 
-def resolve_uniform_pair_chunk_size(n, dim, explicit=0):
+def resolve_uniform_pair_chunk_size(n, dim, explicit=256):
     '''
-    Pair-block width C for chunked uniformity.
+    Pair-block width C for chunked uniformity (exact i<j reduction).
 
-    explicit > 0: use min(explicit, n).
-    Else: choose C so a [C, C] float32 block (+ matmul workspace) stays near the
-    shared ~512MiB budget (same order as NegSamp / AllNeg chunk heuristics).
+    explicit > 0: use min(explicit, n) (config/CLI default 256).
+    explicit <= 0: no blocking — use full n (may OOM on large batches).
     '''
     if n <= 1:
         return max(n, 1)
-    explicit = int(explicit or 0)
-    if explicit > 0:
-        return min(explicit, n)
-    # [C,C] scores + ~1x workspace; also keep 2*[C,D] views cheap relative to budget.
-    max_by_pair = int((_UNIFORM_PAIR_CHUNK_BYTES_BUDGET / 8.0) ** 0.5)
-    max_by_dim = max(_UNIFORM_PAIR_CHUNK_BYTES_BUDGET // max(dim * 4 * 4, 1), 32)
-    # Soft cap keeps peak predictable for B=512 entity term (n=1024) on mid GPUs.
-    auto = max(32, min(max_by_pair, max_by_dim, n, 256))
-    return int(auto)
+    chunk = int(explicit or 0)
+    if chunk <= 0:
+        return n
+    return min(chunk, n)
 
 
 def _normalized_sqdist_block(xi, xj):
@@ -583,7 +573,7 @@ class KGAULoss(KGELoss):
         )
 
     def _pair_chunk_size(self):
-        return int(getattr(self.args, 'uniform_pair_chunk_size', 0) or 0)
+        return int(getattr(self.args, 'uniform_pair_chunk_size', 256) or 0)
 
     def _compute_uniform_terms(self, head, relation, tail, query_e, target_e, model, uniform_t=4):
         uniform_loss_sum = query_e.new_zeros(())
@@ -689,7 +679,7 @@ class KGmAULoss(KGELoss):
         )
 
     def _pair_chunk_size(self):
-        return int(getattr(self.args, 'uniform_pair_chunk_size', 0) or 0)
+        return int(getattr(self.args, 'uniform_pair_chunk_size', 256) or 0)
 
     def _compute_uniform_terms(self, head, relation, tail, query_e, target_e, model, uniform_t=4):
         uniform_loss_sum = query_e.new_zeros(())
@@ -801,7 +791,7 @@ class KGmAmULoss(KGELoss):
         )
 
     def _pair_chunk_size(self):
-        return int(getattr(self.args, 'uniform_pair_chunk_size', 0) or 0)
+        return int(getattr(self.args, 'uniform_pair_chunk_size', 256) or 0)
 
     def _compute_margin_uniformity_terms(
         self, head, relation, tail, query_e, target_e, model,

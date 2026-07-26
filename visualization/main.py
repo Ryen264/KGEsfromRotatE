@@ -28,7 +28,6 @@ from metrics.classification import classification_metrics_from_probs
 from model import KGEModel
 from strategy import get_strategy, resolve_strategy_name
 
-DEFAULT_DISPLAY_EPOCHS = 200
 DEFAULT_UNIFORM_KEYS = ['query', 'target', 'entity', 'relation']
 DEFAULT_UNIFORM_T = 4
 
@@ -78,6 +77,10 @@ def find_best_valid(history, valid_metric='MRR'):
     return history['epochs'][best_idx], metric_values[best_idx]
 
 
+def clone_model_state(model):
+    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+
 def evaluate_triple_classification(model, test_triples, args):
     model.eval()
     sample = []
@@ -97,6 +100,50 @@ def evaluate_triple_classification(model, test_triples, args):
     return classification_metrics_from_probs(np.array(y_true), y_score)
 
 
+def dataset_display_name(data_path):
+    name = os.path.basename(str(data_path or '').rstrip('/\\'))
+    aliases = {
+        'wn18rr': 'WN18RR',
+        'wn18': 'WN18',
+        'fb15k_237': 'FB15k-237',
+        'fb15k-237': 'FB15k-237',  # legacy alias
+        'fb15k': 'FB15k',
+        'yago3_10': 'YAGO3-10',
+        'yago3-10': 'YAGO3-10',  # legacy alias
+        'countries_s1': 'Countries_S1',
+        'countries_s2': 'Countries_S2',
+        'countries_s3': 'Countries_S3',
+    }
+    return aliases.get(name.lower(), name or 'N/A')
+
+
+def negative_samples_for_report(args):
+    '''NegSamp: N; AllNeg: nentity; KGAU: 0.'''
+    return candidates_per_positive(args)
+
+
+def chunk_size_for_report(args):
+    '''NegSamp: negative_chunk_size; KGAU: uniform_pair_chunk_size; AllNeg: None.'''
+    strategy = getattr(args, 'strategy', 'uniform')
+    loss = getattr(args, 'loss', '')
+    if strategy in ('uniform', 'bernoulli', 'selfadv'):
+        return str(int(getattr(args, 'negative_chunk_size', 256) or 0))
+    if strategy == 'kgau' or loss in ('kgau', 'kgmau', 'kgmamu'):
+        return str(int(getattr(args, 'uniform_pair_chunk_size', 256) or 0))
+    return None
+
+
+def steady_time_per_epoch(timing, num_epochs):
+    '''Mean train-only epoch time; skip first epoch as allocator/cudnn warmup.'''
+    train_epoch_times = timing.get('train_epoch_times') or []
+    if len(train_epoch_times) > 1:
+        steady = train_epoch_times[1:]
+        return float(sum(steady) / len(steady))
+    if train_epoch_times:
+        return float(train_epoch_times[0])
+    return float(timing.get('train_time', 0.0)) / max(num_epochs, 1)
+
+
 def build_results_report(
     num_epochs,
     valid_metric,
@@ -109,47 +156,79 @@ def build_results_report(
     loss_name,
     strategy_name,
     dim,
-    batch_size):
+    batch_size,
+    config_path=None,
+    dataset_name=None,
+    negative_samples=None,
+    args=None,
+):
     mr = format_metric_value(link_metrics.get('MR') if link_metrics else None)
     mrr = format_metric_value(link_metrics.get('MRR') if link_metrics else None)
     hit_1 = format_metric_value(link_metrics.get('HITS@1') if link_metrics else None)
     hit_3 = format_metric_value(link_metrics.get('HITS@3') if link_metrics else None)
     hit_10 = format_metric_value(link_metrics.get('HITS@10') if link_metrics else None)
-    
+
     acc = format_metric_value(classification_metrics_dict.get('accuracy') if classification_metrics_dict else None)
     prec = format_metric_value(classification_metrics_dict.get('precision') if classification_metrics_dict else None)
     rec = format_metric_value(classification_metrics_dict.get('recall') if classification_metrics_dict else None)
     f1 = format_metric_value(classification_metrics_dict.get('f1') if classification_metrics_dict else None)
     pr_auc = format_metric_value(classification_metrics_dict.get('pr_auc') if classification_metrics_dict else None)
     roc_auc = format_metric_value(classification_metrics_dict.get('roc_auc') if classification_metrics_dict else None)
-    
+
     best_epoch = int(best_epoch)
     best_valid_value = format_metric_value(best_valid_value)
-    
+
     train_time = format_duration(timing['train_time'])
     valid_time = format_duration(timing['valid_time'])
     test_time = format_duration(timing['test_time'])
     total_time = format_duration(timing['total_time'])
-    
-    time_per_epoch = format_duration(timing['train_time'] / max(num_epochs, 1))
-    # Prefer train-only peak when available (excludes valid/test).
+
+    time_per_epoch = format_duration(steady_time_per_epoch(timing, num_epochs))
+
     peak_value = timing.get('train_peak_gpu_memory_gb')
     if peak_value is None:
         peak_value = timing.get('peak_gpu_memory_gb')
-    if peak_value is None:
-        peak_gpu_memory = None
-    else:
-        peak_gpu_memory = '{:.2f} GB'.format(float(peak_value))
+    peak_gpu_memory = (
+        None if peak_value is None else '{:.2f} GB'.format(float(peak_value))
+    )
+    reserved_value = timing.get('train_peak_gpu_memory_reserved_gb')
+    peak_gpu_memory_reserved = (
+        None if reserved_value is None else '{:.2f} GB'.format(float(reserved_value))
+    )
+
+    chunk_size = chunk_size_for_report(args) if args is not None else None
 
     lines = [
+        'Config Path: {}'.format(config_path or 'N/A'),
         'Model: {}'.format(model_name),
+        'Dataset: {}'.format(dataset_name or 'N/A'),
         'Loss: {}'.format(loss_name),
         'Strategy: {}'.format(strategy_name),
         'Dim: {}'.format(dim),
         'Batch Size: {}'.format(batch_size),
-        ''
+        'Epochs: {}'.format(num_epochs),
+        'Negative Samples: {}'.format(
+            0 if negative_samples is None else negative_samples
+        ),
     ]
-    
+    if chunk_size is not None:
+        lines.append('Chunk Size: {}'.format(chunk_size))
+
+    loss_name_key = getattr(args, 'loss', '') if args is not None else ''
+    if loss_name_key in ('kgau', 'kgmau', 'kgmamu') or str(strategy_name).lower() == 'kgau':
+        uniform_t = getattr(args, 'uniform_t', DEFAULT_UNIFORM_T) if args is not None else DEFAULT_UNIFORM_T
+        gamma_q = getattr(args, 'uniform_gamma_q', 0.0) if args is not None else 0.0
+        gamma_y = getattr(args, 'uniform_gamma_y', 0.0) if args is not None else 0.0
+        gamma_e = getattr(args, 'uniform_gamma_e', 0.0) if args is not None else 0.0
+        lines += [
+            'Uniform t: {}'.format(uniform_t),
+            '(Gamma Query, Gamma Target, Gamma Entity): ({}, {}, {})'.format(
+                gamma_q, gamma_y, gamma_e,
+            ),
+        ]
+
+    lines.append('')
+
     if mrr is not None:
         lines += [
             'MR: {}'.format(mr),
@@ -174,6 +253,7 @@ def build_results_report(
     lines += [
         'Best Epoch: {}'.format(best_epoch),
         'Best {}: {}'.format(valid_metric, best_valid_value),
+        'Test checkpoint: best-valid (epoch {})'.format(best_epoch),
         '',
         'Training: {}'.format(train_time),
         'Valid: {}'.format(valid_time),
@@ -182,14 +262,11 @@ def build_results_report(
         ''
     ]
 
-    if time_per_epoch is not None:
-        lines += [
-            'Time per epoch: {}'.format(time_per_epoch)
-        ]
+    lines.append('Time per epoch: {}'.format(time_per_epoch))
     if peak_gpu_memory is not None:
-        lines += [
-            'Peak GPU memory: {}'.format(peak_gpu_memory)
-        ]
+        lines.append('Peak GPU memory: {}'.format(peak_gpu_memory))
+    if peak_gpu_memory_reserved is not None:
+        lines.append('Peak GPU memory reserved: {}'.format(peak_gpu_memory_reserved))
     return '\n'.join(lines) + '\n'
 
 
@@ -213,72 +290,6 @@ def candidates_per_positive(args):
     if strategy in ('uniform', 'bernoulli', 'selfadv'):
         return int(getattr(args, 'negative_sample_size', 0) or 0)
     return 0
-
-
-def build_eff_report(args, timing, num_epochs, epoch_steps):
-    '''Train-only efficiency metrics for fair strategy comparison.'''
-    train_epoch_times = timing.get('train_epoch_times') or []
-    if len(train_epoch_times) > 1:
-        # Skip first epoch as warmup (allocator / cudnn).
-        steady = train_epoch_times[1:]
-    else:
-        steady = train_epoch_times
-    time_per_epoch = float(np.mean(steady)) if steady else 0.0
-
-    peak = timing.get('train_peak_gpu_memory_gb')
-    peak_str = '{:.4f}'.format(peak) if peak is not None else 'N/A'
-    reserved = timing.get('train_peak_gpu_memory_reserved_gb')
-    reserved_str = '{:.4f}'.format(reserved) if reserved is not None else 'N/A'
-
-    lines = [
-        'Efficiency report (train-only)',
-        '==============================',
-        'Model: {}'.format(getattr(args, 'model', None)),
-        'Loss: {}'.format(getattr(args, 'loss', None)),
-        'Strategy: {}'.format(getattr(args, 'strategy', None)),
-        'Dim: {}'.format(getattr(args, 'dim', None)),
-        'Batch size: {}'.format(getattr(args, 'batch_size', None)),
-        'Negative sample size: {}'.format(
-            getattr(args, 'negative_sample_size', None)
-        ),
-        'Negative chunk size: {}'.format(
-            getattr(args, 'negative_chunk_size', 0) or 'auto'
-        ),
-        'Uniform pair chunk size: {}'.format(
-            getattr(args, 'uniform_pair_chunk_size', 0) or 'auto'
-        ),
-        'Nentity: {}'.format(getattr(args, 'nentity', None)),
-        'Candidates per positive: {}'.format(candidates_per_positive(args)),
-        'Steps per epoch: {}'.format(epoch_steps),
-        'Num epochs measured: {}'.format(num_epochs),
-        'Warmup epochs excluded from mean time: {}'.format(
-            1 if len(train_epoch_times) > 1 else 0
-        ),
-        '',
-        'Train time total (s): {:.4f}'.format(timing.get('train_time', 0.0)),
-        'Train time per epoch (s): {:.4f}'.format(time_per_epoch),
-        'Train time per epoch (formatted): {}'.format(format_duration(time_per_epoch)),
-        'Valid time total (s): {:.4f}'.format(timing.get('valid_time', 0.0)),
-        'Test time total (s): {:.4f}'.format(timing.get('test_time', 0.0)),
-        '',
-        'Train peak GPU memory allocated (GB): {}'.format(peak_str),
-        'Train peak GPU memory reserved (GB): {}'.format(reserved_str),
-        '',
-        'Notes:',
-        '- Peak memory is max_memory_allocated during train steps only',
-        '  (reset each epoch before train; excludes valid/test).',
-        '- Time per epoch averages train-only wall time with CUDA sync;',
-        '  first epoch excluded when num_epochs > 1.',
-    ]
-    return '\n'.join(lines) + '\n'
-
-
-def write_eff_report(output_dir, report_text):
-    path = os.path.join(output_dir, 'eff-report.txt')
-    with open(path, 'w') as fout:
-        fout.write(report_text)
-    print('Efficiency report saved to {}'.format(path))
-    return path
 
 
 def run_post_training_evaluation(model, args, test_triples, all_true_triples):
@@ -346,13 +357,18 @@ def build_args(config):
     args.cpu_num = config.get('cpu_num', 4)
     # Resolve strategy defaults (sans -> selfadv, else uniform)
     args.strategy = resolve_strategy_name(args)
+    # Configs omit unused keys; clear misleading argparse defaults on args.
+    if args.strategy in ('1vsall', 'kvsall', 'kgau') and 'negative_sample_size' not in config:
+        args.negative_sample_size = 0
+    if args.strategy not in ('uniform', 'bernoulli', 'selfadv') and 'negative_chunk_size' not in config:
+        args.negative_chunk_size = 0
     get_strategy(args)
 
     return args
 
 
-def resolve_num_epochs(config, display_epochs):
-    return min(int(config['epochs']), int(display_epochs))
+def resolve_num_epochs(config):
+    return int(config['epochs'])
 
 
 def load_dataset(args):
@@ -540,6 +556,9 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
     train_epoch_times = []
     train_peak_gpu_memory_gb = None
     train_peak_gpu_memory_reserved_gb = None
+    best_epoch = None
+    best_valid_value = float('-inf')
+    best_model_state = None
 
     epoch_bar = tqdm(
         range(1, num_epochs + 1),
@@ -599,6 +618,12 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
         valid_time += time.perf_counter() - valid_start
         history['valid_metric'].append(metrics)
 
+        metric_value = metrics[valid_metric]
+        if metric_value > best_valid_value:
+            best_valid_value = metric_value
+            best_epoch = epoch
+            best_model_state = clone_model_state(model)
+
         postfix = format_training_postfix(
             valid_metric,
             metrics[valid_metric],
@@ -608,6 +633,15 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
             history['uniform_loss'][-1],
         )
         epoch_bar.set_postfix_str(postfix, refresh=True)
+
+    # Test / reports use best-valid weights, not the last training epoch.
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(
+            'Restored best model at epoch {} ({}={:.4f}) for evaluation'.format(
+                best_epoch, valid_metric, best_valid_value,
+            )
+        )
 
     timing = {
         'train_time': train_time,
@@ -619,6 +653,8 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
         'train_peak_gpu_memory_reserved_gb': train_peak_gpu_memory_reserved_gb,
         'train_epoch_times': train_epoch_times,
         'epoch_steps': epoch_steps,
+        'best_epoch': best_epoch,
+        'best_valid_value': best_valid_value,
     }
 
     datasets = {
@@ -629,8 +665,8 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
     return history, model, args, datasets, timing
 
 
-def _truncate_history(history, display_epochs):
-    n = min(display_epochs, len(history['epochs']))
+def _truncate_history(history, num_epochs):
+    n = min(num_epochs, len(history['epochs']))
     truncated = {}
     for key, value in history.items():
         if key == 'uniform':
@@ -652,8 +688,8 @@ def _place_legend_bottom_right(ax_right, lines):
     )
 
 
-def plot_alignment_uniformity(history, display_epochs, uniform_sets, output_path=None):
-    history = _truncate_history(history, display_epochs)
+def plot_alignment_uniformity(history, num_epochs, uniform_sets, output_path=None):
+    history = _truncate_history(history, num_epochs)
     epochs = history['epochs']
 
     fig, ax_left = plt.subplots(figsize=(6, 4))
@@ -689,8 +725,8 @@ def plot_alignment_uniformity(history, display_epochs, uniform_sets, output_path
     return fig
 
 
-def plot_loss_and_metric(history, valid_metric, display_epochs, loss_label='loss', output_path=None):
-    history = _truncate_history(history, display_epochs)
+def plot_loss_and_metric(history, valid_metric, num_epochs, loss_label='loss', output_path=None):
+    history = _truncate_history(history, num_epochs)
     epochs = history['epochs']
     metric_values = [m[valid_metric] for m in history['valid_metric']]
 
@@ -725,13 +761,12 @@ def plot_loss_and_metric(history, valid_metric, display_epochs, loss_label='loss
 def visualize_training(
     config_path,
     valid_metric='MRR',
-    display_epochs=DEFAULT_DISPLAY_EPOCHS,
     gpu=1,
     output_dir=None,
     show=True,
     uniform_sets=None):
     config, config_path = load_config(resolve_path(config_path))
-    num_epochs = resolve_num_epochs(config, display_epochs)
+    num_epochs = resolve_num_epochs(config)
     args = build_args(config)
     uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_KEYS)
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
@@ -741,12 +776,13 @@ def visualize_training(
     strategy_name = getattr(args, 'strategy', 'NoneStrategy')
     dim = getattr(args, 'dim', 'NoneDim')
     batch_size = getattr(args, 'batch_size', 'NoneBatchSize')
+    dataset_name = dataset_display_name(config.get('data_path') or getattr(args, 'data_path', ''))
 
     print('Config: {}'.format(config_path))
     print('Model: {}  Loss: {}  Strategy: {}  Dataset: {}'.format(
-        model_name, loss_name, getattr(args, 'strategy', 'uniform'), config.get('data_path')
+        model_name, loss_name, getattr(args, 'strategy', 'uniform'), dataset_name,
     ))
-    print('Training for {} epochs (displaying first {})'.format(num_epochs, display_epochs))
+    print('Training for {} epochs (from config)'.format(num_epochs))
     print('Uniform sets: {}'.format(', '.join(uniform_sets)))
 
     if output_dir is None:
@@ -775,14 +811,14 @@ def visualize_training(
 
     fig_au = plot_alignment_uniformity(
         history,
-        display_epochs,
+        num_epochs,
         uniform_sets,
         output_path=os.path.join(output_dir, 'alignment_uniformity.png'),
     )
     fig_curve = plot_loss_and_metric(
         history,
         valid_metric,
-        display_epochs,
+        num_epochs,
         loss_label=loss_label,
         output_path=os.path.join(output_dir, 'loss_and_{}.png'.format(valid_metric)),
     )
@@ -817,16 +853,12 @@ def visualize_training(
         strategy_name=strategy_name,
         dim=dim,
         batch_size=batch_size,
+        config_path=config_path,
+        dataset_name=dataset_name,
+        negative_samples=negative_samples_for_report(args),
+        args=args,
     )
     write_results_report(output_dir, report_text)
-
-    eff_text = build_eff_report(
-        args,
-        timing,
-        num_epochs=num_epochs,
-        epoch_steps=timing.get('epoch_steps', 0),
-    )
-    write_eff_report(output_dir, eff_text)
 
     return history, fig_au, fig_curve
 
@@ -842,10 +874,6 @@ def parse_cli():
         help='Path to config JSON (default: configs/ComplEx_WN18RR.json)',
     )
     parser.add_argument('--valid-metric', default='MRR', help='Validation metric for learning curve')
-    parser.add_argument(
-        '--display-epochs', type=int, default=DEFAULT_DISPLAY_EPOCHS,
-        help='First N epochs to train and plot',
-    )
     parser.add_argument('--gpu', type=int, default=1, help='GPU device id')
     parser.add_argument(
         '--output-dir', default=None,
@@ -866,7 +894,6 @@ def main():
     visualize_training(
         cli.config,
         valid_metric=cli.valid_metric,
-        display_epochs=cli.display_epochs,
         gpu=cli.gpu,
         output_dir=resolve_path(cli.output_dir) if cli.output_dir else None,
         show=not cli.no_show,

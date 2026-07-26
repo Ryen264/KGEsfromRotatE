@@ -1,10 +1,10 @@
 {
   "model": "ComplEx",
-  "data_path": "data/wn18rr",
+  "data_path": "data/fb15k_237",
   "loss": "kgau",
   "strategy": "kgau",
-  "dim": 64,
-  "batch_size": 512,
+  "dim": 128,
+  "batch_size": 16384,
   "margin_gamma": 200.0,
   "learning_rate": 0.002,
   "epochs": 200,
@@ -16,6 +16,6 @@
   "uniform_t": 4,
   "uniform_pair_chunk_size": 256,
   "uniform_gamma_q": 0.0,
-  "uniform_gamma_y": 1.0,
-  "uniform_gamma_e": 0.0
+  "uniform_gamma_y": 0.0,
+  "uniform_gamma_e": 1.0
 }

@@ -22,11 +22,9 @@ Setup tham chiếu: ComplEx `dim=500` (`D=1000` với double-emb), `batch_size=5
 
 | Parameter | Default | Ý nghĩa |
 |---|---|---|
-| `negative_chunk_size` | `0` = **auto** | Max negatives / chunk; `>0` = ép tay |
+| `negative_chunk_size` | **256** | Max negatives / chunk; `<=0` = không chunk (dùng hết N) |
 
-Auto: `C = min(N, max(256, 512MiB / (B·D·8)))` → setup tham chiếu **`C=256`**.
-
-**Lưu ý:** `0` không phải tắt. `C ≥ N` → không chunk.
+`C = min(negative_chunk_size, N)`. Khi `C ≥ N` → không chunk.
 
 ---
 
@@ -68,23 +66,21 @@ Auto: `C = min(N, max(256, 512MiB / (B·D·8)))` → setup tham chiếu **`C=256
 
 | Parameter | Default | Ý nghĩa |
 |---|---|---|
-| `uniform_pair_chunk_size` | `0` = **auto** | Độ rộng block cặp; `>0` = ép tay |
+| `uniform_pair_chunk_size` | **256** | Độ rộng block cặp; `<=0` = không block (dùng hết n, dễ OOM) |
 
-Auto: soft cap **256** → entity term setup tham chiếu **`C=256`**.
-
-**Lưu ý:** `0` không phải tắt; chunked **luôn** thay `pdist`. Giữ `B=512` + `γ_e > 0` vẫn được.
+`C = min(uniform_pair_chunk_size, n)`.
 
 ---
 
 ## Tóm tắt
 
-| Nhóm | Tên kỹ thuật | Hyperparam mới | Default | Auto (setup tham chiếu) |
-|---|---|---|---|---|
-| NegSamp | Chunked Negative Scoring + Checkpoint | `negative_chunk_size` | `0` (auto) | **256** |
-| AllNeg | Query–Entity Matmul Scoring | — | luôn bật | — |
-| KGAU | Chunked Pairwise Uniformity | `uniform_pair_chunk_size` | `0` (auto) | **256** |
+| Nhóm | Tên kỹ thuật | Hyperparam | Default |
+|---|---|---|---|
+| NegSamp | Chunked Negative Scoring + Checkpoint | `negative_chunk_size` | **256** |
+| AllNeg | Query–Entity Matmul Scoring | — | luôn bật |
+| KGAU | Chunked Pairwise Uniformity | `uniform_pair_chunk_size` | **256** |
 
-Không bắt buộc ghi chunk vào JSON. Muốn ghi rõ:
+Ví dụ trong JSON:
 
 ```json
 "negative_chunk_size": 256,
