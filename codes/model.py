@@ -81,8 +81,150 @@ class ComplEx(KGEBase):
         return re_q @ re_e.transpose(0, 1) + im_q @ im_e.transpose(0, 1)
 
 
+class RotatE(KGEBase):
+    '''
+    RotatE: Knowledge Graph Embedding by Relational Rotation in Complex Space.
+
+    Entities are complex (double_entity_embedding); relations are real phases
+    (not doubled). Score = margin_gamma - ||h ◦ r - t||_1 over complex moduli.
+    '''
+
+    def __init__(self, embedding_range, margin_gamma):
+        self.embedding_range = embedding_range
+        self.margin_gamma = margin_gamma
+        self.pi = 3.14159265358979323846
+
+    @staticmethod
+    def _split_complex(x):
+        return torch.chunk(x, 2, dim=-1)
+
+    def _relation_rotation(self, relation):
+        # Map relation embeddings to phases in [-pi, pi], then to unit complex.
+        phase_relation = relation / (self.embedding_range.item() / self.pi)
+        return torch.cos(phase_relation), torch.sin(phase_relation)
+
+    def query_encoder(self, head, relation, tail, mode):
+        re_relation, im_relation = self._relation_rotation(relation)
+        if mode == 'head-batch':
+            # Inverse rotation: r^{-1} ◦ t  (since |r|=1, r^{-1}=conj(r))
+            re_tail, im_tail = self._split_complex(tail)
+            re_query = re_relation * re_tail + im_relation * im_tail
+            im_query = re_relation * im_tail - im_relation * re_tail
+        else:
+            # Forward rotation: h ◦ r
+            re_head, im_head = self._split_complex(head)
+            re_query = re_head * re_relation - im_head * im_relation
+            im_query = re_head * im_relation + im_head * re_relation
+        return torch.cat([re_query, im_query], dim=-1)
+
+    def target_encoder(self, head, relation, tail, mode):
+        if mode == 'head-batch':
+            return head
+        return tail
+
+    @staticmethod
+    def _complex_distance(re_diff, im_diff):
+        # Per-dim complex modulus, then L1 over dims.
+        # Use stack(...).norm (finite grad at 0) — NOT hypot, which yields NaN
+        # grads when re=im=0. That happens once 1vsAll/KvsAll fits positives.
+        return torch.stack([re_diff, im_diff], dim=0).norm(dim=0).sum(dim=-1)
+
+    def score(self, head, relation, tail, mode):
+        query = self.query_encoder(head, relation, tail, mode)
+        target = self.target_encoder(head, relation, tail, mode)
+        re_query, im_query = self._split_complex(query)
+        re_target, im_target = self._split_complex(target)
+        return self.margin_gamma.item() - self._complex_distance(
+            re_query - re_target, im_query - im_target
+        )
+
+    def score_query_entities(self, query, entity_embedding):
+        '''
+        Score queries against all entity embeddings without expanding to [B, E, D]
+        via forward()/index_select. Same contract as ComplEx.score_query_entities:
+        query [B, D], entity_embedding [E, D] -> scores [B, E].
+
+        ComplEx uses a bilinear matmul (autograd saves only [B,D]/[E,D]).
+        RotatE distance is not bilinear, so a custom autograd saves the same
+        embeddings and recomputes entity chunks in backward. Chunk budget is
+        fixed (512MiB), not adaptive to free VRAM.
+        '''
+        re_q, im_q = self._split_complex(query)
+        re_e, im_e = self._split_complex(entity_embedding)
+        gamma = self.margin_gamma.detach().to(dtype=query.dtype, device=query.device)
+        return _RotatEScoreQueryEntities.apply(re_q, im_q, re_e, im_e, gamma)
+
+
+class _RotatEScoreQueryEntities(torch.autograd.Function):
+    '''
+    All-entity RotatE scores with ComplEx-like saved-tensor footprint:
+    save query/entity embeddings only; recompute distance chunk-wise in backward.
+    '''
+
+    # Same fixed budget style as KGEModel._score_all_entities_chunked.
+    _BYTES_BUDGET = 512 * 1024 * 1024
+
+    @staticmethod
+    def _chunk_size(batch_size, half_dim, nentity):
+        # Peak temps ≈ re_diff + im_diff + stacked + norm ~ 5x [B, C, d] float32.
+        per_entity = max(batch_size * half_dim * 4 * 5, 1)
+        return max(64, min(nentity, _RotatEScoreQueryEntities._BYTES_BUDGET // per_entity))
+
+    @staticmethod
+    def _distance(re_diff, im_diff):
+        return torch.stack([re_diff, im_diff], dim=0).norm(dim=0).sum(dim=-1)
+
+    @staticmethod
+    def forward(ctx, re_q, im_q, re_e, im_e, gamma):
+        ctx.save_for_backward(re_q, im_q, re_e, im_e)
+        ctx.gamma = float(gamma)
+        batch_size, half_dim = re_q.shape
+        nentity = re_e.size(0)
+        chunk = _RotatEScoreQueryEntities._chunk_size(batch_size, half_dim, nentity)
+        ctx.chunk = chunk
+
+        scores = re_q.new_empty(batch_size, nentity)
+        for start in range(0, nentity, chunk):
+            end = min(start + chunk, nentity)
+            re_diff = re_q.unsqueeze(1) - re_e[start:end].unsqueeze(0)
+            im_diff = im_q.unsqueeze(1) - im_e[start:end].unsqueeze(0)
+            scores[:, start:end] = ctx.gamma - _RotatEScoreQueryEntities._distance(
+                re_diff, im_diff
+            )
+        return scores
+
+    @staticmethod
+    def backward(ctx, grad_scores):
+        re_q, im_q, re_e, im_e = ctx.saved_tensors
+        chunk = ctx.chunk
+        nentity = re_e.size(0)
+
+        grad_re_q = torch.zeros_like(re_q)
+        grad_im_q = torch.zeros_like(im_q)
+        grad_re_e = torch.zeros_like(re_e)
+        grad_im_e = torch.zeros_like(im_e)
+
+        for start in range(0, nentity, chunk):
+            end = min(start + chunk, nentity)
+            re_diff = re_q.unsqueeze(1) - re_e[start:end].unsqueeze(0)
+            im_diff = im_q.unsqueeze(1) - im_e[start:end].unsqueeze(0)
+            # Finite subgradient at 0: clamp only the divisor (re_diff=0 => grad=0).
+            moduli = torch.stack([re_diff, im_diff], dim=0).norm(dim=0).clamp_min(1e-12)
+            grad = grad_scores[:, start:end].unsqueeze(-1)
+            # score = gamma - sum moduli; d(score)/d(re_diff) = -re_diff/moduli
+            g_re = -grad * (re_diff / moduli)
+            g_im = -grad * (im_diff / moduli)
+            grad_re_q += g_re.sum(dim=1)
+            grad_im_q += g_im.sum(dim=1)
+            grad_re_e[start:end] -= g_re.sum(dim=0)
+            grad_im_e[start:end] -= g_im.sum(dim=0)
+
+        return grad_re_q, grad_im_q, grad_re_e, grad_im_e, None
+
+
 KGE_SCORERS = {
     'ComplEx': ComplEx,
+    'RotatE': RotatE,
 }
 
 
@@ -126,9 +268,19 @@ class KGEModel(nn.Module):
         if model_name == 'ComplEx' and (not double_entity_embedding or not double_relation_embedding):
             raise ValueError('ComplEx should use --double_entity_embedding and --double_relation_embedding')
 
+        if model_name == 'RotatE' and (not double_entity_embedding or double_relation_embedding):
+            raise ValueError('RotatE should use --double_entity_embedding')
+
         if model_name not in KGE_SCORERS:
             raise ValueError('model %s not supported' % model_name)
-        self.kge_scorer = KGE_SCORERS[model_name]()
+
+        if model_name == 'RotatE':
+            self.kge_scorer = RotatE(
+                embedding_range=self.embedding_range,
+                margin_gamma=self.margin_gamma,
+            )
+        else:
+            self.kge_scorer = KGE_SCORERS[model_name]()
         
     def query_encoder(self, head, relation, tail=None, mode='tail-batch'):
         return self.kge_scorer.query_encoder(head, relation, tail, mode)

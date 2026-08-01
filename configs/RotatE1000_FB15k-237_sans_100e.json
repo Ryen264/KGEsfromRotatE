@@ -1,0 +1,20 @@
+{
+  "model": "RotatE",
+  "data_path": "data/fb15k_237",
+  "loss": "sans",
+  "strategy": "selfadv",
+  "dim": 1000,
+  "batch_size": 1024,
+  "negative_sample_size": 256,
+  "negative_chunk_size": 256,
+  "margin_gamma": 9.0,
+  "learning_rate": 0.00005,
+  "epochs": 100,
+  "test_batch_size": 16,
+  "double_entity_embedding": true,
+  "double_relation_embedding": false,
+  "regularization_coeff": 0.0,
+  "regularization_p": 3,
+  "adversarial_temperature": 1.0,
+  "negative_adversarial_sampling": true
+}

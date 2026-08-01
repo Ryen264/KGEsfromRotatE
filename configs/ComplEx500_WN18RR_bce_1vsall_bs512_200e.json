@@ -1,0 +1,16 @@
+{
+  "model": "ComplEx",
+  "data_path": "data/wn18rr",
+  "loss": "bce",
+  "strategy": "1vsall",
+  "dim": 500,
+  "batch_size": 512,
+  "margin_gamma": 200.0,
+  "learning_rate": 0.002,
+  "epochs": 200,
+  "test_batch_size": 8,
+  "double_entity_embedding": true,
+  "double_relation_embedding": true,
+  "regularization_coeff": 5e-06,
+  "regularization_p": 3
+}

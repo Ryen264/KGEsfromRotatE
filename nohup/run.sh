@@ -2,8 +2,8 @@
 # Start visualization training in the background with nohup.
 #
 # Usage:
-#   ./nohup/run.sh configs/ComplEx64_WN18RR_ce_uniform.json
-#   ./nohup/run.sh configs/ComplEx64_WN18RR_ce_uniform.json --gpu 0 --no-show
+#   ./nohup/run.sh configs/ComplEx64_WN18RR_ce_uniform_200e.json
+#   ./nohup/run.sh configs/ComplEx64_WN18RR_ce_uniform_200e.json --gpu 0 --no-show
 #
 # Logs:  nohup/logs/<config-stem>_<timestamp>.log
 # PID:   nohup/job.pid
@@ -27,7 +27,7 @@ if [ -f "$PID_FILE" ]; then
     rm -f "$PID_FILE" "$META_FILE"
 fi
 
-CONFIG="${1:-configs/ComplEx64_WN18RR_ce_uniform.json}"
+CONFIG="${1:-configs/ComplEx64_WN18RR_ce_uniform_200e.json}"
 shift 2>/dev/null || true
 
 if [ ! -f "$ROOT/$CONFIG" ] && [ ! -f "$CONFIG" ]; then
