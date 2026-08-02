@@ -25,7 +25,7 @@ from loss import (
     update_kgau_gamma_schedule,
 )
 from metrics.classification import classification_metrics_from_probs
-from model import KGEModel
+from model import KGEModel, resolve_rotate_score_mode
 from strategy import get_strategy, resolve_strategy_name
 
 DEFAULT_UNIFORM_KEYS = ['query', 'target', 'entity', 'relation']
@@ -408,6 +408,9 @@ def load_dataset(args):
 
 
 def build_model_and_iterator(args, train_triples):
+    score_mode = (
+        resolve_rotate_score_mode(args) if args.model == 'RotatE' else 'distance'
+    )
     model = KGEModel(
         model_name=args.model,
         nentity=args.nentity,
@@ -416,6 +419,7 @@ def build_model_and_iterator(args, train_triples):
         margin_gamma=args.margin_gamma,
         double_entity_embedding=args.double_entity_embedding,
         double_relation_embedding=args.double_relation_embedding,
+        score_mode=score_mode,
     )
     if args.cuda:
         model = model.cuda()
@@ -758,10 +762,34 @@ def plot_loss_and_metric(history, valid_metric, num_epochs, loss_label='loss', o
     return fig
 
 
+def configure_cuda_device(gpu=0):
+    '''
+    Bind the process to a CUDA device index among currently visible GPUs.
+
+    Do not rewrite CUDA_VISIBLE_DEVICES after torch has been imported — that
+    empties the visible device list and breaks Triton ("Invalid device id").
+    '''
+    if not torch.cuda.is_available():
+        print('CUDA not available; running on CPU')
+        return None
+    n = torch.cuda.device_count()
+    if gpu is None:
+        gpu = 0
+    gpu = int(gpu)
+    if gpu < 0 or gpu >= n:
+        print(
+            'Warning: GPU {} unavailable (device_count={}); using GPU 0'.format(gpu, n)
+        )
+        gpu = 0
+    torch.cuda.set_device(gpu)
+    print('Using CUDA device {} ({})'.format(gpu, torch.cuda.get_device_name(gpu)))
+    return gpu
+
+
 def visualize_training(
     config_path,
     valid_metric='MRR',
-    gpu=1,
+    gpu=0,
     output_dir=None,
     show=True,
     uniform_sets=None):
@@ -769,7 +797,7 @@ def visualize_training(
     num_epochs = resolve_num_epochs(config)
     args = build_args(config)
     uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_KEYS)
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
+    configure_cuda_device(gpu)
 
     model_name = config.get('model')
     loss_name = getattr(args, 'loss', 'NoneLoss')
@@ -782,6 +810,8 @@ def visualize_training(
     print('Model: {}  Loss: {}  Strategy: {}  Dataset: {}'.format(
         model_name, loss_name, getattr(args, 'strategy', 'uniform'), dataset_name,
     ))
+    if model_name == 'RotatE':
+        print('RotatE score_mode: {}'.format(resolve_rotate_score_mode(args)))
     print('Training for {} epochs (from config)'.format(num_epochs))
     print('Uniform sets: {}'.format(', '.join(uniform_sets)))
 
@@ -874,7 +904,7 @@ def parse_cli():
         help='Path to config JSON (default: configs/ComplEx_WN18RR.json)',
     )
     parser.add_argument('--valid-metric', default='MRR', help='Validation metric for learning curve')
-    parser.add_argument('--gpu', type=int, default=1, help='GPU device id')
+    parser.add_argument('--gpu', type=int, default=0, help='CUDA device index among visible GPUs (default: 0)')
     parser.add_argument(
         '--output-dir', default=None,
         help='Directory to save PNG figures (default: visualization/outputs/<config_path>_<timestamp>)',

@@ -26,7 +26,7 @@ from loss import (
     update_kgau_gamma_schedule,
 )
 from metrics.classification import classification_metrics_from_probs
-from model import KGEModel
+from model import KGEModel, resolve_rotate_score_mode
 from strategy import get_strategy, resolve_strategy_name
 
 UNIFORM_SET_KEYS = ('query', 'target', 'entity')
@@ -282,6 +282,9 @@ def load_dataset(args):
 
 
 def build_model_and_iterator(args, train_triples):
+    score_mode = (
+        resolve_rotate_score_mode(args) if args.model == 'RotatE' else 'distance'
+    )
     model = KGEModel(
         model_name=args.model,
         nentity=args.nentity,
@@ -290,6 +293,7 @@ def build_model_and_iterator(args, train_triples):
         margin_gamma=args.margin_gamma,
         double_entity_embedding=args.double_entity_embedding,
         double_relation_embedding=args.double_relation_embedding,
+        score_mode=score_mode,
     )
     if args.cuda:
         model = model.cuda()
@@ -685,7 +689,31 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
 
 
 def resolve_default_gpu():
-    return 1 if torch.cuda.is_available() else 0
+    return 0
+
+
+def configure_cuda_device(gpu=0):
+    '''
+    Bind the process to a CUDA device index among currently visible GPUs.
+
+    Do not rewrite CUDA_VISIBLE_DEVICES after torch has been imported — that
+    empties the visible device list and breaks Triton ("Invalid device id").
+    '''
+    if not torch.cuda.is_available():
+        print('CUDA not available; running on CPU')
+        return None
+    n = torch.cuda.device_count()
+    if gpu is None:
+        gpu = 0
+    gpu = int(gpu)
+    if gpu < 0 or gpu >= n:
+        print(
+            'Warning: GPU {} unavailable (device_count={}); using GPU 0'.format(gpu, n)
+        )
+        gpu = 0
+    torch.cuda.set_device(gpu)
+    print('Using CUDA device {} ({})'.format(gpu, torch.cuda.get_device_name(gpu)))
+    return gpu
 
 
 def visualize_training(
@@ -703,7 +731,7 @@ def visualize_training(
     uniform_sets = validate_uniform_sets(uniform_sets or DEFAULT_UNIFORM_SETS)
     if gpu is None:
         gpu = resolve_default_gpu()
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu)
+    configure_cuda_device(gpu)
 
     print('Config: {}'.format(config_path))
     print('Model: {}  Loss: {}  Dataset: {}'.format(

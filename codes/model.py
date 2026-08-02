@@ -4,14 +4,46 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from torch.utils.data import DataLoader
 
 from dataloader import TestDataset
-from loss import compute_kge_loss, UniGammaController, is_learnable_kgau_gammas
+from loss import (
+    compute_kge_loss,
+    UniGammaController,
+    is_kgau_family_loss,
+    is_learnable_kgau_gammas,
+)
 from metrics.classification import classification_metrics
 from metrics.ranking import ranks_from_score_matrix, rotate_ranking_metrics_from_ranks
-from strategy import get_strategy
+from strategy import get_strategy, resolve_strategy_name
+
+
+def resolve_rotate_score_mode(args):
+    '''
+    RotatE scoring mode from training setup.
+
+    KGAU-family (loss or strategy) aligns L2-normalized query/target embeddings,
+    so ranking uses cosine similarity. NegSamp / AllNeg keep RotatE distance.
+    '''
+    if is_kgau_family_loss(args):
+        return 'cosine'
+    try:
+        if resolve_strategy_name(args) == 'kgau':
+            return 'cosine'
+    except Exception:
+        pass
+    return 'distance'
+
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    triton = None
+    tl = None
+    _TRITON_AVAILABLE = False
 
 
 class KGEBase(object):
@@ -86,12 +118,26 @@ class RotatE(KGEBase):
     RotatE: Knowledge Graph Embedding by Relational Rotation in Complex Space.
 
     Entities are complex (double_entity_embedding); relations are real phases
-    (not doubled). Score = margin_gamma - ||h ◦ r - t||_1 over complex moduli.
+    (not doubled).
+
+    score_mode:
+      - 'distance' (NegSamp / AllNeg): margin_gamma - ||h ◦ r - t||_1
+      - 'cosine' (KGAU-family): cosine(query, target) after L2-normalize,
+        matching KGAU alignment on normalized query/target embeddings.
     '''
 
-    def __init__(self, embedding_range, margin_gamma):
+    SCORE_MODES = ('distance', 'cosine')
+
+    def __init__(self, embedding_range, margin_gamma, score_mode='distance'):
+        if score_mode not in self.SCORE_MODES:
+            raise ValueError(
+                'RotatE score_mode must be one of {}, got {}'.format(
+                    self.SCORE_MODES, score_mode
+                )
+            )
         self.embedding_range = embedding_range
         self.margin_gamma = margin_gamma
+        self.score_mode = score_mode
         self.pi = 3.14159265358979323846
 
     @staticmethod
@@ -129,9 +175,18 @@ class RotatE(KGEBase):
         # grads when re=im=0. That happens once 1vsAll/KvsAll fits positives.
         return torch.stack([re_diff, im_diff], dim=0).norm(dim=0).sum(dim=-1)
 
+    @staticmethod
+    def _cosine_score(query, target):
+        '''Cosine similarity after L2-normalize along the embedding dim.'''
+        query = F.normalize(query, p=2, dim=-1)
+        target = F.normalize(target, p=2, dim=-1)
+        return (query * target).sum(dim=-1)
+
     def score(self, head, relation, tail, mode):
         query = self.query_encoder(head, relation, tail, mode)
         target = self.target_encoder(head, relation, tail, mode)
+        if self.score_mode == 'cosine':
+            return self._cosine_score(query, target)
         re_query, im_query = self._split_complex(query)
         re_target, im_target = self._split_complex(target)
         return self.margin_gamma.item() - self._complex_distance(
@@ -144,25 +199,231 @@ class RotatE(KGEBase):
         via forward()/index_select. Same contract as ComplEx.score_query_entities:
         query [B, D], entity_embedding [E, D] -> scores [B, E].
 
-        ComplEx uses a bilinear matmul (autograd saves only [B,D]/[E,D]).
-        RotatE distance is not bilinear, so a custom autograd saves the same
-        embeddings and recomputes entity chunks in backward. Chunk budget is
-        fixed (512MiB), not adaptive to free VRAM.
+        cosine: L2-normalize then matmul (KGAU).
+        distance: custom autograd / Triton path (NegSamp AllNeg-style full-entity).
         '''
+        if self.score_mode == 'cosine':
+            query_n = F.normalize(query, p=2, dim=-1)
+            entity_n = F.normalize(entity_embedding, p=2, dim=-1)
+            return query_n @ entity_n.transpose(0, 1)
+
         re_q, im_q = self._split_complex(query)
         re_e, im_e = self._split_complex(entity_embedding)
         gamma = self.margin_gamma.detach().to(dtype=query.dtype, device=query.device)
         return _RotatEScoreQueryEntities.apply(re_q, im_q, re_e, im_e, gamma)
 
 
+if _TRITON_AVAILABLE:
+    @triton.jit
+    def _rotate_allneg_fwd_kernel(
+        re_q_ptr, im_q_ptr, re_e_ptr, im_e_ptr, scores_ptr,
+        B, E, D,
+        stride_qb, stride_qd,
+        stride_ee, stride_ed,
+        stride_sb, stride_se,
+        gamma,
+        BLOCK_E: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_e = tl.program_id(1)
+        if pid_b >= B:
+            return
+
+        e_offs = pid_e * BLOCK_E + tl.arange(0, BLOCK_E)
+        e_mask = e_offs < E
+        acc = tl.zeros((BLOCK_E,), dtype=tl.float32)
+
+        for d0 in range(0, D, BLOCK_D):
+            d_offs = d0 + tl.arange(0, BLOCK_D)
+            d_mask = d_offs < D
+
+            rq = tl.load(
+                re_q_ptr + pid_b * stride_qb + d_offs * stride_qd,
+                mask=d_mask, other=0.0,
+            ).to(tl.float32)
+            iq = tl.load(
+                im_q_ptr + pid_b * stride_qb + d_offs * stride_qd,
+                mask=d_mask, other=0.0,
+            ).to(tl.float32)
+
+            re = tl.load(
+                re_e_ptr + e_offs[:, None] * stride_ee + d_offs[None, :] * stride_ed,
+                mask=e_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            ie = tl.load(
+                im_e_ptr + e_offs[:, None] * stride_ee + d_offs[None, :] * stride_ed,
+                mask=e_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+
+            re_diff = rq[None, :] - re
+            im_diff = iq[None, :] - ie
+            mod = tl.sqrt(re_diff * re_diff + im_diff * im_diff)
+            mod = tl.where(d_mask[None, :], mod, 0.0)
+            acc += tl.sum(mod, axis=1)
+
+        tl.store(
+            scores_ptr + pid_b * stride_sb + e_offs * stride_se,
+            gamma - acc,
+            mask=e_mask,
+        )
+
+    @triton.jit
+    def _rotate_allneg_bwd_query_kernel(
+        re_q_ptr, im_q_ptr, re_e_ptr, im_e_ptr, grad_scores_ptr,
+        grad_re_q_ptr, grad_im_q_ptr,
+        B, E, D,
+        stride_qb, stride_qd,
+        stride_ee, stride_ed,
+        stride_sb, stride_se,
+        BLOCK_E: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        '''One program per batch row; owns that query gradient (no atomics).'''
+        pid_b = tl.program_id(0)
+        if pid_b >= B:
+            return
+
+        for d0 in range(0, D, BLOCK_D):
+            d_offs = d0 + tl.arange(0, BLOCK_D)
+            d_mask = d_offs < D
+            acc_re = tl.zeros((BLOCK_D,), dtype=tl.float32)
+            acc_im = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+            rq = tl.load(
+                re_q_ptr + pid_b * stride_qb + d_offs * stride_qd,
+                mask=d_mask, other=0.0,
+            ).to(tl.float32)
+            iq = tl.load(
+                im_q_ptr + pid_b * stride_qb + d_offs * stride_qd,
+                mask=d_mask, other=0.0,
+            ).to(tl.float32)
+
+            for e0 in range(0, E, BLOCK_E):
+                e_offs = e0 + tl.arange(0, BLOCK_E)
+                e_mask = e_offs < E
+                gscore = tl.load(
+                    grad_scores_ptr + pid_b * stride_sb + e_offs * stride_se,
+                    mask=e_mask, other=0.0,
+                ).to(tl.float32)
+
+                re = tl.load(
+                    re_e_ptr + e_offs[:, None] * stride_ee + d_offs[None, :] * stride_ed,
+                    mask=e_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                ie = tl.load(
+                    im_e_ptr + e_offs[:, None] * stride_ee + d_offs[None, :] * stride_ed,
+                    mask=e_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+
+                re_diff = rq[None, :] - re
+                im_diff = iq[None, :] - ie
+                mod = tl.maximum(tl.sqrt(re_diff * re_diff + im_diff * im_diff), 1e-12)
+                g_re = -gscore[:, None] * (re_diff / mod)
+                g_im = -gscore[:, None] * (im_diff / mod)
+                g_re = tl.where(e_mask[:, None] & d_mask[None, :], g_re, 0.0)
+                g_im = tl.where(e_mask[:, None] & d_mask[None, :], g_im, 0.0)
+                acc_re += tl.sum(g_re, axis=0)
+                acc_im += tl.sum(g_im, axis=0)
+
+            tl.store(
+                grad_re_q_ptr + pid_b * stride_qb + d_offs * stride_qd,
+                acc_re, mask=d_mask,
+            )
+            tl.store(
+                grad_im_q_ptr + pid_b * stride_qb + d_offs * stride_qd,
+                acc_im, mask=d_mask,
+            )
+
+    @triton.jit
+    def _rotate_allneg_bwd_entity_kernel(
+        re_q_ptr, im_q_ptr, re_e_ptr, im_e_ptr, grad_scores_ptr,
+        grad_re_e_ptr, grad_im_e_ptr,
+        B, E, D,
+        stride_qb, stride_qd,
+        stride_ee, stride_ed,
+        stride_sb, stride_se,
+        BLOCK_B: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        '''One program per entity; owns that entity gradient (no atomics).'''
+        pid_e = tl.program_id(0)
+        if pid_e >= E:
+            return
+
+        for d0 in range(0, D, BLOCK_D):
+            d_offs = d0 + tl.arange(0, BLOCK_D)
+            d_mask = d_offs < D
+            acc_re = tl.zeros((BLOCK_D,), dtype=tl.float32)
+            acc_im = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+            re = tl.load(
+                re_e_ptr + pid_e * stride_ee + d_offs * stride_ed,
+                mask=d_mask, other=0.0,
+            ).to(tl.float32)
+            ie = tl.load(
+                im_e_ptr + pid_e * stride_ee + d_offs * stride_ed,
+                mask=d_mask, other=0.0,
+            ).to(tl.float32)
+
+            for b0 in range(0, B, BLOCK_B):
+                b_offs = b0 + tl.arange(0, BLOCK_B)
+                b_mask = b_offs < B
+                gscore = tl.load(
+                    grad_scores_ptr + b_offs * stride_sb + pid_e * stride_se,
+                    mask=b_mask, other=0.0,
+                ).to(tl.float32)
+
+                rq = tl.load(
+                    re_q_ptr + b_offs[:, None] * stride_qb + d_offs[None, :] * stride_qd,
+                    mask=b_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                iq = tl.load(
+                    im_q_ptr + b_offs[:, None] * stride_qb + d_offs[None, :] * stride_qd,
+                    mask=b_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+
+                re_diff = rq - re[None, :]
+                im_diff = iq - ie[None, :]
+                mod = tl.maximum(tl.sqrt(re_diff * re_diff + im_diff * im_diff), 1e-12)
+                g_re = -gscore[:, None] * (re_diff / mod)
+                g_im = -gscore[:, None] * (im_diff / mod)
+                g_re = tl.where(b_mask[:, None] & d_mask[None, :], g_re, 0.0)
+                g_im = tl.where(b_mask[:, None] & d_mask[None, :], g_im, 0.0)
+                # d(re_diff)/d(re_e)=-1 => accumulate -g_re over batch
+                acc_re += -tl.sum(g_re, axis=0)
+                acc_im += -tl.sum(g_im, axis=0)
+
+            tl.store(
+                grad_re_e_ptr + pid_e * stride_ee + d_offs * stride_ed,
+                acc_re, mask=d_mask,
+            )
+            tl.store(
+                grad_im_e_ptr + pid_e * stride_ee + d_offs * stride_ed,
+                acc_im, mask=d_mask,
+            )
+
+
 class _RotatEScoreQueryEntities(torch.autograd.Function):
     '''
     All-entity RotatE scores with ComplEx-like saved-tensor footprint:
-    save query/entity embeddings only; recompute distance chunk-wise in backward.
+    save query/entity embeddings only; recompute distance in backward.
+
+    On CUDA + Triton: fused kernels (no [B,C,D] intermediates).
+    Otherwise: chunked PyTorch stack+norm path.
     '''
 
-    # Same fixed budget style as KGEModel._score_all_entities_chunked.
     _BYTES_BUDGET = 512 * 1024 * 1024
+    _TRITON_BLOCK_E = 64
+    _TRITON_BLOCK_D = 64
+    # Sticky disable after a launch failure (e.g. bad CUDA device context).
+    _triton_disabled = False
 
     @staticmethod
     def _chunk_size(batch_size, half_dim, nentity):
@@ -172,33 +433,118 @@ class _RotatEScoreQueryEntities(torch.autograd.Function):
 
     @staticmethod
     def _distance(re_diff, im_diff):
+        # stack+norm is faster than sqrt(re^2+im^2) on GPU and finite at 0.
         return torch.stack([re_diff, im_diff], dim=0).norm(dim=0).sum(dim=-1)
 
     @staticmethod
-    def forward(ctx, re_q, im_q, re_e, im_e, gamma):
-        ctx.save_for_backward(re_q, im_q, re_e, im_e)
-        ctx.gamma = float(gamma)
+    def _use_triton(re_q):
+        return (
+            _TRITON_AVAILABLE
+            and not _RotatEScoreQueryEntities._triton_disabled
+            and re_q.is_cuda
+            and re_q.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        )
+
+    @staticmethod
+    def _disable_triton(reason):
+        if not _RotatEScoreQueryEntities._triton_disabled:
+            logging.warning(
+                'Disabling Triton RotatE AllNeg kernels (%s); using chunked PyTorch.',
+                reason,
+            )
+        _RotatEScoreQueryEntities._triton_disabled = True
+
+    @staticmethod
+    def _forward_triton(re_q, im_q, re_e, im_e, gamma):
+        batch_size, half_dim = re_q.shape
+        nentity = re_e.size(0)
+        scores = re_q.new_empty(batch_size, nentity)
+        re_q_c = re_q.contiguous()
+        im_q_c = im_q.contiguous()
+        re_e_c = re_e.contiguous()
+        im_e_c = im_e.contiguous()
+        scores_c = scores.contiguous()
+
+        block_e = _RotatEScoreQueryEntities._TRITON_BLOCK_E
+        block_d = min(_RotatEScoreQueryEntities._TRITON_BLOCK_D, triton.next_power_of_2(half_dim))
+        grid = (batch_size, triton.cdiv(nentity, block_e))
+        with torch.cuda.device(re_q.device):
+            _rotate_allneg_fwd_kernel[grid](
+                re_q_c, im_q_c, re_e_c, im_e_c, scores_c,
+                batch_size, nentity, half_dim,
+                re_q_c.stride(0), re_q_c.stride(1),
+                re_e_c.stride(0), re_e_c.stride(1),
+                scores_c.stride(0), scores_c.stride(1),
+                float(gamma),
+                BLOCK_E=block_e,
+                BLOCK_D=block_d,
+            )
+        return scores_c
+
+    @staticmethod
+    def _backward_triton(re_q, im_q, re_e, im_e, grad_scores):
+        batch_size, half_dim = re_q.shape
+        nentity = re_e.size(0)
+        grad_re_q = torch.zeros_like(re_q)
+        grad_im_q = torch.zeros_like(im_q)
+        grad_re_e = torch.zeros_like(re_e)
+        grad_im_e = torch.zeros_like(im_e)
+
+        re_q_c = re_q.contiguous()
+        im_q_c = im_q.contiguous()
+        re_e_c = re_e.contiguous()
+        im_e_c = im_e.contiguous()
+        grad_scores_c = grad_scores.contiguous()
+        grad_re_q_c = grad_re_q.contiguous()
+        grad_im_q_c = grad_im_q.contiguous()
+        grad_re_e_c = grad_re_e.contiguous()
+        grad_im_e_c = grad_im_e.contiguous()
+
+        block_e = _RotatEScoreQueryEntities._TRITON_BLOCK_E
+        block_b = _RotatEScoreQueryEntities._TRITON_BLOCK_E
+        block_d = min(_RotatEScoreQueryEntities._TRITON_BLOCK_D, triton.next_power_of_2(half_dim))
+
+        with torch.cuda.device(re_q.device):
+            _rotate_allneg_bwd_query_kernel[(batch_size,)](
+                re_q_c, im_q_c, re_e_c, im_e_c, grad_scores_c,
+                grad_re_q_c, grad_im_q_c,
+                batch_size, nentity, half_dim,
+                re_q_c.stride(0), re_q_c.stride(1),
+                re_e_c.stride(0), re_e_c.stride(1),
+                grad_scores_c.stride(0), grad_scores_c.stride(1),
+                BLOCK_E=block_e,
+                BLOCK_D=block_d,
+            )
+            _rotate_allneg_bwd_entity_kernel[(nentity,)](
+                re_q_c, im_q_c, re_e_c, im_e_c, grad_scores_c,
+                grad_re_e_c, grad_im_e_c,
+                batch_size, nentity, half_dim,
+                re_q_c.stride(0), re_q_c.stride(1),
+                re_e_c.stride(0), re_e_c.stride(1),
+                grad_scores_c.stride(0), grad_scores_c.stride(1),
+                BLOCK_B=block_b,
+                BLOCK_D=block_d,
+            )
+        return grad_re_q_c, grad_im_q_c, grad_re_e_c, grad_im_e_c
+
+    @staticmethod
+    def _forward_chunked(re_q, im_q, re_e, im_e, gamma):
         batch_size, half_dim = re_q.shape
         nentity = re_e.size(0)
         chunk = _RotatEScoreQueryEntities._chunk_size(batch_size, half_dim, nentity)
-        ctx.chunk = chunk
-
         scores = re_q.new_empty(batch_size, nentity)
         for start in range(0, nentity, chunk):
             end = min(start + chunk, nentity)
             re_diff = re_q.unsqueeze(1) - re_e[start:end].unsqueeze(0)
             im_diff = im_q.unsqueeze(1) - im_e[start:end].unsqueeze(0)
-            scores[:, start:end] = ctx.gamma - _RotatEScoreQueryEntities._distance(
+            scores[:, start:end] = float(gamma) - _RotatEScoreQueryEntities._distance(
                 re_diff, im_diff
             )
-        return scores
+        return scores, chunk
 
     @staticmethod
-    def backward(ctx, grad_scores):
-        re_q, im_q, re_e, im_e = ctx.saved_tensors
-        chunk = ctx.chunk
+    def _backward_chunked(re_q, im_q, re_e, im_e, grad_scores, chunk):
         nentity = re_e.size(0)
-
         grad_re_q = torch.zeros_like(re_q)
         grad_im_q = torch.zeros_like(im_q)
         grad_re_e = torch.zeros_like(re_e)
@@ -208,18 +554,61 @@ class _RotatEScoreQueryEntities(torch.autograd.Function):
             end = min(start + chunk, nentity)
             re_diff = re_q.unsqueeze(1) - re_e[start:end].unsqueeze(0)
             im_diff = im_q.unsqueeze(1) - im_e[start:end].unsqueeze(0)
-            # Finite subgradient at 0: clamp only the divisor (re_diff=0 => grad=0).
             moduli = torch.stack([re_diff, im_diff], dim=0).norm(dim=0).clamp_min(1e-12)
             grad = grad_scores[:, start:end].unsqueeze(-1)
-            # score = gamma - sum moduli; d(score)/d(re_diff) = -re_diff/moduli
             g_re = -grad * (re_diff / moduli)
             g_im = -grad * (im_diff / moduli)
             grad_re_q += g_re.sum(dim=1)
             grad_im_q += g_im.sum(dim=1)
             grad_re_e[start:end] -= g_re.sum(dim=0)
             grad_im_e[start:end] -= g_im.sum(dim=0)
+        return grad_re_q, grad_im_q, grad_re_e, grad_im_e
 
-        return grad_re_q, grad_im_q, grad_re_e, grad_im_e, None
+    @staticmethod
+    def forward(ctx, re_q, im_q, re_e, im_e, gamma):
+        ctx.save_for_backward(re_q, im_q, re_e, im_e)
+        ctx.gamma = float(gamma)
+        use_triton = _RotatEScoreQueryEntities._use_triton(re_q)
+        if use_triton:
+            try:
+                scores = _RotatEScoreQueryEntities._forward_triton(
+                    re_q, im_q, re_e, im_e, ctx.gamma
+                )
+                ctx.use_triton = True
+                ctx.chunk = None
+                return scores
+            except Exception as exc:
+                _RotatEScoreQueryEntities._disable_triton(exc)
+        ctx.use_triton = False
+        scores, chunk = _RotatEScoreQueryEntities._forward_chunked(
+            re_q, im_q, re_e, im_e, ctx.gamma
+        )
+        ctx.chunk = chunk
+        return scores
+
+    @staticmethod
+    def backward(ctx, grad_scores):
+        re_q, im_q, re_e, im_e = ctx.saved_tensors
+        if ctx.use_triton:
+            try:
+                grads = _RotatEScoreQueryEntities._backward_triton(
+                    re_q, im_q, re_e, im_e, grad_scores
+                )
+                return (*grads, None)
+            except Exception as exc:
+                _RotatEScoreQueryEntities._disable_triton(exc)
+                # Recompute with chunked path (same inputs / grad_scores).
+                chunk = _RotatEScoreQueryEntities._chunk_size(
+                    re_q.size(0), re_q.size(1), re_e.size(0),
+                )
+                grads = _RotatEScoreQueryEntities._backward_chunked(
+                    re_q, im_q, re_e, im_e, grad_scores, chunk,
+                )
+                return (*grads, None)
+        grads = _RotatEScoreQueryEntities._backward_chunked(
+            re_q, im_q, re_e, im_e, grad_scores, ctx.chunk
+        )
+        return (*grads, None)
 
 
 KGE_SCORERS = {
@@ -230,13 +619,15 @@ KGE_SCORERS = {
 
 class KGEModel(nn.Module):
     def __init__(self, model_name, nentity, nrelation, dim, margin_gamma, 
-                 double_entity_embedding=False, double_relation_embedding=False):
+                 double_entity_embedding=False, double_relation_embedding=False,
+                 score_mode='distance'):
         super(KGEModel, self).__init__()
         self.model_name = model_name
         self.nentity = nentity
         self.nrelation = nrelation
         self.dim = dim
         self.epsilon = 2.0
+        self.score_mode = score_mode
         
         self.margin_gamma = nn.Parameter(
             torch.Tensor([margin_gamma]), 
@@ -275,9 +666,11 @@ class KGEModel(nn.Module):
             raise ValueError('model %s not supported' % model_name)
 
         if model_name == 'RotatE':
+            # KGAU uses cosine; NegSamp/AllNeg keep RotatE distance.
             self.kge_scorer = RotatE(
                 embedding_range=self.embedding_range,
                 margin_gamma=self.margin_gamma,
+                score_mode=score_mode,
             )
         else:
             self.kge_scorer = KGE_SCORERS[model_name]()

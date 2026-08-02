@@ -341,12 +341,22 @@ class AllNegStrategy(KGEStrategy):
             subsampling_weight = subsampling_weight.cuda()
 
         all_scores = self._score_all_entities(model, positive_sample, mode)
-        positive_score, negative_score = self._split_scores(
-            all_scores, positive_sample, label_matrix, mode
-        )
         # Pairwise losses use pos/neg; BCE/CE use full scores + labels
         # (one-hot for 1vsAll, multi-hot for KvsAll).
         labels = self._labels_for_loss(all_scores, positive_sample, label_matrix, mode)
+        loss_name = getattr(self.args, 'loss', '')
+        # BCE/CE already consume [B, E] scores+labels — skip materializing
+        # [B, E-1] negatives (and KvsAll's Python pad loop).
+        if loss_name in ('bce', 'ce'):
+            return (
+                None, None, subsampling_weight,
+                positive_sample, mode, None, all_scores, labels,
+            )
+
+        # Pairwise path: use expanded labels (not compact dataloader indices).
+        positive_score, negative_score = self._split_scores(
+            all_scores, positive_sample, labels, mode
+        )
         negative_weights = self.weight_negatives(negative_score)
         return (
             positive_score, negative_score, subsampling_weight,
@@ -372,21 +382,30 @@ class OneVsAll(AllNegStrategy):
     def _dataset_class(self):
         return OneVsAllTrainDataset
 
+    @staticmethod
+    def _positive_indices(positive_sample, label_matrix, mode):
+        # Dataset may pass dense one-hot [B, E] or compact target indices [B].
+        if label_matrix is not None and label_matrix.dim() == 1:
+            return label_matrix.long()
+        if mode == 'tail-batch':
+            return positive_sample[:, 2].long()
+        return positive_sample[:, 0].long()
+
     def _labels_for_loss(self, all_scores, positive_sample, label_matrix, mode):
         loss_name = getattr(self.args, 'loss', '')
+        pos_idx = self._positive_indices(positive_sample, label_matrix, mode)
         # CE single-label prefers class indices; BCE uses one-hot matrix.
         if loss_name == 'ce':
-            if mode == 'tail-batch':
-                return positive_sample[:, 2].long()
-            return positive_sample[:, 0].long()
-        return label_matrix
+            return pos_idx
+        if label_matrix is not None and label_matrix.dim() == 2:
+            return label_matrix
+        labels = all_scores.new_zeros(all_scores.shape)
+        labels.scatter_(1, pos_idx.view(-1, 1), 1.0)
+        return labels
 
     def _split_scores(self, all_scores, positive_sample, label_matrix, mode):
         batch_size = all_scores.size(0)
-        if mode == 'tail-batch':
-            pos_idx = positive_sample[:, 2]
-        else:
-            pos_idx = positive_sample[:, 0]
+        pos_idx = self._positive_indices(positive_sample, label_matrix, mode)
 
         positive_score = all_scores.gather(1, pos_idx.view(-1, 1))
         mask = torch.ones_like(all_scores, dtype=torch.bool)
@@ -410,11 +429,23 @@ class KvsAll(AllNegStrategy):
         return KvsAllTrainDataset
 
     def _labels_for_loss(self, all_scores, positive_sample, label_matrix, mode):
-        # Always multi-hot for KvsAll (BCE and multi-label CE).
-        return label_matrix
+        # Dense multi-hot [B, E], or compact padded indices [B, K] with -1 pad.
+        if label_matrix.dim() == 2 and label_matrix.dtype in (
+            torch.float16, torch.float32, torch.float64,
+        ):
+            return label_matrix
+        labels = all_scores.new_zeros(all_scores.shape)
+        valid = label_matrix >= 0
+        if valid.any():
+            rows = (
+                torch.arange(label_matrix.size(0), device=label_matrix.device)
+                .unsqueeze(1)
+                .expand_as(label_matrix)
+            )
+            labels[rows[valid], label_matrix[valid].long()] = 1.0
+        return labels
 
     def _split_scores(self, all_scores, positive_sample, label_matrix, mode):
-        batch_size = all_scores.size(0)
         if mode == 'tail-batch':
             pos_idx = positive_sample[:, 2]
         else:
@@ -426,15 +457,24 @@ class KvsAll(AllNegStrategy):
             neg_mask = torch.ones_like(all_scores, dtype=torch.bool)
             neg_mask.scatter_(1, pos_idx.view(-1, 1), False)
 
+        # Vectorized pad: gather with a dense index matrix instead of a
+        # Python row loop (only used for pairwise losses; BCE/CE skip this).
         neg_counts = neg_mask.sum(dim=1)
         max_neg = int(neg_counts.max().item())
-        negative_score = all_scores.new_full((batch_size, max_neg), 0.0)
-        for i in range(batch_size):
-            row = all_scores[i][neg_mask[i]]
-            negative_score[i, : row.numel()] = row
-            if row.numel() < max_neg:
-                fill = row.mean() if row.numel() > 0 else all_scores.new_zeros(())
-                negative_score[i, row.numel():] = fill
+        # Descending sort puts True(1) first; take the leading max_neg cols.
+        neg_idx = neg_mask.to(torch.int8).argsort(dim=1, descending=True)[:, :max_neg]
+        negative_score = all_scores.gather(1, neg_idx)
+        # Rows with fewer than max_neg true negatives: fill padded slots with
+        # that row's mean over true negatives (matches previous semantics).
+        pad_mask = (
+            torch.arange(max_neg, device=all_scores.device).unsqueeze(0)
+            >= neg_counts.unsqueeze(1)
+        )
+        if pad_mask.any():
+            safe_counts = neg_counts.clamp_min(1).to(all_scores.dtype)
+            row_sum = (all_scores * neg_mask.to(all_scores.dtype)).sum(dim=1)
+            fill = (row_sum / safe_counts).unsqueeze(1).expand_as(negative_score)
+            negative_score = torch.where(pad_mask, fill, negative_score)
         return positive_score, negative_score
 
     def prepare_multilabel_batch(self, batch, model):
@@ -446,7 +486,8 @@ class KvsAll(AllNegStrategy):
             subsampling_weight = subsampling_weight.cuda()
 
         all_scores = self._score_all_entities(model, positive_sample, mode)
-        return all_scores, label_matrix, subsampling_weight, positive_sample, mode
+        labels = self._labels_for_loss(all_scores, positive_sample, label_matrix, mode)
+        return all_scores, labels, subsampling_weight, positive_sample, mode
 
 
 # ---------------------------------------------------------------------------
@@ -629,24 +670,34 @@ class _AllNegTrainDatasetBase(Dataset):
 
 class OneVsAllTrainDataset(_AllNegTrainDatasetBase):
     def _label_vector(self, head, relation, tail):
-        labels = torch.zeros(self.nentity, dtype=torch.float32)
+        # Compact target index [ ]; one-hot is built on-device in OneVsAll.
         if self.mode == 'tail-batch':
-            labels[tail] = 1.0
-        else:
-            labels[head] = 1.0
-        return labels
+            return torch.tensor(tail, dtype=torch.long)
+        return torch.tensor(head, dtype=torch.long)
 
 
 class KvsAllTrainDataset(_AllNegTrainDatasetBase):
     def _label_vector(self, head, relation, tail):
-        labels = torch.zeros(self.nentity, dtype=torch.float32)
+        # Compact positive entity ids; multi-hot is built on-device in KvsAll.
         if self.mode == 'tail-batch':
-            for e in self.true_tail[(head, relation)]:
-                labels[int(e)] = 1.0
+            ents = self.true_tail[(head, relation)]
         else:
-            for e in self.true_head[(relation, tail)]:
-                labels[int(e)] = 1.0
-        return labels
+            ents = self.true_head[(relation, tail)]
+        return torch.tensor([int(e) for e in ents], dtype=torch.long)
+
+    @staticmethod
+    def collate_fn(data):
+        positive_sample = torch.stack([_[0] for _ in data], dim=0)
+        pos_lists = [_[1] for _ in data]
+        max_k = max((int(x.numel()) for x in pos_lists), default=0)
+        # Pad with -1 so KvsAll._labels_for_loss can scatter valid ids only.
+        label_idx = torch.full((len(data), max(max_k, 1)), -1, dtype=torch.long)
+        for i, ids in enumerate(pos_lists):
+            if ids.numel() > 0:
+                label_idx[i, : ids.numel()] = ids
+        subsample_weight = torch.cat([_[2] for _ in data], dim=0)
+        mode = data[0][3]
+        return positive_sample, label_idx, subsample_weight, mode
 
 
 # ---------------------------------------------------------------------------

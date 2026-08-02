@@ -7,7 +7,7 @@ import random
 import numpy as np
 import torch
 
-from model import KGEModel
+from model import KGEModel, resolve_rotate_score_mode
 
 from loss import UniGammaController, build_training_optimizer, is_learnable_kgau_gammas, set_optimizer_learning_rates, update_kgau_gamma_schedule
 from strategy import get_strategy, resolve_strategy_name
@@ -280,10 +280,13 @@ def main(args):
         dim=args.dim,
         margin_gamma=args.margin_gamma,
         double_entity_embedding=args.double_entity_embedding,
-        double_relation_embedding=args.double_relation_embedding
+        double_relation_embedding=args.double_relation_embedding,
+        score_mode=resolve_rotate_score_mode(args) if args.model == 'RotatE' else 'distance',
     )
     
     logging.info('Model Parameter Configuration:')
+    if args.model == 'RotatE':
+        logging.info('RotatE score_mode = %s' % kge_model.score_mode)
     for name, param in kge_model.named_parameters():
         logging.info('Parameter %s: %s, require_grad = %s' % (name, str(param.size()), str(param.requires_grad)))
 
