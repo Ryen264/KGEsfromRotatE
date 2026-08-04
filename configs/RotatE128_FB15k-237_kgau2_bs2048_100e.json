@@ -1,0 +1,21 @@
+{
+  "model": "RotatE",
+  "data_path": "data/fb15k_237",
+  "loss": "kgau",
+  "strategy": "kgau",
+  "dim": 128,
+  "batch_size": 2048,
+  "margin_gamma": 9.0,
+  "learning_rate": 0.00005,
+  "epochs": 100,
+  "test_batch_size": 16,
+  "double_entity_embedding": true,
+  "double_relation_embedding": false,
+  "regularization_coeff": 0.0,
+  "regularization_p": 3,
+  "uniform_t": 2,
+  "uniform_pair_chunk_size": 256,
+  "uniform_gamma_q": 1.0,
+  "uniform_gamma_y": 1.0,
+  "uniform_gamma_e": 1.0
+}
