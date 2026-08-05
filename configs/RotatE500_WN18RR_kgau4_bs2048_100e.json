@@ -4,7 +4,7 @@
   "loss": "kgau",
   "strategy": "kgau",
   "dim": 500,
-  "batch_size": 1024,
+  "batch_size": 2048,
   "margin_gamma": 6.0,
   "learning_rate": 0.00005,
   "epochs": 100,
