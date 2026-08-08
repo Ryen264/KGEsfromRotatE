@@ -53,7 +53,6 @@ Ngoài cài đặt khung huấn luyện KGAU cho ComplEx và RotatE, mã nguồn
 KGEsfromRotatE/
 ├── codes/                 # Huấn luyện và đánh giá chính
 │   ├── run.py             # CLI: đọc args, vòng lặp train/valid/test
-│   ├── model.py           # KGEModel, ComplEx, RotatE
 │   ├── loss.py            # Các hàm mất mát (gồm hàm mất mát KGAU)
 │   ├── strategy.py        # Chiến lược NegSamp / AllNeg / KGAU
 │   ├── dataloader.py      # Dataset / DataLoader
@@ -153,7 +152,7 @@ CUDA_VISIBLE_DEVICES=0 python -u codes/run.py --do_train \
   -n 256 -b 1024 -d 1000 \
   -g 24.0 -a 1.0 -adv \
   -lr 0.0001 --epochs 150 \
-  -save models/RotatE_fb15k_0 --test_batch_size 16 -de
+  --test_batch_size 16 -de
 ```
 
 Ví dụ ComplEx + KGAU trên WN18RR:
@@ -167,8 +166,7 @@ CUDA_VISIBLE_DEVICES=0 python -u codes/run.py --do_train --cuda \
   -d 64 -b 512 -g 200.0 -lr 0.002 --epochs 100 \
   --uniform_t 4 --uniform_pair_chunk_size 256 \
   --uniform-gamma-q 1.0 --uniform-gamma-y 1.0 --uniform-gamma-e 1.0 \
-  -r 5e-6 -rp 3 \
-  -save models/ComplEx64_wn18rr_kgau4
+  -r 5e-6 -rp 3
 ```
 
 Xem đầy đủ tham số trong `codes/run.py` (`parse_args`).
@@ -184,7 +182,7 @@ bash run.sh train RotatE fb15k 0 0 1024 256 1000 24.0 1.0 0.0001 150 16 -de
 ## Kiểm thử từ checkpoint
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -u codes/run.py --do_test --cuda -init models/RotatE_fb15k_0
+CUDA_VISIBLE_DEVICES=0 python -u codes/run.py --do_test --cuda
 ```
 
 Checkpoint tốt nhất theo chỉ số kiểm định (best-valid) được ưu tiên khi đánh giá cuối (xem log `Test checkpoint: best-valid`).
