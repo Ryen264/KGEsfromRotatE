@@ -157,7 +157,7 @@ if __name__ == "__main__":
     #     Point(name="KGAU (d=64)",     dim=64,     peak_gpu_memory=0.62, time_per_epoch=27.70)
     # ]
 
-    loss_points = [
+    wn18rr_loss_points = [
         Point(name="Uniform (BCE, d=500)",      dim=500, peak_gpu_memory=1.85, time_per_epoch=90.0,  mrr=0.4383),
         Point(name="Bernoulli (BCE, d=500)",    dim=500, peak_gpu_memory=1.85, time_per_epoch=92.0,  mrr=0.4341),
         Point(name="SelfAdv (SANS, d=500)",     dim=500, peak_gpu_memory=1.85, time_per_epoch=92.0,  mrr=0.4433),
@@ -166,10 +166,32 @@ if __name__ == "__main__":
         Point(name="KGAU (d=500)",              dim=500, peak_gpu_memory=0.81, time_per_epoch=7.11,  mrr=0.4560),
         Point(name="KGAU (d=64)",               dim=64,  peak_gpu_memory=0.13, time_per_epoch=2.49,  mrr=0.4643),
     ]
+
+    fb15k237_loss_points = [
+        Point(name="Uniform (BCE, d=1000)",     dim=1000, peak_gpu_memory=5.37, time_per_epoch=104.0, mrr=0.2689),
+        Point(name="Bernoulli (BCE, d=1000)",   dim=1000, peak_gpu_memory=5.37, time_per_epoch=102.0, mrr=0.2582),
+        Point(name="SelfAdv (SANS, d=1000)",    dim=1000, peak_gpu_memory=5.37, time_per_epoch=104.0, mrr=0.3184),
+        Point(name="1vsAll (BCE, d=1000)",      dim=1000, peak_gpu_memory=0.93, time_per_epoch=72.0,  mrr=0.2680),
+        Point(name="KvsAll (BCE, d=1000)",      dim=1000, peak_gpu_memory=0.81, time_per_epoch=61.0,  mrr=0.2715),
+        Point(name="KGAU (d=1000)",             dim=1000, peak_gpu_memory=0.68, time_per_epoch=46.46, mrr=0.3185),
+        Point(name="KGAU (d=128)",              dim=128,  peak_gpu_memory=0.13, time_per_epoch=32.16, mrr=0.3080),
+    ]
     
     draw_chart(
-        points=loss_points,
-        title="Peak GPU Memory and Time per Epoch of ComplEx on different Training Strategies",
+        points=wn18rr_loss_points,
+        title="Peak GPU Memory and Time per Epoch of KGAU on WN18RR",
+        x_title="Training Strategies",
+        left_y_axis="peak_gpu_memory", left_y_color="blue", left_y_title="Peak GPU Memory (GB)",
+        right_y_axis="time_per_epoch", right_y_color="green", right_y_title="Time per Epoch (s)",
+        output_dir="visualization/outputs/charts",
+        show_bar_values=True, show_line_values=True, show_line=True,
+        line_y_axis="mrr", line_y_color="darkred", line_y_title="MRR",
+        legend_loc="lower left"
+    )
+    
+    draw_chart(
+        points=fb15k237_loss_points,
+        title="Peak GPU Memory and Time per Epoch of KGAU on FB15K-237",
         x_title="Training Strategies",
         left_y_axis="peak_gpu_memory", left_y_color="blue", left_y_title="Peak GPU Memory (GB)",
         right_y_axis="time_per_epoch", right_y_color="green", right_y_title="Time per Epoch (s)",

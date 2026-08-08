@@ -69,9 +69,35 @@ def find_best_valid(history, valid_metric='MRR'):
     return history['epochs'][best_idx], metric_values[best_idx]
 
 
-def resolve_tsne_milestone_epochs(num_epochs):
-    """Epochs visualized during training: first and last."""
-    return {1, num_epochs}
+def resolve_tsne_milestone_epochs(num_epochs, explicit_epochs=None):
+    """
+    Epochs at which t-SNE snapshots are saved.
+
+    Default: first, midpoint, and last epoch.
+    For a 200-epoch run that yields {1, 100, 200}.
+    """
+    num_epochs = int(num_epochs)
+    if num_epochs < 1:
+        raise ValueError('num_epochs must be >= 1, got {}'.format(num_epochs))
+
+    if explicit_epochs is not None:
+        milestones = set()
+        for epoch in explicit_epochs:
+            epoch = int(epoch)
+            if epoch < 1 or epoch > num_epochs:
+                raise ValueError(
+                    't-SNE epoch {} is outside [1, {}]'.format(epoch, num_epochs)
+                )
+            milestones.add(epoch)
+        if not milestones:
+            raise ValueError('explicit_epochs must contain at least one epoch')
+        return milestones
+
+    milestones = {1, num_epochs}
+    if num_epochs > 2:
+        mid = num_epochs // 2
+        milestones.add(mid)
+    return milestones
 
 
 def clone_model_state(model):
@@ -155,8 +181,8 @@ def build_results_report(
     return '\n'.join(lines) + '\n'
 
 
-def write_results_report(output_dir, report_text, loss_name):
-    results_path = os.path.join(output_dir, f'results_{loss_name}_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.txt')
+def write_results_report(output_dir, report_text, loss_name=None):
+    results_path = os.path.join(output_dir, 'results.txt')
     with open(results_path, 'w') as fout:
         fout.write(report_text)
     print('Results saved to {}'.format(results_path))
@@ -513,6 +539,7 @@ def generate_tsne_visualization(
         facecolor='white',
         fontsize=10,
     )
+    ax.set_title('t-SNE target embeddings @ epoch {}'.format(epoch))
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_xlabel('')
@@ -525,10 +552,9 @@ def generate_tsne_visualization(
     fig.tight_layout()
 
     os.makedirs(output_dir, exist_ok=True)
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     save_path = os.path.join(
         output_dir,
-        'tsne_epoch_{}_{}_{}.png'.format(epoch, config_stem, timestamp),
+        'tsne_epoch_{:04d}_{}.png'.format(epoch, config_stem),
     )
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -558,7 +584,13 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
     best_epoch = None
     best_valid_value = float('-inf')
     best_model_state = None
-    milestone_epochs = resolve_tsne_milestone_epochs(num_epochs) if tsne_config is not None else set()
+    if tsne_config is not None:
+        if tsne_config.get('milestone_epochs') is not None:
+            milestone_epochs = set(int(e) for e in tsne_config['milestone_epochs'])
+        else:
+            milestone_epochs = resolve_tsne_milestone_epochs(num_epochs)
+    else:
+        milestone_epochs = set()
 
     epoch_bar = tqdm(
         range(1, num_epochs + 1),
@@ -647,19 +679,9 @@ def train_and_collect_history(args, num_epochs, valid_metric='MRR', uniform_sets
         epoch_bar.set_postfix_str(postfix, refresh=True)
 
     # Test / reports use best-valid weights, not the last training epoch.
+    # t-SNE snapshots stay at fixed milestones only (no extra best-valid figure).
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
-        if tsne_config is not None and best_epoch is not None and best_epoch not in milestone_epochs:
-            generate_tsne_visualization(
-                model=model,
-                triples=valid_triples,
-                epoch=best_epoch,
-                target_epochs={best_epoch},
-                max_queries=tsne_config['max_queries'],
-                max_tails_per_query=tsne_config['max_tails_per_query'],
-                output_dir=tsne_config['output_dir'],
-                config_stem=tsne_config['config_stem'],
-            )
         print(
             'Restored best model at epoch {} ({}={:.4f}) for evaluation'.format(
                 best_epoch, valid_metric, best_valid_value,
@@ -720,7 +742,7 @@ def visualize_training(
     config_path,
     valid_metric='MRR',
     gpu=None,
-    output_dir='visualization/outputs/charts',
+    output_dir=None,
     uniform_sets=None,
     tsne_config=None,
 ):
@@ -733,6 +755,19 @@ def visualize_training(
         gpu = resolve_default_gpu()
     configure_cuda_device(gpu)
 
+    if tsne_config is not None:
+        tsne_config = dict(tsne_config)
+        if tsne_config.get('milestone_epochs') is None:
+            tsne_config['milestone_epochs'] = sorted(
+                resolve_tsne_milestone_epochs(num_epochs)
+            )
+        else:
+            tsne_config['milestone_epochs'] = sorted(
+                resolve_tsne_milestone_epochs(
+                    num_epochs, explicit_epochs=tsne_config['milestone_epochs']
+                )
+            )
+
     print('Config: {}'.format(config_path))
     print('Model: {}  Loss: {}  Dataset: {}'.format(
         config.get('model'), getattr(args, 'loss', 'sans'), config.get('data_path')
@@ -740,18 +775,22 @@ def visualize_training(
     print('Training for {} epochs (from config)'.format(num_epochs))
     print('Uniform sets: {}'.format(', '.join(uniform_sets)))
     if tsne_config is not None:
-        print('t-SNE snapshots at epochs: 1, best valid, {}'.format(num_epochs))
+        print(
+            't-SNE snapshots at epochs: {}'.format(
+                ', '.join(str(e) for e in tsne_config['milestone_epochs'])
+            )
+        )
         print('t-SNE max queries: {}'.format(tsne_config['max_queries']))
         print('t-SNE max tails per query: {}'.format(tsne_config['max_tails_per_query']))
 
     if output_dir is None:
-        output_dir = 'visualization/outputs/charts'
-    output_dir = resolve_path(output_dir)
+        output_dir = build_output_dir(config_path)
+    else:
+        output_dir = resolve_path(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     print('Output dir: {}'.format(output_dir))
 
     if tsne_config is not None:
-        tsne_config = dict(tsne_config)
         tsne_config['output_dir'] = output_dir
         tsne_config['config_stem'] = os.path.splitext(os.path.basename(config_path))[0]
 
@@ -783,6 +822,7 @@ def visualize_training(
 
     return history, model, timing
 
+
 def parse_cli():
     parser = argparse.ArgumentParser(
         description='Train a KGE model and save t-SNE embedding snapshots.'
@@ -795,6 +835,26 @@ def parse_cli():
     )
     parser.add_argument('--valid-metric', default='MRR', help='Validation metric for learning curve')
     parser.add_argument(
+        '--gpu', type=int, default=0,
+        help='CUDA device index among visible GPUs (default: 0)',
+    )
+    parser.add_argument(
+        '--output-dir', default=None,
+        help='Directory to save figures (default: visualization/outputs/<config>_<timestamp>)',
+    )
+    parser.add_argument(
+        '--tsne-epochs', nargs='+', type=int, default=None,
+        help='Epochs for t-SNE snapshots (default: 1, mid, last; e.g. 1 100 200 for 200e)',
+    )
+    parser.add_argument(
+        '--tsne-max-queries', type=int, default=10,
+        help='Number of (head, relation) queries in each t-SNE plot (default: 10)',
+    )
+    parser.add_argument(
+        '--tsne-max-tails', type=int, default=30,
+        help='Top-k tails per query in each t-SNE plot (default: 30)',
+    )
+    parser.add_argument(
         '--uniform-sets', nargs='+', default=None,
         choices=list(UNIFORM_SET_KEYS),
         help='Uniformity embedding pools to track during training (default: query target entity)',
@@ -803,22 +863,18 @@ def parse_cli():
 
 
 def main():
-    tsne_max_queries = 10
-    tsne_max_tails_per_query = 30
-    output_dir = 'visualization/outputs/charts'
-    gpu = resolve_default_gpu()
-
     cli = parse_cli()
     tsne_params = {
-        'max_queries': tsne_max_queries,
-        'max_tails_per_query': tsne_max_tails_per_query,
+        'max_queries': cli.tsne_max_queries,
+        'max_tails_per_query': cli.tsne_max_tails,
+        'milestone_epochs': cli.tsne_epochs,
     }
 
     visualize_training(
         cli.config,
         valid_metric=cli.valid_metric,
-        gpu=gpu,
-        output_dir=output_dir,
+        gpu=cli.gpu,
+        output_dir=cli.output_dir,
         uniform_sets=cli.uniform_sets,
         tsne_config=tsne_params,
     )
