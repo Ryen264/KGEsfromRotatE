@@ -369,6 +369,7 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
 
     align_margin = getattr(args, 'align_margin', 0.0)
+    align_alpha = getattr(args, 'align_alpha', 2.0)
     uniform_margin = getattr(args, 'uniform_margin', 2.0)
     uniform_t = getattr(args, 'uniform_t', 4)
 
@@ -377,7 +378,9 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
             query_e, target_e, align_margin=align_margin,
         ).item()
     else:
-        align_loss = loss_fn.alignment(query_e, target_e).item()
+        align_loss = loss_fn.alignment(
+            query_e, target_e, align_alpha=align_alpha,
+        ).item()
 
     uniform_components = {}
     embeddings = {

@@ -217,10 +217,12 @@ def build_results_report(
     loss_name_key = getattr(args, 'loss', '') if args is not None else ''
     if loss_name_key in ('kgau', 'kgmau', 'kgmamu') or str(strategy_name).lower() == 'kgau':
         uniform_t = getattr(args, 'uniform_t', DEFAULT_UNIFORM_T) if args is not None else DEFAULT_UNIFORM_T
+        align_alpha = getattr(args, 'align_alpha', 2.0) if args is not None else 2.0
         gamma_q = getattr(args, 'uniform_gamma_q', 0.0) if args is not None else 0.0
         gamma_y = getattr(args, 'uniform_gamma_y', 0.0) if args is not None else 0.0
         gamma_e = getattr(args, 'uniform_gamma_e', 0.0) if args is not None else 0.0
         lines += [
+            'Align alpha: {}'.format(align_alpha),
             'Uniform t: {}'.format(uniform_t),
             '(Gamma Query, Gamma Target, Gamma Entity): ({}, {}, {})'.format(
                 gamma_q, gamma_y, gamma_e,
@@ -469,6 +471,7 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
 
     align_margin = getattr(args, 'align_margin', 0.0)
+    align_alpha = getattr(args, 'align_alpha', 2.0)
     uniform_margin = getattr(args, 'uniform_margin', 2.0)
     uniform_t = DEFAULT_UNIFORM_T
 
@@ -477,7 +480,9 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
             query_e, target_e, align_margin=align_margin,
         ).item()
     else:
-        align_loss = loss_fn.alignment(query_e, target_e).item()
+        align_loss = loss_fn.alignment(
+            query_e, target_e, align_alpha=align_alpha,
+        ).item()
 
     uniform_components = {}
     embeddings = {

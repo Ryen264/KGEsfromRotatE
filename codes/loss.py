@@ -554,7 +554,7 @@ class KGAULoss(KGELoss):
     '''
     KGAU Loss - Alignment-Uniformity Loss for Knowledge Graph Embeddings
     L = alignment_loss + Avg(uniformity_loss)_terms + regularization
-        alignment_loss = L2-distance(query_e, target_e)^2.mean()
+        alignment_loss = L2-distance(query_e, target_e)^align_alpha.mean()  (default alpha=2)
         uniformity_loss = log(exp(-uniform_t * L2-distance(x, x')^2).mean())
 
     Uniformity uses chunked pairwise reduction (exact same i<j pairs as pdist)
@@ -562,9 +562,9 @@ class KGAULoss(KGELoss):
     '''
     
     @staticmethod
-    def alignment(x, y):
+    def alignment(x, y, align_alpha=2.0):
         x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
-        return (x - y).norm(p=2, dim=1).pow(2).mean()
+        return (x - y).norm(p=2, dim=1).pow(align_alpha).mean()
 
     @staticmethod
     def uniformity(x, uniform_t=4, pair_chunk_size=0):
@@ -613,10 +613,11 @@ class KGAULoss(KGELoss):
 
     def calculate_loss(self, head, relation, tail, model, mode):
         uniform_t = getattr(self.args, 'uniform_t', 4)
+        align_alpha = getattr(self.args, 'align_alpha', 2.0)
 
         query_e = model.query_encoder(head, relation, tail, mode=mode)
         target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
-        align_loss = self.alignment(query_e, target_e)
+        align_loss = self.alignment(query_e, target_e, align_alpha=align_alpha)
 
         uniform_loss_sum, uniform_count, uniform_log = self._compute_uniform_terms(
             head, relation, tail, query_e, target_e, model, uniform_t,

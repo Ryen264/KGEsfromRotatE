@@ -84,6 +84,8 @@ def parse_args(args=None):
 
     parser.add_argument('--align_margin', default=0.0, type=float,
                         help='Margin m for KGmAU/KGmAmU alignment: ReLU(d^2 - m); keep small in [0, 4]')
+    parser.add_argument('--align_alpha', default=2.0, type=float,
+                        help='KGAU alignment exponent: E[||x-y||_2^alpha] (default 2)')
     parser.add_argument('--uniform_margin', default=2.0, type=float,
                         help='Margin m_u for KGmAmU soft-margin AU: log E[exp(t*ReLU(m_u-d^2))]; in (0, 4]')
     parser.add_argument('--uniform_t', default=4, type=float,
