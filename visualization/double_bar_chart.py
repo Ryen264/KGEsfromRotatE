@@ -38,7 +38,7 @@ def draw_chart(points: list[Point],
     right_y_axis: str, right_y_color: str, right_y_title: str,
     output_dir: str="visualization/outputs/charts",
     show_bar_values: bool=True, show_line_values: bool=True,
-    legend_loc: str="lower left",
+    legend_loc: str="upper right",
     show_line: bool=False,
     line_y_axis: str="", line_y_color: str="red", line_y_title: str="",
     line_on: str="left"):
@@ -177,26 +177,29 @@ if __name__ == "__main__":
         Point(name="KGAU (d=128)",              dim=128,  peak_gpu_memory=0.13, time_per_epoch=32.16, mrr=0.3080),
     ]
     
+    # Blues:  royalblue > #3568E8 > #2A5DF0 > #1F52F7 > blue
+    # Greens: green > #008020 > #008040 > #008060 > teal
+
     draw_chart(
         points=wn18rr_loss_points,
         title="Peak GPU Memory and Time per Epoch of KGAU on WN18RR",
         x_title="Training Strategies",
-        left_y_axis="peak_gpu_memory", left_y_color="blue", left_y_title="Peak GPU Memory (GB)",
-        right_y_axis="time_per_epoch", right_y_color="green", right_y_title="Time per Epoch (s)",
+        left_y_axis="peak_gpu_memory", left_y_color="#1F52F7", left_y_title="Peak GPU Memory (GB)",
+        right_y_axis="time_per_epoch", right_y_color="#008020", right_y_title="Time per Epoch (s)",
         output_dir="visualization/outputs/charts",
         show_bar_values=True, show_line_values=True, show_line=True,
-        line_y_axis="mrr", line_y_color="darkred", line_y_title="MRR",
-        legend_loc="lower left"
+        line_y_axis="mrr", line_y_color="crimson", line_y_title="MRR",
+        legend_loc="upper right"
     )
     
     draw_chart(
         points=fb15k237_loss_points,
         title="Peak GPU Memory and Time per Epoch of KGAU on FB15K-237",
         x_title="Training Strategies",
-        left_y_axis="peak_gpu_memory", left_y_color="blue", left_y_title="Peak GPU Memory (GB)",
-        right_y_axis="time_per_epoch", right_y_color="green", right_y_title="Time per Epoch (s)",
+        left_y_axis="peak_gpu_memory", left_y_color="#1F52F7", left_y_title="Peak GPU Memory (GB)",
+        right_y_axis="time_per_epoch", right_y_color="#008020", right_y_title="Time per Epoch (s)",
         output_dir="visualization/outputs/charts",
         show_bar_values=True, show_line_values=True, show_line=True,
-        line_y_axis="mrr", line_y_color="darkred", line_y_title="MRR",
-        legend_loc="lower left"
+        line_y_axis="mrr", line_y_color="crimson", line_y_title="MRR",
+        legend_loc="upper right"
     )

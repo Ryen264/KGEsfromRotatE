@@ -87,22 +87,40 @@ def draw_chart(points: list[GammaPoint],
 if __name__ == "__main__":
     # Example dataset mapping all 8 possible combinations of your uniformity gammas
     # Replace these dummy MRR values with your actual experiment log metrics
+    # gamma_experimental_results = [
+    #     # Case (Query=0, Target=0)
+    #     GammaPoint(name="0", uniform_gamma_q=0, uniform_gamma_y=0, uniform_gamma_e=0, MRR=0.0088),
+    #     GammaPoint(name="1", uniform_gamma_q=0, uniform_gamma_y=0, uniform_gamma_e=1, MRR=0.4650),
+        
+    #     # Case (Query=0, Target=1)
+    #     GammaPoint(name="0", uniform_gamma_q=0, uniform_gamma_y=1, uniform_gamma_e=0, MRR=0.4551),
+    #     GammaPoint(name="1", uniform_gamma_q=0, uniform_gamma_y=1, uniform_gamma_e=1, MRR=0.4636),
+        
+    #     # Case (Query=1, Target=0)
+    #     GammaPoint(name="0", uniform_gamma_q=1, uniform_gamma_y=0, uniform_gamma_e=0, MRR=0.4573),
+    #     GammaPoint(name="1", uniform_gamma_q=1, uniform_gamma_y=0, uniform_gamma_e=1, MRR=0.4642),
+
+    #     # Case (Query=1, Target=1)
+    #     GammaPoint(name="0", uniform_gamma_q=1, uniform_gamma_y=1, uniform_gamma_e=0, MRR=0.4555),
+    #     GammaPoint(name="1", uniform_gamma_q=1, uniform_gamma_y=1, uniform_gamma_e=1, MRR=0.4658),
+    # ]
+
     gamma_experimental_results = [
         # Case (Query=0, Target=0)
-        GammaPoint(name="0", uniform_gamma_q=0, uniform_gamma_y=0, uniform_gamma_e=0, MRR=0.0088),
-        GammaPoint(name="1", uniform_gamma_q=0, uniform_gamma_y=0, uniform_gamma_e=1, MRR=0.4650),
+        GammaPoint(name="0", uniform_gamma_q=0, uniform_gamma_y=0, uniform_gamma_e=0, MRR=0.4287),
+        GammaPoint(name="1", uniform_gamma_q=0, uniform_gamma_y=0, uniform_gamma_e=1, MRR=0.4640),
         
         # Case (Query=0, Target=1)
-        GammaPoint(name="0", uniform_gamma_q=0, uniform_gamma_y=1, uniform_gamma_e=0, MRR=0.4551),
-        GammaPoint(name="1", uniform_gamma_q=0, uniform_gamma_y=1, uniform_gamma_e=1, MRR=0.4636),
+        GammaPoint(name="0", uniform_gamma_q=0, uniform_gamma_y=1, uniform_gamma_e=0, MRR=0.4520),
+        GammaPoint(name="1", uniform_gamma_q=0, uniform_gamma_y=1, uniform_gamma_e=1, MRR=0.4609),
         
         # Case (Query=1, Target=0)
-        GammaPoint(name="0", uniform_gamma_q=1, uniform_gamma_y=0, uniform_gamma_e=0, MRR=0.4573),
-        GammaPoint(name="1", uniform_gamma_q=1, uniform_gamma_y=0, uniform_gamma_e=1, MRR=0.4642),
+        GammaPoint(name="0", uniform_gamma_q=1, uniform_gamma_y=0, uniform_gamma_e=0, MRR=0.4558),
+        GammaPoint(name="1", uniform_gamma_q=1, uniform_gamma_y=0, uniform_gamma_e=1, MRR=0.4629),
 
         # Case (Query=1, Target=1)
-        GammaPoint(name="0", uniform_gamma_q=1, uniform_gamma_y=1, uniform_gamma_e=0, MRR=0.4555),
-        GammaPoint(name="1", uniform_gamma_q=1, uniform_gamma_y=1, uniform_gamma_e=1, MRR=0.4658),
+        GammaPoint(name="0", uniform_gamma_q=1, uniform_gamma_y=1, uniform_gamma_e=0, MRR=0.4610),
+        GammaPoint(name="1", uniform_gamma_q=1, uniform_gamma_y=1, uniform_gamma_e=1, MRR=0.4639),
     ]
     
     # Define the 4 target combinations of (uniform_gamma_q, uniform_gamma_y)
