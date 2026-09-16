@@ -21,6 +21,7 @@ class Point:
     batch_size: int = 0
     negative_sample_size: int = 0
     uniform_t: int = 0
+    align_alpha: float = 0.0
     peak_gpu_memory: float = 0.0
     time_per_epoch: float = 0.0
 
@@ -36,26 +37,70 @@ def build_output_path(output_dir, title):
     return os.path.join(resolve_path(output_dir), filename)
 
 
-# Offset directions for labels when multiple points share the same coordinates.
+# Offset directions for labels when multiple points collide (exact or nearby).
+# Prefer opposing left/right and above/below so adjacent labels stay readable.
 LABEL_PLACEMENTS = [
-    {'xytext': (10, 10), 'ha': 'left', 'va': 'bottom'},
-    {'xytext': (-10, 10), 'ha': 'right', 'va': 'bottom'},
-    {'xytext': (10, -10), 'ha': 'left', 'va': 'top'},
-    {'xytext': (-10, -10), 'ha': 'right', 'va': 'top'},
-    {'xytext': (14, 0), 'ha': 'left', 'va': 'center'},
-    {'xytext': (-14, 0), 'ha': 'right', 'va': 'center'},
-    {'xytext': (0, 12), 'ha': 'center', 'va': 'bottom'},
-    {'xytext': (0, -12), 'ha': 'center', 'va': 'top'},
+    {'xytext': (-14, 12), 'ha': 'right', 'va': 'bottom'},  # upper-left
+    {'xytext': (14, 12), 'ha': 'left', 'va': 'bottom'},    # upper-right
+    {'xytext': (14, -12), 'ha': 'left', 'va': 'top'},      # lower-right
+    {'xytext': (-14, -12), 'ha': 'right', 'va': 'top'},    # lower-left
+    {'xytext': (-18, 0), 'ha': 'right', 'va': 'center'},
+    {'xytext': (18, 0), 'ha': 'left', 'va': 'center'},
+    {'xytext': (0, 14), 'ha': 'center', 'va': 'bottom'},
+    {'xytext': (0, -14), 'ha': 'center', 'va': 'top'},
 ]
+
+# Default placement for an isolated point (no nearby neighbors).
+DEFAULT_LABEL_PLACEMENT = {'xytext': (10, 10), 'ha': 'left', 'va': 'bottom'}
+
+# Normalized Euclidean distance below which labels are treated as colliding.
+# DistMult (2015) and ComplEx (2016) at the same dim fall under this threshold.
+NEARBY_LABEL_THRESHOLD = 0.12
+
+
+def _normalized_distance(x1, y1, x2, y2, x_range, y_range):
+    dx = abs(x1 - x2) / x_range
+    dy = abs(y1 - y2) / y_range
+    return (dx * dx + dy * dy) ** 0.5
 
 
 def label_placements_for_points(x_vals, y_vals):
-    groups = defaultdict(list)
-    for idx, (x_val, y_val) in enumerate(zip(x_vals, y_vals)):
-        groups[(x_val, y_val)].append(idx)
+    n = len(x_vals)
+    if n == 0:
+        return []
 
-    placements = [None] * len(x_vals)
+    x_range = max(x_vals) - min(x_vals) or 1.0
+    y_range = max(y_vals) - min(y_vals) or 1.0
+
+    # Union nearby points (and exact duplicates) into collision groups.
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _normalized_distance(x_vals[i], y_vals[i], x_vals[j], y_vals[j], x_range, y_range) < NEARBY_LABEL_THRESHOLD:
+                union(i, j)
+
+    groups = defaultdict(list)
+    for idx in range(n):
+        groups[find(idx)].append(idx)
+
+    placements = [DEFAULT_LABEL_PLACEMENT] * n
     for indices in groups.values():
+        if len(indices) == 1:
+            continue
+        # Sort left-to-right (then bottom-to-top) so neighboring labels fan outward.
+        indices = sorted(indices, key=lambda i: (x_vals[i], y_vals[i]))
         for placement_idx, point_idx in enumerate(indices):
             placements[point_idx] = LABEL_PLACEMENTS[placement_idx % len(LABEL_PLACEMENTS)]
     return placements
@@ -131,29 +176,29 @@ def draw_chart(points: list[Point], x_axis: str, y_axis: str, color_axis: str,
     plt.close()
 
 if __name__ == "__main__":
-    # wn18rr_points = [
-    #     Point(name="TransE",    year=2013, MRR=0.2260, dim=500,     batch_size=512,     negative_sample_size=1024),
-    #     Point(name="DistMult",  year=2015, MRR=0.4300, dim=100,     batch_size=868,     negative_sample_size=1),
-    #     Point(name="ComplEx",   year=2016, MRR=0.4400, dim=100,     batch_size=868,     negative_sample_size=1),
-    #     Point(name="RotatE",    year=2019, MRR=0.4760, dim=500,     batch_size=512,     negative_sample_size=1024),
-    #     Point(name="pRotatE",   year=2019, MRR=0.4620, dim=500,     batch_size=512,     negative_sample_size=1024),
-    #     Point(name="TuckER",    year=2019, MRR=0.4700, dim=200,     batch_size=128,     negative_sample_size=40942),
-    #     Point(name="SimKGC",    year=2022, MRR=0.6850, dim=768,     batch_size=1024,    negative_sample_size=3072),
-    #     Point(name="TransERR",  year=2024, MRR=0.5010, dim=1000,    batch_size=2048,    negative_sample_size=128),
-    #     Point(name="DaBR",      year=2025, MRR=0.5100, dim=500,     batch_size=100,     negative_sample_size=5)
-    # ]
+    wn18rr_points = [
+        Point(name="TransE",    year=2013, MRR=0.2260, dim=500,     batch_size=512,     negative_sample_size=1024),
+        Point(name="DistMult",  year=2015, MRR=0.4300, dim=100,     batch_size=868,     negative_sample_size=1),
+        Point(name="ComplEx",   year=2016, MRR=0.4400, dim=100,     batch_size=868,     negative_sample_size=1),
+        Point(name="RotatE",    year=2019, MRR=0.4760, dim=500,     batch_size=512,     negative_sample_size=1024),
+        Point(name="pRotatE",   year=2019, MRR=0.4620, dim=500,     batch_size=512,     negative_sample_size=1024),
+        Point(name="TuckER",    year=2019, MRR=0.4700, dim=200,     batch_size=128,     negative_sample_size=40942),
+        # Point(name="SimKGC",    year=2022, MRR=0.6850, dim=768,     batch_size=1024,    negative_sample_size=3072),
+        Point(name="TransERR",  year=2024, MRR=0.5010, dim=1000,    batch_size=2048,    negative_sample_size=128),
+        Point(name="DaBR",      year=2025, MRR=0.5100, dim=500,     batch_size=100,     negative_sample_size=5)
+    ]
 
-    # fb15k237_points = [
-    #     Point(name="TransE",   year=2013, MRR=0.2940, dim=1000,     batch_size=1024,    negative_sample_size=256),
-    #     Point(name="DistMult", year=2015, MRR=0.2410, dim=100,      batch_size=2721,    negative_sample_size=1),
-    #     Point(name="ComplEx",  year=2016, MRR=0.2470, dim=100,      batch_size=2721,    negative_sample_size=1),
-    #     Point(name="RotatE",   year=2019, MRR=0.3380, dim=1000,     batch_size=1024,    negative_sample_size=256),
-    #     Point(name="pRotatE",  year=2019, MRR=0.3280, dim=1000,     batch_size=1024,    negative_sample_size=256),
-    #     Point(name="TuckER",   year=2019, MRR=0.3580, dim=200,      batch_size=128,     negative_sample_size=14540),
-    #     Point(name="SimKGC",   year=2022, MRR=0.3360, dim=768,      batch_size=1024,    negative_sample_size=3072),
-    #     Point(name="TransERR", year=2024, MRR=0.3600, dim=1000,     batch_size=1000,    negative_sample_size=128),
-    #     Point(name="DaBR",     year=2025, MRR=0.3730, dim=500,      batch_size=100,     negative_sample_size=10)
-    # ]
+    fb15k237_points = [
+        Point(name="TransE",   year=2013, MRR=0.2940, dim=1000,     batch_size=1024,    negative_sample_size=256),
+        Point(name="DistMult", year=2015, MRR=0.2410, dim=100,      batch_size=2721,    negative_sample_size=1),
+        Point(name="ComplEx",  year=2016, MRR=0.2470, dim=100,      batch_size=2721,    negative_sample_size=1),
+        Point(name="RotatE",   year=2019, MRR=0.3380, dim=1000,     batch_size=1024,    negative_sample_size=256),
+        Point(name="pRotatE",  year=2019, MRR=0.3280, dim=1000,     batch_size=1024,    negative_sample_size=256),
+        Point(name="TuckER",   year=2019, MRR=0.3580, dim=200,      batch_size=128,     negative_sample_size=14540),
+        # Point(name="SimKGC",   year=2022, MRR=0.3360, dim=768,      batch_size=1024,    negative_sample_size=3072),
+        Point(name="TransERR", year=2024, MRR=0.3600, dim=1000,     batch_size=1000,    negative_sample_size=128),
+        Point(name="DaBR",     year=2025, MRR=0.3730, dim=500,      batch_size=100,     negative_sample_size=10)
+    ]
 
     # uniform_t_points = [
     #     Point(name="t=2", uniform_t=2, MRR=0.3862, hit_1=0.3038),
@@ -178,16 +223,16 @@ if __name__ == "__main__":
     #     Point(name="b=1024", batch_size=1024, MRR=0.4695, hit_1=0.4247)
     # ]
 
-    batch_size_points = [
-        Point(name="b=128", batch_size=128, MRR=0.4459, hit_1=0.3949, peak_gpu_memory=0.12),
-        Point(name="b=256", batch_size=256, MRR=0.4555, hit_1=0.4097, peak_gpu_memory=0.12),
-        Point(name="b=512", batch_size=512, MRR=0.4639, hit_1=0.4205, peak_gpu_memory=0.13),
-        Point(name="b=1024", batch_size=1024, MRR=0.4682, hit_1=0.4255, peak_gpu_memory=0.15),
-        Point(name="b=2048", batch_size=2048, MRR=0.4704, hit_1=0.4284, peak_gpu_memory=0.23),
-        Point(name="b=4096", batch_size=4096, MRR=0.4670, hit_1=0.4284, peak_gpu_memory=0.54),
+    # batch_size_points = [
+    #     Point(name="b=128", batch_size=128, MRR=0.4459, hit_1=0.3949, peak_gpu_memory=0.12),
+    #     Point(name="b=256", batch_size=256, MRR=0.4555, hit_1=0.4097, peak_gpu_memory=0.12),
+    #     Point(name="b=512", batch_size=512, MRR=0.4639, hit_1=0.4205, peak_gpu_memory=0.13),
+    #     Point(name="b=1024", batch_size=1024, MRR=0.4682, hit_1=0.4255, peak_gpu_memory=0.15),
+    #     Point(name="b=2048", batch_size=2048, MRR=0.4704, hit_1=0.4284, peak_gpu_memory=0.23),
+    #     Point(name="b=4096", batch_size=4096, MRR=0.4670, hit_1=0.4284, peak_gpu_memory=0.54),
         # Point(name="b=8192", batch_size=8192, MRR=0.0775, hit_1=0.0534, peak_gpu_memory=1.71),
         # Point(name="b=16384", batch_size=16384, MRR=0.0007, hit_1=0.0000, peak_gpu_memory=6.32)
-    ]
+    # ]
 
     # dim_points = [
     #     Point(name="d=16", dim=16, MRR=0.4099, hit_1=0.3551, peak_gpu_memory=0.05),
@@ -200,23 +245,47 @@ if __name__ == "__main__":
     #     Point(name="d=1500", dim=1500, MRR=0.4460, hit_1=0.3926, peak_gpu_memory=2.38)
     # ]
 
-    # draw_chart(
-    #     points=wn18rr_points, 
-    #     x_axis="year", x_title="Year",
-    #     y_axis="dim", y_title="Embedding Dimension",
-    #     color_axis="MRR", color_title="MRR", color_map="Blues",
-    #     title="Overview of Embedding Dimensions of different KGE models over time on WN18RR",
-    #     plot_line=False
-    # )
+    # complex_align_alpha_points = [
+    #     Point(name="a=0.25", align_alpha=0.25, MRR=0.3390, hit_1=0.2675),
+    #     Point(name="a=0.5", align_alpha=0.5, MRR=0.3541, hit_1=0.2754),
+    #     Point(name="a=1", align_alpha=1, MRR=0.4213, hit_1=0.3515),
+    #     Point(name="a=2", align_alpha=2, MRR=0.4639, hit_1=0.4205),
+    #     Point(name="a=3", align_alpha=3, MRR=0.4603, hit_1=0.4202),
+    #     Point(name="a=4", align_alpha=4, MRR=0.4576, hit_1=0.4209),
+    #     Point(name="a=5", align_alpha=5, MRR=0.4514, hit_1=0.4167),
+    #     Point(name="a=6", align_alpha=6, MRR=0.4508, hit_1=0.4183),
+    # ]
 
-    # draw_chart(
-    #     points=fb15k237_points, 
-    #     x_axis="year", x_title="Year",
-    #     y_axis="dim", y_title="Embedding Dimension",
-    #     color_axis="MRR", color_title="MRR", color_map="Blues",
-    #     title="Overview of Embedding Dimensions of different KGE models over time on FB15k237",
-    #     plot_line=False
-    # )
+    # rotate_align_alpha_points = [
+    #     Point(name="a=0.25", align_alpha=0.25, MRR=0.3684, hit_1=0.3218),
+    #     Point(name="a=0.5", align_alpha=0.5, MRR=0.3877, hit_1=0.3395),
+    #     Point(name="a=1", align_alpha=1, MRR=0.4286, hit_1=0.3685),
+    #     Point(name="a=2", align_alpha=2, MRR=0.4646, hit_1=0.4263),
+    #     Point(name="a=3", align_alpha=3, MRR=0.4623, hit_1=0.4279),
+    #     Point(name="a=4", align_alpha=4, MRR=0.4537, hit_1=0.4204),
+    #     Point(name="a=5", align_alpha=5, MRR=0.4501, hit_1=0.4190),
+    #     Point(name="a=6", align_alpha=6, MRR=0.4442, hit_1=0.4140),
+    # ]
+
+    draw_chart(
+        points=wn18rr_points, 
+        x_axis="year", x_title="Year",
+        y_axis="dim", y_title="Embedding Dimension",
+        color_axis="MRR", color_title="MRR", color_map="Blues",
+        title="Overview of Embedding Dimensions of different KGE models over time on WN18RR",
+        plot_line=False,
+        y_scale_mode="log"
+    )
+
+    draw_chart(
+        points=fb15k237_points, 
+        x_axis="year", x_title="Year",
+        y_axis="dim", y_title="Embedding Dimension",
+        color_axis="MRR", color_title="MRR", color_map="Blues",
+        title="Overview of Embedding Dimensions of different KGE models over time on FB15k237",
+        plot_line=False,
+        y_scale_mode="log"
+    )
 
     # draw_chart(
     #     points=uniform_t_points, 
@@ -236,15 +305,15 @@ if __name__ == "__main__":
     #     plot_line=True
     # )
 
-    draw_chart(
-        points=batch_size_points, 
-        x_axis="batch_size", x_title="Batch Size",
-        y_axis="MRR", y_title="MRR",
-        color_axis="hit_1", color_title="Hit@1", color_map="Blues",
-        title="Analysis of ComplEx-AU over different Batch Sizes on WN18RR",
-        plot_line=True,
-        x_scale_mode="log",
-    )
+    # draw_chart(
+    #     points=batch_size_points, 
+    #     x_axis="batch_size", x_title="Batch Size",
+    #     y_axis="MRR", y_title="MRR",
+    #     color_axis="hit_1", color_title="Hit@1", color_map="Blues",
+    #     title="Analysis of ComplEx-AU over different Batch Sizes on WN18RR",
+    #     plot_line=True,
+    #     x_scale_mode="log",
+    # )
 
     # draw_chart(
     #     points=wn18rr_points,
@@ -264,4 +333,22 @@ if __name__ == "__main__":
     #     title="Overview of Batch Sizes and Negative Sample Sizes of different KGE models on FB15k237",
     #     plot_line=False,
     #     x_scale_mode="log", y_scale_mode="log",
+    # )
+
+    # draw_chart(
+    #     points=complex_align_alpha_points,
+    #     x_axis="align_alpha", x_title="Alignment Alpha",
+    #     y_axis="MRR", y_title="MRR",
+    #     color_axis="hit_1", color_title="Hit@1", color_map="Blues",
+    #     title="Analysis of ComplEx-AU over different Alignment Alphas on WN18RR",
+    #     plot_line=True,
+    # )
+
+    # draw_chart(
+    #     points=rotate_align_alpha_points,
+    #     x_axis="align_alpha", x_title="Alignment Alpha",
+    #     y_axis="MRR", y_title="MRR",
+    #     color_axis="hit_1", color_title="Hit@1", color_map="Blues",
+    #     title="Analysis of RotatE-AU over different Alignment Alphas on WN18RR",
+    #     plot_line=True,
     # )

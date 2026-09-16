@@ -257,9 +257,9 @@ if __name__ == "__main__":
         Point(name="b=512", batch_size=512, MRR=0.4639, hit_1=0.4205, peak_gpu_memory=0.13),
         Point(name="b=1024", batch_size=1024, MRR=0.4682, hit_1=0.4255, peak_gpu_memory=0.15),
         Point(name="b=2048", batch_size=2048, MRR=0.4704, hit_1=0.4284, peak_gpu_memory=0.23),
-        Point(name="b=4096", batch_size=4096, MRR=0.4670, hit_1=0.4284, peak_gpu_memory=0.54),
-        # Point(name="b=8192", batch_size=8192, MRR=0.0775, hit_1=0.0534, peak_gpu_memory=1.71),
-        # Point(name="b=16384", batch_size=16384, MRR=0.0007, hit_1=0.0000, peak_gpu_memory=6.32),
+        Point(name="b=4096", batch_size=4096, MRR=0.4709, hit_1=0.4296, peak_gpu_memory=0.54),
+        Point(name="b=8192", batch_size=8192, MRR=0.4791, hit_1=0.4370, peak_gpu_memory=1.71),
+        Point(name="b=16384", batch_size=16384, MRR=0.4783, hit_1=0.4355, peak_gpu_memory=6.32),
     ]
 
     # dim_points = [
