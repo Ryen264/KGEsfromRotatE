@@ -530,6 +530,9 @@ def build_training_optimizer(model, args):
             lr=lr,
         )
 
+    # ĐẢM BẢO khởi tạo các learnable parameters TRƯỚC khi optimizer thu thập params
+    UniGammaController(args).ensure_model_params(model)
+
     gamma_lr = getattr(args, 'log_kgau_gamma_lr', None) or lr
     embedding_params = []
     gamma_params = []
@@ -550,39 +553,28 @@ def set_optimizer_learning_rates(optimizer, lr, gamma_lr=None):
         optimizer.param_groups[1]['lr'] = gamma_lr if gamma_lr is not None else lr
 
 
-class KGAULoss(KGELoss):
+class BaseKGAULoss(KGELoss):
     '''
-    KGAU Loss - Alignment-Uniformity Loss for Knowledge Graph Embeddings
-    L = alignment_loss + Avg(uniformity_loss)_terms + regularization
-        alignment_loss = L2-distance(query_e, target_e)^align_alpha.mean()  (default alpha=2)
-        uniformity_loss = log(exp(-uniform_t * L2-distance(x, x')^2).mean())
-
-    Uniformity uses chunked pairwise reduction (exact same i<j pairs as pdist)
-    to avoid pdist backward spikes ~O(n^2·D) when dim/batch are large.
+    Base class for KGAU family losses. 
+    Handles uniform terms computation, logging, and regularization.
+    Subclasses must implement `compute_alignment` and `compute_uniformity`.
     '''
-    
-    @staticmethod
-    def alignment(x, y, align_alpha=2.0):
-        x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
-        return (x - y).norm(p=2, dim=1).pow(align_alpha).mean()
+    def compute_alignment(self, query_e, target_e):
+        raise NotImplementedError
 
-    @staticmethod
-    def uniformity(x, uniform_t=4, pair_chunk_size=0):
-        return chunked_pairwise_uniformity(
-            x, uniform_t=uniform_t, pair_chunk_size=pair_chunk_size,
-        )
+    def compute_uniformity(self, embeddings):
+        raise NotImplementedError
 
     def _pair_chunk_size(self):
         return int(getattr(self.args, 'uniform_pair_chunk_size', 256) or 0)
 
-    def _compute_uniform_terms(self, head, relation, tail, query_e, target_e, model, uniform_t=4):
+    def _compute_uniform_terms(self, head, relation, tail, query_e, target_e, model):
         uniform_loss_sum = query_e.new_zeros(())
         uniform_count = 0
         uniform_log = {}
         epoch = getattr(self.args, 'current_epoch', 0)
         learnable = is_learnable_kgau_gammas(self.args)
         controller = UniGammaController(self.args) if learnable else None
-        pair_chunk_size = self._pair_chunk_size()
 
         for term_key, gamma_key in KGAU_UNIFORM_TERMS:
             gamma_init = getattr(self.args, gamma_key, 0.0)
@@ -591,15 +583,19 @@ class KGAULoss(KGELoss):
             embeddings = get_kgau_uniform_embeddings(
                 head, relation, tail, query_e, target_e, term_key,
             )
-            uniform_val = self.uniformity(
-                embeddings, uniform_t=uniform_t, pair_chunk_size=pair_chunk_size,
-            )
+            
+            # Dynamic dispatch to the specific uniformity calculation of the subclass
+            uniform_val = self.compute_uniformity(embeddings)
+            
             if learnable:
                 gamma_weight = controller.effective_gamma(model, term_key, epoch)
             else:
                 gamma_weight = gamma_init
+                
             uniform_loss_sum = uniform_loss_sum + gamma_weight * uniform_val
             uniform_count += 1
+            
+            # Standardize logging keys across all KGAU variants for easier metric tracking
             uniform_log['uniform_{}'.format(term_key)] = uniform_val.item()
             if learnable:
                 eff_item = (
@@ -612,15 +608,14 @@ class KGAULoss(KGELoss):
         return uniform_loss_sum, uniform_count, uniform_log
 
     def calculate_loss(self, head, relation, tail, model, mode):
-        uniform_t = getattr(self.args, 'uniform_t', 4)
-        align_alpha = getattr(self.args, 'align_alpha', 2.0)
-
         query_e = model.query_encoder(head, relation, tail, mode=mode)
         target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
-        align_loss = self.alignment(query_e, target_e, align_alpha=align_alpha)
+        
+        # Dynamic dispatch to the specific alignment calculation of the subclass
+        align_loss = self.compute_alignment(query_e, target_e)
 
         uniform_loss_sum, uniform_count, uniform_log = self._compute_uniform_terms(
-            head, relation, tail, query_e, target_e, model, uniform_t,
+            head, relation, tail, query_e, target_e, model,
         )
 
         if uniform_count > 0:
@@ -647,236 +642,54 @@ class KGAULoss(KGELoss):
 
     def __call__(self, positive_score, negative_score, subsampling_weight, model):
         raise NotImplementedError(
-            'KGAU Loss requires positive triple embeddings; '
+            f'{self.__class__.__name__} requires positive triple embeddings; '
             'use compute_kge_loss with positive_sample and mode.'
         )
 
 
-class KGmAULoss(KGELoss):
-    '''
-    KGmAU Loss - Margin Alignment-Uniformity Loss for Knowledge Graph Embeddings
-    L = margin_alignment_loss + Avg(uniformity_loss)_terms + regularization
-        margin_alignment_loss = max(0, L2-distance(query_e, target_e) - align_margin)^2.mean()
-        uniformity_loss = log(exp(-uniform_t * L2-distance(x, x')^2).mean())
-    '''
+class KGAULoss(BaseKGAULoss):
+    '''L = alignment_loss + Avg(uniformity_loss)_terms + regularization'''
+    def compute_alignment(self, query_e, target_e):
+        align_alpha = getattr(self.args, 'align_alpha', 2.0)
+        x, y = F.normalize(query_e, dim=-1), F.normalize(target_e, dim=-1)
+        return (x - y).norm(p=2, dim=1).pow(align_alpha).mean()
 
-    @staticmethod
-    def margin_alignment(x, y, align_margin=0.0):
-        """
-        Margin Alignment Loss by Squared Hinge
-        """
-        x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
-        l2_distance = torch.norm(x - y, p=2, dim=1)
-
-        hinge_step = F.relu(l2_distance - align_margin)
-        squared_hinge_loss = hinge_step.pow(2)
-
-        return squared_hinge_loss.mean()
-
-    @staticmethod
-    def uniformity(x, uniform_t=4, pair_chunk_size=0):
+    def compute_uniformity(self, embeddings):
+        uniform_t = getattr(self.args, 'uniform_t', 4)
         return chunked_pairwise_uniformity(
-            x, uniform_t=uniform_t, pair_chunk_size=pair_chunk_size,
+            embeddings, uniform_t=uniform_t, pair_chunk_size=self._pair_chunk_size(),
         )
 
-    def _pair_chunk_size(self):
-        return int(getattr(self.args, 'uniform_pair_chunk_size', 256) or 0)
 
-    def _compute_uniform_terms(self, head, relation, tail, query_e, target_e, model, uniform_t=4):
-        uniform_loss_sum = query_e.new_zeros(())
-        uniform_count = 0
-        uniform_log = {}
-        epoch = getattr(self.args, 'current_epoch', 0)
-        learnable = is_learnable_kgau_gammas(self.args)
-        controller = UniGammaController(self.args) if learnable else None
-        pair_chunk_size = self._pair_chunk_size()
-
-        for term_key, gamma_key in KGAU_UNIFORM_TERMS:
-            gamma_init = getattr(self.args, gamma_key, 0.0)
-            if gamma_init <= 0:
-                continue
-            embeddings = get_kgau_uniform_embeddings(
-                head, relation, tail, query_e, target_e, term_key,
-            )
-            uniform_val = self.uniformity(
-                embeddings, uniform_t=uniform_t, pair_chunk_size=pair_chunk_size,
-            )
-            if learnable:
-                gamma_weight = controller.effective_gamma(model, term_key, epoch)
-            else:
-                gamma_weight = gamma_init
-            uniform_loss_sum = uniform_loss_sum + gamma_weight * uniform_val
-            uniform_count += 1
-            uniform_log['uniform_{}'.format(term_key)] = uniform_val.item()
-            if learnable:
-                eff_item = (
-                    gamma_weight.item()
-                    if isinstance(gamma_weight, torch.Tensor)
-                    else float(gamma_weight)
-                )
-                uniform_log['uniform_gamma_eff_{}'.format(term_key)] = eff_item
-
-        return uniform_loss_sum, uniform_count, uniform_log
-
-    def calculate_loss(self, head, relation, tail, model, mode):
-        uniform_t = getattr(self.args, 'uniform_t', 4)
+class KGmAULoss(BaseKGAULoss):
+    '''L = margin_alignment_loss + Avg(uniformity_loss)_terms + regularization'''
+    def compute_alignment(self, query_e, target_e):
         align_margin = getattr(self.args, 'align_margin', 0.0)
-
-        query_e = model.query_encoder(head, relation, tail, mode=mode)
-        target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
-        margin_alignment_loss = self.margin_alignment(
-            query_e, target_e, align_margin=align_margin,
-        )
-
-        uniform_loss_sum, uniform_count, uniform_log = self._compute_uniform_terms(
-            head, relation, tail, query_e, target_e, model, uniform_t,
-        )
-
-        if uniform_count > 0:
-            loss = margin_alignment_loss + uniform_loss_sum / uniform_count
-            uniform_loss_val = (uniform_loss_sum / uniform_count).item()
-        else:
-            loss = margin_alignment_loss
-            uniform_loss_val = 0.0
-
-        regularization_term, regularization_log = regularization(
-            model, self.args.regularization_coeff, p=self.args.regularization_p
-        )
-        if regularization_term is not None:
-            loss = loss + regularization_term
-
-        log = {
-            **regularization_log,
-            **uniform_log,
-            'margin_alignment_loss': margin_alignment_loss.item(),
-            'uniform_loss': uniform_loss_val,
-            'loss': loss.item(),
-        }
-        return loss, log
-
-    def __call__(self, positive_score, negative_score, subsampling_weight, model):
-        raise NotImplementedError(
-            'KGmAU Loss requires positive triple embeddings; '
-            'use compute_kge_loss with positive_sample and mode.'
-        )
-
-
-class KGmAmULoss(KGELoss):
-    '''
-    KGmAmU Loss - Margin Alignment + Soft-margin Uniformity for Knowledge Graph Embeddings
-    L = margin_alignment_loss + Avg(soft_margin_uniformity)_terms + regularization
-        margin_alignment_loss = max(0, L2-distance(query_e, target_e) - align_margin)^2.mean()
-        soft_margin_uniformity = log(exp(uniform_t * ReLU(uniform_margin - L2-distance(x, x')^2)).mean())
-    '''
-
-    @staticmethod
-    def margin_alignment(x, y, align_margin=0.0):
-        """
-        Margin Alignment Loss by Squared Hinge
-        """
-        x, y = F.normalize(x, dim=-1), F.normalize(y, dim=-1)
+        x, y = F.normalize(query_e, dim=-1), F.normalize(target_e, dim=-1)
         l2_distance = torch.norm(x - y, p=2, dim=1)
+        return F.relu(l2_distance - align_margin).pow(2).mean()
 
-        hinge_step = F.relu(l2_distance - align_margin)
-        squared_hinge_loss = hinge_step.pow(2)
-
-        return squared_hinge_loss.mean()
-
-    @staticmethod
-    def margin_uniformity(x, uniform_margin=2.0, uniform_t=4, pair_chunk_size=0):
-        return chunked_pairwise_margin_uniformity(
-            x,
-            uniform_margin=uniform_margin,
-            uniform_t=uniform_t,
-            pair_chunk_size=pair_chunk_size,
-        )
-
-    def _pair_chunk_size(self):
-        return int(getattr(self.args, 'uniform_pair_chunk_size', 256) or 0)
-
-    def _compute_margin_uniformity_terms(
-        self, head, relation, tail, query_e, target_e, model,
-        uniform_margin=2.0, uniform_t=4,
-    ):
-        margin_uniformity_loss_sum = query_e.new_zeros(())
-        margin_uniformity_count = 0
-        margin_uniformity_log = {}
-        epoch = getattr(self.args, 'current_epoch', 0)
-        learnable = is_learnable_kgau_gammas(self.args)
-        controller = UniGammaController(self.args) if learnable else None
-        pair_chunk_size = self._pair_chunk_size()
-
-        for term_key, gamma_key in KGAU_UNIFORM_TERMS:
-            gamma_init = getattr(self.args, gamma_key, 0.0)
-            if gamma_init <= 0:
-                continue
-            embeddings = get_kgau_uniform_embeddings(
-                head, relation, tail, query_e, target_e, term_key,
-            )
-            margin_uniformity_val = self.margin_uniformity(
-                embeddings,
-                uniform_margin=uniform_margin,
-                uniform_t=uniform_t,
-                pair_chunk_size=pair_chunk_size,
-            )
-            if learnable:
-                gamma_weight = controller.effective_gamma(model, term_key, epoch)
-            else:
-                gamma_weight = gamma_init
-            margin_uniformity_loss_sum = margin_uniformity_loss_sum + gamma_weight * margin_uniformity_val
-            margin_uniformity_count += 1
-            margin_uniformity_log['margin_uniformity_{}'.format(term_key)] = margin_uniformity_val.item()
-            if learnable:
-                eff_item = (
-                    gamma_weight.item()
-                    if isinstance(gamma_weight, torch.Tensor)
-                    else float(gamma_weight)
-                )
-                margin_uniformity_log['uniform_gamma_eff_{}'.format(term_key)] = eff_item
-
-        return margin_uniformity_loss_sum, margin_uniformity_count, margin_uniformity_log
-
-    def calculate_loss(self, head, relation, tail, model, mode):
+    def compute_uniformity(self, embeddings):
         uniform_t = getattr(self.args, 'uniform_t', 4)
+        return chunked_pairwise_uniformity(
+            embeddings, uniform_t=uniform_t, pair_chunk_size=self._pair_chunk_size(),
+        )
+
+
+class KGmAmULoss(BaseKGAULoss):
+    '''L = margin_alignment_loss + Avg(soft_margin_uniformity)_terms + regularization'''
+    def compute_alignment(self, query_e, target_e):
         align_margin = getattr(self.args, 'align_margin', 0.0)
+        x, y = F.normalize(query_e, dim=-1), F.normalize(target_e, dim=-1)
+        l2_distance = torch.norm(x - y, p=2, dim=1)
+        return F.relu(l2_distance - align_margin).pow(2).mean()
+
+    def compute_uniformity(self, embeddings):
+        uniform_t = getattr(self.args, 'uniform_t', 4)
         uniform_margin = getattr(self.args, 'uniform_margin', 2.0)
-
-        query_e = model.query_encoder(head, relation, tail, mode=mode)
-        target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
-        margin_alignment_loss = self.margin_alignment(
-            query_e, target_e, align_margin=align_margin,
-        )
-
-        margin_uniformity_loss_sum, margin_uniformity_count, margin_uniformity_log = self._compute_margin_uniformity_terms(
-            head, relation, tail, query_e, target_e, model, uniform_margin, uniform_t,
-        )
-
-        if margin_uniformity_count > 0:
-            loss = margin_alignment_loss + margin_uniformity_loss_sum / margin_uniformity_count
-            margin_uniformity_loss_val = (margin_uniformity_loss_sum / margin_uniformity_count).item()
-        else:
-            loss = margin_alignment_loss
-            margin_uniformity_loss_val = 0.0
-
-        regularization_term, regularization_log = regularization(
-            model, self.args.regularization_coeff, p=self.args.regularization_p
-        )
-        if regularization_term is not None:
-            loss = loss + regularization_term
-
-        log = {
-            **regularization_log,
-            **margin_uniformity_log,
-            'margin_alignment_loss': margin_alignment_loss.item(),
-            'margin_uniformity_loss': margin_uniformity_loss_val,
-            'loss': loss.item(),
-        }
-        return loss, log
-
-    def __call__(self, positive_score, negative_score, subsampling_weight, model):
-        raise NotImplementedError(
-            'KGmAmU Loss requires positive triple embeddings; '
-            'use compute_kge_loss with positive_sample and mode.'
+        return chunked_pairwise_margin_uniformity(
+            embeddings, uniform_margin=uniform_margin, uniform_t=uniform_t,
+            pair_chunk_size=self._pair_chunk_size(),
         )
 
 

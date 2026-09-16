@@ -1,6 +1,28 @@
+"""Knowledge Graph Embedding (KGE) models.
+
+This module implements:
+  - KGEBase: common interface for a KGE score function.
+  - ComplEx, RotatE: score functions, each in its own class, exposing
+    `query_encoder` / `target_encoder` / `score` so that training
+    strategies (NegSamp, AllNeg, KGAU, ...) can reuse the same query /
+    target embeddings the score is built from.
+  - KGEModel: the nn.Module wrapping entity/relation embedding tables
+    around a KGE score function, plus the train/eval loop entry points
+    (`train_step`, `test_step`).
+
+RotatE's all-entity scoring path (`score_query_entities`) is backed by a
+custom autograd.Function (`_RotatEScoreQueryEntities`) with an optional
+Triton-accelerated kernel, so it never materializes a [batch, nentity, dim]
+tensor. The Triton kernels are defined as plain module-level functions
+because `@triton.jit` requires that (it cannot decorate bound methods);
+they are private implementation details of RotatE and are not meant to be
+used directly.
+"""
+
 import logging
 
 import numpy as np
+import random # Thêm module random để sinh negative samples
 
 import torch
 import torch.nn as nn
@@ -15,26 +37,12 @@ from loss import (
     is_kgau_family_loss,
     is_learnable_kgau_gammas,
 )
-from metrics.classification import classification_metrics
-from metrics.ranking import ranks_from_score_matrix, rotate_ranking_metrics_from_ranks
+from metrics import (
+    triple_classification_metrics,
+    ranks_from_score_matrix,
+    rotate_ranking_metrics_from_ranks
+)
 from strategy import get_strategy, resolve_strategy_name
-
-
-def resolve_rotate_score_mode(args):
-    '''
-    RotatE scoring mode from training setup.
-
-    KGAU-family (loss or strategy) aligns L2-normalized query/target embeddings,
-    so ranking uses cosine similarity. NegSamp / AllNeg keep RotatE distance.
-    '''
-    if is_kgau_family_loss(args):
-        return 'cosine'
-    try:
-        if resolve_strategy_name(args) == 'kgau':
-            return 'cosine'
-    except Exception:
-        pass
-    return 'distance'
 
 try:
     import triton
@@ -46,7 +54,45 @@ except ImportError:  # pragma: no cover
     _TRITON_AVAILABLE = False
 
 
+def resolve_rotate_score_mode(args):
+    '''
+    RotatE scoring mode from training setup.
+
+    KGAU-family (loss or strategy) aligns L2-normalized query/target
+    embeddings, so ranking uses cosine similarity. NegSamp / AllNeg keep
+    RotatE distance.
+    '''
+    if is_kgau_family_loss(args):
+        return 'cosine'
+    try:
+        if resolve_strategy_name(args) == 'kgau':
+            return 'cosine'
+    except (AttributeError, KeyError, ValueError):
+        pass
+    return 'distance'
+
+
+# =============================================================================
+# Base class
+# =============================================================================
+
 class KGEBase(object):
+    '''
+    Common interface for a KGE score function.
+
+    `score(head, relation, tail, mode)` is the training/eval-facing entry
+    point. It is decomposed into `query_encoder` (the head/relation or
+    relation/tail side, depending on `mode`) and `target_encoder` (the
+    remaining entity) so that strategies which need the query and target
+    embeddings separately (e.g. KGAU-style alignment losses) can reuse
+    them instead of recomputing.
+    '''
+
+    @staticmethod
+    def _split_complex(x):
+        '''Split a [..., 2*d] embedding into its (real, imaginary) halves.'''
+        return torch.chunk(x, 2, dim=-1)
+
     def score(self, head, relation, tail, mode):
         raise NotImplementedError
 
@@ -57,10 +103,18 @@ class KGEBase(object):
         raise NotImplementedError
 
 
+# =============================================================================
+# ComplEx
+# =============================================================================
+
 class ComplEx(KGEBase):
-    @staticmethod
-    def _split_complex(x):
-        return torch.chunk(x, 2, dim=-1)
+    '''
+    ComplEx: Complex Embeddings for Simple Link Prediction.
+
+    Entities and relations are complex-valued (stored as concatenated
+    [real, imaginary] halves). The score is the Hermitian dot product
+    Re(<h * r, conj(t)>).
+    '''
 
     @staticmethod
     def _merge_complex(re_part, im_part):
@@ -105,115 +159,26 @@ class ComplEx(KGEBase):
 
     def score_query_entities(self, query, entity_embedding):
         '''
-        Score queries against all entity embeddings without expanding to [B, E, D].
-        query: [B, D], entity_embedding: [E, D] -> scores [B, E]
+        Score queries against all entity embeddings without expanding to
+        [B, E, D]. query: [B, D], entity_embedding: [E, D] -> scores [B, E].
         '''
         re_q, im_q = self._split_complex(query)
         re_e, im_e = self._split_complex(entity_embedding)
         return re_q @ re_e.transpose(0, 1) + im_q @ im_e.transpose(0, 1)
 
 
-class RotatE(KGEBase):
-    '''
-    RotatE: Knowledge Graph Embedding by Relational Rotation in Complex Space.
-
-    Entities are complex (double_entity_embedding); relations are real phases
-    (not doubled).
-
-    score_mode:
-      - 'distance' (NegSamp / AllNeg): margin_gamma - ||h ◦ r - t||_1
-      - 'cosine' (KGAU-family): cosine(query, target) after L2-normalize,
-        matching KGAU alignment on normalized query/target embeddings.
-    '''
-
-    SCORE_MODES = ('distance', 'cosine')
-
-    def __init__(self, embedding_range, margin_gamma, score_mode='distance'):
-        if score_mode not in self.SCORE_MODES:
-            raise ValueError(
-                'RotatE score_mode must be one of {}, got {}'.format(
-                    self.SCORE_MODES, score_mode
-                )
-            )
-        self.embedding_range = embedding_range
-        self.margin_gamma = margin_gamma
-        self.score_mode = score_mode
-        self.pi = 3.14159265358979323846
-
-    @staticmethod
-    def _split_complex(x):
-        return torch.chunk(x, 2, dim=-1)
-
-    def _relation_rotation(self, relation):
-        # Map relation embeddings to phases in [-pi, pi], then to unit complex.
-        phase_relation = relation / (self.embedding_range.item() / self.pi)
-        return torch.cos(phase_relation), torch.sin(phase_relation)
-
-    def query_encoder(self, head, relation, tail, mode):
-        re_relation, im_relation = self._relation_rotation(relation)
-        if mode == 'head-batch':
-            # Inverse rotation: r^{-1} ◦ t  (since |r|=1, r^{-1}=conj(r))
-            re_tail, im_tail = self._split_complex(tail)
-            re_query = re_relation * re_tail + im_relation * im_tail
-            im_query = re_relation * im_tail - im_relation * re_tail
-        else:
-            # Forward rotation: h ◦ r
-            re_head, im_head = self._split_complex(head)
-            re_query = re_head * re_relation - im_head * im_relation
-            im_query = re_head * im_relation + im_head * re_relation
-        return torch.cat([re_query, im_query], dim=-1)
-
-    def target_encoder(self, head, relation, tail, mode):
-        if mode == 'head-batch':
-            return head
-        return tail
-
-    @staticmethod
-    def _complex_distance(re_diff, im_diff):
-        # Per-dim complex modulus, then L1 over dims.
-        # Use stack(...).norm (finite grad at 0) — NOT hypot, which yields NaN
-        # grads when re=im=0. That happens once 1vsAll/KvsAll fits positives.
-        return torch.stack([re_diff, im_diff], dim=0).norm(dim=0).sum(dim=-1)
-
-    @staticmethod
-    def _cosine_score(query, target):
-        '''Cosine similarity after L2-normalize along the embedding dim.'''
-        query = F.normalize(query, p=2, dim=-1)
-        target = F.normalize(target, p=2, dim=-1)
-        return (query * target).sum(dim=-1)
-
-    def score(self, head, relation, tail, mode):
-        query = self.query_encoder(head, relation, tail, mode)
-        target = self.target_encoder(head, relation, tail, mode)
-        if self.score_mode == 'cosine':
-            return self._cosine_score(query, target)
-        re_query, im_query = self._split_complex(query)
-        re_target, im_target = self._split_complex(target)
-        return self.margin_gamma.item() - self._complex_distance(
-            re_query - re_target, im_query - im_target
-        )
-
-    def score_query_entities(self, query, entity_embedding):
-        '''
-        Score queries against all entity embeddings without expanding to [B, E, D]
-        via forward()/index_select. Same contract as ComplEx.score_query_entities:
-        query [B, D], entity_embedding [E, D] -> scores [B, E].
-
-        cosine: L2-normalize then matmul (KGAU).
-        distance: custom autograd / Triton path (NegSamp AllNeg-style full-entity).
-        '''
-        if self.score_mode == 'cosine':
-            query_n = F.normalize(query, p=2, dim=-1)
-            entity_n = F.normalize(entity_embedding, p=2, dim=-1)
-            return query_n @ entity_n.transpose(0, 1)
-
-        re_q, im_q = self._split_complex(query)
-        re_e, im_e = self._split_complex(entity_embedding)
-        gamma = self.margin_gamma.detach().to(dtype=query.dtype, device=query.device)
-        return _RotatEScoreQueryEntities.apply(re_q, im_q, re_e, im_e, gamma)
-
+# =============================================================================
+# RotatE
+# =============================================================================
+#
+# The Triton kernels below implement the forward/backward of RotatE's
+# all-entity distance score (used by `score_query_entities`). They are kept
+# as module-level functions (required by `@triton.jit`) and are only ever
+# invoked through `_RotatEScoreQueryEntities`, which is in turn a private
+# implementation detail of `RotatE.score_query_entities`.
 
 if _TRITON_AVAILABLE:
+
     @triton.jit
     def _rotate_allneg_fwd_kernel(
         re_q_ptr, im_q_ptr, re_e_ptr, im_e_ptr, scores_ptr,
@@ -412,11 +377,13 @@ if _TRITON_AVAILABLE:
 
 class _RotatEScoreQueryEntities(torch.autograd.Function):
     '''
-    All-entity RotatE scores with ComplEx-like saved-tensor footprint:
-    save query/entity embeddings only; recompute distance in backward.
+    All-entity RotatE scores with ComplEx-like saved-tensor footprint: save
+    query/entity embeddings only, recompute distance in backward.
 
-    On CUDA + Triton: fused kernels (no [B,C,D] intermediates).
+    On CUDA + Triton: fused kernels (no [B, C, D] intermediates).
     Otherwise: chunked PyTorch stack+norm path.
+
+    Private implementation detail of `RotatE.score_query_entities`.
     '''
 
     _BYTES_BUDGET = 512 * 1024 * 1024
@@ -427,7 +394,7 @@ class _RotatEScoreQueryEntities(torch.autograd.Function):
 
     @staticmethod
     def _chunk_size(batch_size, half_dim, nentity):
-        # Peak temps ≈ re_diff + im_diff + stacked + norm ~ 5x [B, C, d] float32.
+        # Peak temps ~= re_diff + im_diff + stacked + norm ~ 5x [B, C, d] float32.
         per_entity = max(batch_size * half_dim * 4 * 5, 1)
         return max(64, min(nentity, _RotatEScoreQueryEntities._BYTES_BUDGET // per_entity))
 
@@ -450,7 +417,8 @@ class _RotatEScoreQueryEntities(torch.autograd.Function):
         if not _RotatEScoreQueryEntities._triton_disabled:
             logging.warning(
                 'Disabling Triton RotatE AllNeg kernels (%s); using chunked PyTorch.',
-                reason,
+                str(reason),
+                exc_info=True
             )
         _RotatEScoreQueryEntities._triton_disabled = True
 
@@ -611,14 +579,121 @@ class _RotatEScoreQueryEntities(torch.autograd.Function):
         return (*grads, None)
 
 
+class RotatE(KGEBase):
+    '''
+    RotatE: Knowledge Graph Embedding by Relational Rotation in Complex Space.
+
+    Entities are complex (double_entity_embedding); relations are real
+    phases (not doubled).
+
+    score_mode:
+      - 'distance' (NegSamp / AllNeg): margin_gamma - ||h o r - t||_1
+      - 'cosine' (KGAU-family): cosine(query, target) after L2-normalize,
+        matching KGAU alignment on normalized query/target embeddings.
+    '''
+
+    SCORE_MODES = ('distance', 'cosine')
+
+    def __init__(self, embedding_range, margin_gamma, score_mode='distance'):
+        if score_mode not in self.SCORE_MODES:
+            raise ValueError(
+                'RotatE score_mode must be one of {}, got {}'.format(
+                    self.SCORE_MODES, score_mode
+                )
+            )
+        self.embedding_range = embedding_range
+        self.margin_gamma = margin_gamma
+        self.score_mode = score_mode
+        self.pi = 3.14159265358979323846
+
+    def _relation_rotation(self, relation):
+        # Map relation embeddings to phases in [-pi, pi], then to unit complex.
+        phase_relation = relation / (self.embedding_range.item() / self.pi)
+        return torch.cos(phase_relation), torch.sin(phase_relation)
+
+    def query_encoder(self, head, relation, tail, mode):
+        re_relation, im_relation = self._relation_rotation(relation)
+        if mode == 'head-batch':
+            # Inverse rotation: r^{-1} o t  (since |r|=1, r^{-1}=conj(r))
+            re_tail, im_tail = self._split_complex(tail)
+            re_query = re_relation * re_tail + im_relation * im_tail
+            im_query = re_relation * im_tail - im_relation * re_tail
+        else:
+            # Forward rotation: h o r
+            re_head, im_head = self._split_complex(head)
+            re_query = re_head * re_relation - im_head * im_relation
+            im_query = re_head * im_relation + im_head * re_relation
+        return torch.cat([re_query, im_query], dim=-1)
+
+    def target_encoder(self, head, relation, tail, mode):
+        if mode == 'head-batch':
+            return head
+        return tail
+
+    @staticmethod
+    def _complex_distance(re_diff, im_diff):
+        # Per-dim complex modulus, then L1 over dims.
+        # Use stack(...).norm (finite grad at 0) -- NOT hypot, which yields
+        # NaN grads when re=im=0. That happens once 1vsAll/KvsAll fits positives.
+        return torch.stack([re_diff, im_diff], dim=0).norm(dim=0).sum(dim=-1)
+
+    @staticmethod
+    def _cosine_score(query, target):
+        '''Cosine similarity after L2-normalize along the embedding dim.'''
+        query = F.normalize(query, p=2, dim=-1)
+        target = F.normalize(target, p=2, dim=-1)
+        return (query * target).sum(dim=-1)
+
+    def score(self, head, relation, tail, mode):
+        query = self.query_encoder(head, relation, tail, mode)
+        target = self.target_encoder(head, relation, tail, mode)
+        if self.score_mode == 'cosine':
+            return self._cosine_score(query, target)
+        re_query, im_query = self._split_complex(query)
+        re_target, im_target = self._split_complex(target)
+        return self.margin_gamma.item() - self._complex_distance(
+            re_query - re_target, im_query - im_target
+        )
+
+    def score_query_entities(self, query, entity_embedding):
+        '''
+        Score queries against all entity embeddings without expanding to
+        [B, E, D] via forward()/index_select. Same contract as
+        ComplEx.score_query_entities: query [B, D], entity_embedding [E, D]
+        -> scores [B, E].
+
+        cosine: L2-normalize then matmul (KGAU).
+        distance: custom autograd / Triton path (NegSamp / AllNeg-style
+        full-entity).
+        '''
+        if self.score_mode == 'cosine':
+            query_n = F.normalize(query, p=2, dim=-1)
+            entity_n = F.normalize(entity_embedding, p=2, dim=-1)
+            return query_n @ entity_n.transpose(0, 1)
+
+        re_q, im_q = self._split_complex(query)
+        re_e, im_e = self._split_complex(entity_embedding)
+        gamma = self.margin_gamma.detach().to(dtype=query.dtype, device=query.device)
+        return _RotatEScoreQueryEntities.apply(re_q, im_q, re_e, im_e, gamma)
+
+
 KGE_SCORERS = {
     'ComplEx': ComplEx,
     'RotatE': RotatE,
 }
 
 
+# =============================================================================
+# KGEModel: embedding tables + train/eval loop around a KGE score function
+# =============================================================================
+
 class KGEModel(nn.Module):
-    def __init__(self, model_name, nentity, nrelation, dim, margin_gamma, 
+    '''
+    Holds the entity/relation embedding tables and delegates scoring to a
+    `KGEBase` score function (`self.kge_scorer`) selected via `model_name`.
+    '''
+
+    def __init__(self, model_name, nentity, nrelation, dim, margin_gamma,
                  double_entity_embedding=False, double_relation_embedding=False,
                  score_mode='distance'):
         super(KGEModel, self).__init__()
@@ -628,34 +703,34 @@ class KGEModel(nn.Module):
         self.dim = dim
         self.epsilon = 2.0
         self.score_mode = score_mode
-        
+
         self.margin_gamma = nn.Parameter(
-            torch.Tensor([margin_gamma]), 
+            torch.Tensor([margin_gamma]),
             requires_grad=False
         )
-        
+
         self.embedding_range = nn.Parameter(
-            torch.Tensor([(self.margin_gamma.item() + self.epsilon) / dim]), 
+            torch.Tensor([(self.margin_gamma.item() + self.epsilon) / dim]),
             requires_grad=False
         )
-        
-        self.entity_dim = dim*2 if double_entity_embedding else dim
-        self.relation_dim = dim*2 if double_relation_embedding else dim
-        
+
+        self.entity_dim = dim * 2 if double_entity_embedding else dim
+        self.relation_dim = dim * 2 if double_relation_embedding else dim
+
         self.entity_embedding = nn.Parameter(torch.zeros(nentity, self.entity_dim))
         nn.init.uniform_(
-            tensor=self.entity_embedding, 
-            a=-self.embedding_range.item(), 
+            tensor=self.entity_embedding,
+            a=-self.embedding_range.item(),
             b=self.embedding_range.item()
         )
-        
+
         self.relation_embedding = nn.Parameter(torch.zeros(nrelation, self.relation_dim))
         nn.init.uniform_(
-            tensor=self.relation_embedding, 
-            a=-self.embedding_range.item(), 
+            tensor=self.relation_embedding,
+            a=-self.embedding_range.item(),
             b=self.embedding_range.item()
         )
-        
+
         if model_name == 'ComplEx' and (not double_entity_embedding or not double_relation_embedding):
             raise ValueError('ComplEx should use --double_entity_embedding and --double_relation_embedding')
 
@@ -674,97 +749,78 @@ class KGEModel(nn.Module):
             )
         else:
             self.kge_scorer = KGE_SCORERS[model_name]()
-        
+            
+        # Placeholder cho mô hình Generator (được sử dụng riêng bởi KBGAN Strategy)
+        self.generator = None
+
     def query_encoder(self, head, relation, tail=None, mode='tail-batch'):
         return self.kge_scorer.query_encoder(head, relation, tail, mode)
 
     def target_encoder(self, tail, head=None, relation=None, mode='tail-batch'):
         return self.kge_scorer.target_encoder(head, relation, tail, mode)
-        
-    def forward(self, sample, mode='single'):
-        '''
-        Forward function that calculate the score of a batch of triples.
-        In the 'single' mode, sample is a batch of triple.
-        In the 'head-batch' or 'tail-batch' mode, sample consists two part.
-        The first part is usually the positive sample.
-        And the second part is the entities in the negative samples.
-        Because negative samples and positive samples usually share two elements 
-        in their triple ((head, relation) or (relation, tail)).
-        '''
 
+    def _lookup_triple(self, sample, mode):
+        '''Index into the embedding tables for `sample`, per `mode`.
+
+        Returns (head, relation, tail) broadcastable as
+        [batch, 1, dim] / [batch, negative_sample_size, dim], and the
+        score-function mode to use ('head-batch' or 'tail-batch').
+        '''
         if mode == 'single':
-            batch_size, negative_sample_size = sample.size(0), 1
-            
             head = torch.index_select(
-                self.entity_embedding, 
-                dim=0, 
-                index=sample[:,0]
+                self.entity_embedding, dim=0, index=sample[:, 0]
             ).unsqueeze(1)
-            
             relation = torch.index_select(
-                self.relation_embedding, 
-                dim=0, 
-                index=sample[:,1]
+                self.relation_embedding, dim=0, index=sample[:, 1]
             ).unsqueeze(1)
-            
             tail = torch.index_select(
-                self.entity_embedding, 
-                dim=0, 
-                index=sample[:,2]
+                self.entity_embedding, dim=0, index=sample[:, 2]
             ).unsqueeze(1)
-            
-        elif mode == 'head-batch':
+            return head, relation, tail, 'tail-batch'
+
+        if mode == 'head-batch':
             tail_part, head_part = sample
             batch_size, negative_sample_size = head_part.size(0), head_part.size(1)
-            
+
             head = torch.index_select(
-                self.entity_embedding, 
-                dim=0, 
-                index=head_part.reshape(-1)
+                self.entity_embedding, dim=0, index=head_part.reshape(-1)
             ).view(batch_size, negative_sample_size, -1)
-            
             relation = torch.index_select(
-                self.relation_embedding, 
-                dim=0, 
-                index=tail_part[:, 1]
+                self.relation_embedding, dim=0, index=tail_part[:, 1]
             ).unsqueeze(1)
-            
             tail = torch.index_select(
-                self.entity_embedding, 
-                dim=0, 
-                index=tail_part[:, 2]
+                self.entity_embedding, dim=0, index=tail_part[:, 2]
             ).unsqueeze(1)
-            
-        elif mode == 'tail-batch':
+            return head, relation, tail, mode
+
+        if mode == 'tail-batch':
             head_part, tail_part = sample
             batch_size, negative_sample_size = tail_part.size(0), tail_part.size(1)
-            
+
             head = torch.index_select(
-                self.entity_embedding, 
-                dim=0, 
-                index=head_part[:, 0]
+                self.entity_embedding, dim=0, index=head_part[:, 0]
             ).unsqueeze(1)
-            
             relation = torch.index_select(
-                self.relation_embedding,
-                dim=0,
-                index=head_part[:, 1]
+                self.relation_embedding, dim=0, index=head_part[:, 1]
             ).unsqueeze(1)
-            
             tail = torch.index_select(
-                self.entity_embedding, 
-                dim=0, 
-                index=tail_part.reshape(-1)
+                self.entity_embedding, dim=0, index=tail_part.reshape(-1)
             ).view(batch_size, negative_sample_size, -1)
-            
-        else:
-            raise ValueError('mode %s not supported' % mode)
+            return head, relation, tail, mode
 
-        if mode == 'single':
-            score_mode = 'tail-batch'
-        else:
-            score_mode = mode
+        raise ValueError('mode %s not supported' % mode)
 
+    def forward(self, sample, mode='single'):
+        '''
+        Forward function that calculates the score of a batch of triples.
+        In the 'single' mode, sample is a batch of triples.
+        In the 'head-batch' or 'tail-batch' mode, sample consists of two
+        parts. The first part is usually the positive sample. And the
+        second part is the entities in the negative samples. Because
+        negative samples and positive samples usually share two elements
+        in their triple ((head, relation) or (relation, tail)).
+        '''
+        head, relation, tail, score_mode = self._lookup_triple(sample, mode)
         return self.kge_scorer.score(head, relation, tail, score_mode)
 
     def score_all_entities(self, positive_sample, mode='tail-batch'):
@@ -772,8 +828,9 @@ class KGEModel(nn.Module):
         Score each positive query against all entities.
 
         Avoids materializing [B, nentity, dim] candidate embeddings (OOM on
-        AllNeg / 1vsAll / KvsAll). Uses a query-[B,D] x entity-[E,D] path when
-        the scorer supports it; otherwise falls back to chunked forward().
+        AllNeg / 1vsAll / KvsAll). Uses a query-[B,D] x entity-[E,D] path
+        when the scorer supports it; otherwise falls back to chunked
+        forward().
         '''
         head = self.entity_embedding[positive_sample[:, 0]].unsqueeze(1)
         relation = self.relation_embedding[positive_sample[:, 1]].unsqueeze(1)
@@ -813,11 +870,9 @@ class KGEModel(nn.Module):
     @staticmethod
     def train_step(model, optimizer, train_iterator, args):
         '''
-        A single train step. Apply back-propation and return the loss
+        A single train step. Apply back-propagation and return the loss.
         '''
-
         model.train()
-
         optimizer.zero_grad()
 
         strategy = get_strategy(args)
@@ -835,105 +890,143 @@ class KGEModel(nn.Module):
         )
 
         loss.backward()
-
         optimizer.step()
 
         if is_learnable_kgau_gammas(args):
             UniGammaController(args).clamp_log_gammas(model)
 
         return log
-    
+
+    @staticmethod
+    def _test_step_countries(model, test_triples, args):
+        '''Countries S* datasets are evaluated on AUC-PR.'''
+        sample = list()
+        y_true = list()
+        for head, relation, tail in test_triples:
+            for candidate_region in args.regions:
+                y_true.append(1 if candidate_region == tail else 0)
+                sample.append((head, relation, candidate_region))
+
+        sample = torch.LongTensor(sample)
+        if args.cuda:
+            sample = sample.cuda()
+
+        with torch.no_grad():
+            y_score = model(sample).squeeze(1).cpu().numpy()
+
+        y_true = np.array(y_true)
+        cls_metrics = classification_metrics(
+            y_true,
+            (y_score > 0).astype(int),
+            y_prob=y_score,
+        )
+        return {'auc_pr': cls_metrics['pr_auc']}
+
+    @staticmethod
+    def _test_step_ranking(model, test_triples, all_true_triples, args):
+        '''Standard (filtered) MRR, MR, HITS@1, HITS@3, HITS@10 evaluation.'''
+        test_dataloader_head = DataLoader(
+            TestDataset(
+                test_triples,
+                all_true_triples,
+                args.nentity,
+                args.nrelation,
+                'head-batch'
+            ),
+            batch_size=args.test_batch_size,
+            num_workers=4,
+            collate_fn=TestDataset.collate_fn
+        )
+
+        test_dataloader_tail = DataLoader(
+            TestDataset(
+                test_triples,
+                all_true_triples,
+                args.nentity,
+                args.nrelation,
+                'tail-batch'
+            ),
+            batch_size=args.test_batch_size,
+            num_workers=4,
+            collate_fn=TestDataset.collate_fn
+        )
+
+        test_dataset_list = [test_dataloader_head, test_dataloader_tail]
+        ranks = []
+        step = 0
+        total_steps = sum([len(dataset) for dataset in test_dataset_list])
+
+        with torch.no_grad():
+            for test_dataset in test_dataset_list:
+                for positive_sample, negative_sample, filter_bias, mode in test_dataset:
+                    if args.cuda:
+                        positive_sample = positive_sample.cuda()
+                        negative_sample = negative_sample.cuda()
+                        filter_bias = filter_bias.cuda()
+
+                    score = model((positive_sample, negative_sample), mode)
+                    score += filter_bias
+
+                    if mode == 'head-batch':
+                        positive_arg = positive_sample[:, 0]
+                    elif mode == 'tail-batch':
+                        positive_arg = positive_sample[:, 2]
+                    else:
+                        raise ValueError('mode %s not supported' % mode)
+
+                    ranks.extend(ranks_from_score_matrix(score, positive_arg))
+
+                    if step % args.test_log_steps == 0:
+                        logging.info('Evaluating the model... (%d/%d)' % (step, total_steps))
+
+                    step += 1
+
+        return rotate_ranking_metrics_from_ranks(ranks)
+
+    @staticmethod
+    def _test_step_triple_classification(model, test_triples, all_true_triples, args):
+        '''
+        Evaluate Value Classification (Triple Classification) task.
+        Supports both 'global' and 'relation' threshold modes via args.threshold_mode.
+        '''
+        y_true = []
+        samples = []
+        relations = []
+        
+        for head, relation, tail in test_triples:
+            samples.append((head, relation, tail))
+            y_true.append(1)
+            relations.append(relation)
+            
+            if random.random() < 0.5:
+                neg_head = random.randint(0, args.nentity - 1)
+                samples.append((neg_head, relation, tail))
+            else:
+                neg_tail = random.randint(0, args.nentity - 1)
+                samples.append((head, relation, neg_tail))
+            y_true.append(0)
+            relations.append(relation) # Negative sample giữ nguyên relation
+            
+        sample_tensor = torch.LongTensor(samples)
+        if args.cuda:
+            sample_tensor = sample_tensor.cuda()
+            
+        with torch.no_grad():
+            scores = model(sample_tensor, mode='single').squeeze(-1).cpu().numpy()
+            
+        # Lấy chế độ threshold từ args, mặc định là 'relation' vì nó cho kết quả tốt hơn
+        t_mode = getattr(args, 'threshold_mode', 'relation')
+        return triple_classification_metrics(y_true, scores, relations, threshold_mode=t_mode)
+
     @staticmethod
     def test_step(model, test_triples, all_true_triples, args):
         '''
-        Evaluate the model on test or valid datasets
+        Evaluate the model on test or valid datasets.
         '''
-        
         model.eval()
-        
+
         if args.countries:
-            #Countries S* datasets are evaluated on AUC-PR
-            #Process test data for AUC-PR evaluation
-            sample = list()
-            y_true  = list()
-            for head, relation, tail in test_triples:
-                for candidate_region in args.regions:
-                    y_true.append(1 if candidate_region == tail else 0)
-                    sample.append((head, relation, candidate_region))
-
-            sample = torch.LongTensor(sample)
-            if args.cuda:
-                sample = sample.cuda()
-
-            with torch.no_grad():
-                y_score = model(sample).squeeze(1).cpu().numpy()
-
-            y_true = np.array(y_true)
-
-            cls_metrics = classification_metrics(
-                y_true,
-                (y_score > 0).astype(int),
-                y_prob=y_score,
-            )
-            metrics = {'auc_pr': cls_metrics['pr_auc']}
-            
-        else:
-            #Otherwise use standard (filtered) MRR, MR, HITS@1, HITS@3, and HITS@10 metrics
-            #Prepare dataloader for evaluation
-            test_dataloader_head = DataLoader(
-                TestDataset(
-                    test_triples, 
-                    all_true_triples, 
-                    args.nentity, 
-                    args.nrelation, 
-                    'head-batch'
-                ), 
-                batch_size=args.test_batch_size,
-                num_workers=4, 
-                collate_fn=TestDataset.collate_fn
-            )
-
-            test_dataloader_tail = DataLoader(
-                TestDataset(
-                    test_triples, 
-                    all_true_triples, 
-                    args.nentity, 
-                    args.nrelation, 
-                    'tail-batch'
-                ), 
-                batch_size=args.test_batch_size,
-                num_workers=4, 
-                collate_fn=TestDataset.collate_fn
-            )
-            
-            test_dataset_list = [test_dataloader_head, test_dataloader_tail]
-            ranks = []
-            step = 0
-            total_steps = sum([len(dataset) for dataset in test_dataset_list])
-
-            with torch.no_grad():
-                for test_dataset in test_dataset_list:
-                    for positive_sample, negative_sample, filter_bias, mode in test_dataset:
-                        if args.cuda:
-                            positive_sample = positive_sample.cuda()
-                            negative_sample = negative_sample.cuda()
-                            filter_bias = filter_bias.cuda()
-
-                        score = model((positive_sample, negative_sample), mode)
-                        score += filter_bias
-
-                        if mode == 'head-batch':
-                            positive_arg = positive_sample[:, 0]
-                        elif mode == 'tail-batch':
-                            positive_arg = positive_sample[:, 2]
-                        else:
-                            raise ValueError('mode %s not supported' % mode)
-
-                        ranks.extend(ranks_from_score_matrix(score, positive_arg))
-
-                        if step % args.test_log_steps == 0:
-                            logging.info('Evaluating the model... (%d/%d)' % (step, total_steps))
-
-                        step += 1
-            metrics = rotate_ranking_metrics_from_ranks(ranks)
-        return metrics
+            return KGEModel._test_step_countries(model, test_triples, args)
+        elif getattr(args, 'triple_classification', False):
+            return KGEModel._test_step_triple_classification(model, test_triples, all_true_triples, args)
+        return KGEModel._test_step_ranking(model, test_triples, all_true_triples, args)

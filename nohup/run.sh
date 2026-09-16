@@ -1,13 +1,4 @@
-#!/bin/sh
-# Start visualization training in the background with nohup.
-#
-# Usage:
-#   ./nohup/run.sh configs/ComplEx64_WN18RR_ce_uniform_200e.json
-#   ./nohup/run.sh configs/ComplEx64_WN18RR_ce_uniform_200e.json --gpu 0 --no-show
-#
-# Logs:  nohup/logs/<config-stem>_<timestamp>.log
-# PID:   nohup/job.pid
-
+#!/bin/bash
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,26 +18,40 @@ if [ -f "$PID_FILE" ]; then
     rm -f "$PID_FILE" "$META_FILE"
 fi
 
-CONFIG="${1:-configs/ComplEx64_WN18RR_ce_uniform_200e.json}"
-shift 2>/dev/null || true
-
-if [ ! -f "$ROOT/$CONFIG" ] && [ ! -f "$CONFIG" ]; then
-    echo "Config not found: $CONFIG"
-    exit 1
-fi
-
+# Kích hoạt môi trường ảo nếu có
 if [ -f "$ROOT/.venv/bin/activate" ]; then
     . "$ROOT/.venv/bin/activate"
 fi
 
+# Tự động điều hướng: 
+# Nếu tham số đầu tiên là file .json -> chạy visualization/main.py
+# Ngược lại -> chạy thẳng main.py ở root
+if [[ "$1" == *.json ]]; then
+    CONFIG="$1"
+    shift
+    if [ ! -f "$ROOT/$CONFIG" ] && [ ! -f "$CONFIG" ]; then
+        echo "Config not found: $CONFIG"
+        exit 1
+    fi
+    CMD="python -u visualization/main.py $CONFIG --no-show $*"
+    CONFIG_STEM="$(basename "$CONFIG" .json)"
+else
+    if [ -z "$1" ]; then
+        echo "Usage:"
+        echo "  ./nohup/run.sh <config.json> [args]"
+        echo "  ./nohup/run.sh --do_train [args]"
+        exit 1
+    fi
+    CMD="python -u main.py $*"
+    CONFIG_STEM="main_cli"
+fi
+
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-CONFIG_STEM="$(basename "$CONFIG" .json)"
 LOG_FILE="$LOG_DIR/${CONFIG_STEM}_${TIMESTAMP}.log"
 LATEST_LINK="$LOG_DIR/latest.log"
 
 cd "$ROOT"
 
-CMD="python -u visualization/main.py $CONFIG --no-show $*"
 echo "Starting: $CMD"
 echo "Log: $LOG_FILE"
 
@@ -57,7 +62,9 @@ echo "$PID" > "$PID_FILE"
 {
     echo "pid=$PID"
     echo "started=$(date -Iseconds 2>/dev/null || date)"
-    echo "config=$CONFIG"
+    if [[ -n "$CONFIG" ]]; then
+        echo "config=$CONFIG"
+    fi
     echo "log=$LOG_FILE"
     echo "cmd=$CMD"
 } > "$META_FILE"

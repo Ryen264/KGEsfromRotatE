@@ -1,7 +1,3 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
 
 import numpy as np
@@ -14,7 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 from dataloader import BidirectionalOneShotIterator, TrainDataset
 
 
-STRATEGY_CHOICES = ('uniform', 'bernoulli', 'selfadv', '1vsall', 'kvsall', 'kgau')
+STRATEGY_CHOICES = ('uniform', 'bernoulli', 'selfadv', 'kbgan', '1vsall', 'kvsall', 'kgau')
 
 
 def suggested_max_workers():
@@ -327,11 +323,22 @@ class AllNegStrategy(KGEStrategy):
         '''Full [B, E] scores without building [B, E, dim] embeddings.'''
         if hasattr(model, 'score_all_entities'):
             return model.score_all_entities(positive_sample, mode=mode)
-        # Legacy fallback (may OOM on large graphs / dims).
+            
+        # Fallback with chunking to prevent OOM on large Knowledge Graphs
         nentity = model.nentity
         candidates = self._candidate_entities(nentity, positive_sample.device)
         negative_sample = candidates.unsqueeze(0).expand(positive_sample.size(0), -1)
-        return model((positive_sample, negative_sample), mode=mode)
+        
+        chunk_size = int(getattr(self.args, 'negative_chunk_size', 256) or 256)
+        if chunk_size <= 0 or chunk_size >= nentity:
+            return model((positive_sample, negative_sample), mode=mode)
+            
+        score_chunks = []
+        for start in range(0, nentity, chunk_size):
+            end = min(start + chunk_size, nentity)
+            neg_chunk = negative_sample[:, start:end]
+            score_chunks.append(model((positive_sample, neg_chunk), mode=mode))
+        return torch.cat(score_chunks, dim=1)
 
     def prepare_train_batch(self, batch, model):
         positive_sample, label_matrix, subsampling_weight, mode = batch
@@ -700,6 +707,54 @@ class KvsAllTrainDataset(_AllNegTrainDatasetBase):
         return positive_sample, label_idx, subsample_weight, mode
 
 
+class KBGANStrategy(NegSampStrategy):
+    '''
+    KBGAN (Adversarial Negative Sampling via Generator).
+    Overrides prepare_train_batch to replace uniform negatives with
+    high-quality hard negatives sampled dynamically from a Generator.
+    '''
+    name = 'kbgan'
+
+    def prepare_train_batch(self, batch, model):
+        positive_sample, negative_sample, subsampling_weight, mode = batch
+        if self.args.cuda:
+            positive_sample = positive_sample.cuda()
+            negative_sample = negative_sample.cuda()
+            subsampling_weight = subsampling_weight.cuda()
+
+        # Đảm bảo model đã được gắn Generator
+        if not hasattr(model, 'generator') or model.generator is None:
+            raise RuntimeError("KBGANStrategy requires 'model.generator' to be set with a pre-trained KGEModel.")
+
+        with torch.no_grad():
+            # 1. Generator chấm điểm các ứng viên negative ngẫu nhiên
+            gen_neg_score = self.score_negatives(
+                model.generator, positive_sample, negative_sample, mode
+            )
+            
+            # 2. Chuyển đổi điểm số thành xác suất (điểm càng cao = càng dễ nhầm lẫn = xác suất được chọn làm hard negative càng lớn)
+            gen_probs = F.softmax(gen_neg_score, dim=1)
+            
+            # 3. Lấy mẫu hard negatives dựa trên phân phối xác suất
+            num_negatives = negative_sample.size(1)
+            sampled_indices = torch.multinomial(gen_probs, num_samples=num_negatives, replacement=True)
+            
+            # 4. Trích xuất ID của các thực thể hard negatives đã được chọn
+            hard_negative_sample = torch.gather(negative_sample, 1, sampled_indices)
+
+        # 5. Discriminator (mô hình chính) tính loss dựa trên hard negatives
+        negative_score = self.score_negatives(
+            model, positive_sample, hard_negative_sample, mode,
+        )
+        positive_score = model(positive_sample)
+        negative_weights = self.weight_negatives(negative_score)
+        
+        return (
+            positive_score, negative_score, subsampling_weight,
+            positive_sample, mode, negative_weights, None, None,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -708,6 +763,7 @@ STRATEGY_REGISTRY = {
     'uniform': UniformNS,
     'bernoulli': BernoulliNS,
     'selfadv': SelfAdvNS,
+    'kbgan': KBGANStrategy,
     '1vsall': OneVsAll,
     'kvsall': KvsAll,
     'kgau': KGAUStrategy,
@@ -728,6 +784,7 @@ def normalize_strategy_name(name):
         'kvsall': 'kvsall',
         'kgmau': 'kgau',
         'kgmamu': 'kgau',
+        'kbgan': 'kbgan',
     }
     key = aliases.get(key, key)
     if key not in STRATEGY_REGISTRY:
@@ -768,7 +825,7 @@ def get_strategy(args):
 
 
 def is_negsamp_strategy(args):
-    return resolve_strategy_name(args) in ('uniform', 'bernoulli', 'selfadv')
+    return resolve_strategy_name(args) in ('uniform', 'bernoulli', 'selfadv', 'kbgan')
 
 
 def is_allneg_strategy(args):

@@ -2,164 +2,139 @@
 
 ## Giới thiệu
 
-Mã nguồn này phát triển từ [RotatE](https://github.com/DeepGraphLearning/KnowledgeGraphEmbedding) (ICLR 2019) để thử nghiệm và mở rộng các mô hình nhúng đồ thị tri thức cho **khung huấn luyện Knowledge Graph Alignment - Uniformity (KGAU)**.
+Repository này được phát triển và mở rộng từ mã nguồn gốc [RotatE](https://github.com/DeepGraphLearning/KnowledgeGraphEmbedding) (ICLR 2019). Mục tiêu chính của dự án là thử nghiệm, thiết kế và tích hợp **khung huấn luyện KGAU (Knowledge Graph Alignment - Uniformity)**, đồng thời hỗ trợ các cơ chế sinh mẫu đối nghịch nâng cao (như **KBGAN**) cho các tác vụ biểu diễn Đồ thị Tri thức (Knowledge Graph Embeddings).
 
-Ngoài cài đặt khung huấn luyện KGAU cho ComplEx và RotatE, mã nguồn bổ sung nhiều hàm mất mát, chiến lược huấn luyện (lấy mẫu âm / toàn mẫu âm), tối ưu bộ nhớ (chunking), cùng công cụ huấn luyện theo tệp cấu hình JSON và trực quan hóa quá trình học.
+Ngoài việc cài đặt khung huấn luyện KGAU cho ComplEx và RotatE, mã nguồn còn được bổ sung hàng loạt hàm mất mát, chiến lược huấn luyện (lấy mẫu âm / toàn mẫu âm), tối ưu hóa bộ nhớ (chunking), cùng hệ thống cấu hình linh hoạt qua JSON và trực quan hóa quá trình học.
 
 ## Tính năng đã triển khai
 
-### Mô hình
-
-- [x] **ComplEx** (cần `-de` và `-dr`: nhân đôi embedding thực thể và quan hệ)
-- [x] **RotatE** (cần `-de`; quan hệ là pha thực, không nhân đôi `-dr`)
+### Kiến trúc Mô hình
+- [x] **ComplEx** (Yêu cầu bật cờ `-de` và `-dr` để nhân đôi không gian nhúng của thực thể và quan hệ).
+- [x] **RotatE** (Yêu cầu bật cờ `-de`; riêng quan hệ được biểu diễn dưới dạng pha thực nên không dùng `-dr`).
 
 ### Hàm mất mát (`--loss`)
 
-| Mã | Tên | Ghi chú |
+| Mã Loss | Tên gọi | Ghi chú |
 |---|---|---|
 | `se` | Bình phương sai số (*Squared Error*) | |
-| `hinge` | Hinge theo điểm | |
-| `bce` | Entropy chéo nhị phân (*Binary Cross-Entropy*) | Thường kèm `1vsall` / `kvsall` |
+| `hinge` | Hinge Loss theo điểm | |
+| `bce` | Entropy chéo nhị phân (*Binary Cross-Entropy*) | Thường dùng kèm chiến lược `1vsall` / `kvsall`. |
 | `mr` | Xếp hạng biên (*Margin Ranking*) | |
 | `bpr` | Bayesian Personalized Ranking | |
 | `ce` | Entropy chéo nhiều lớp (*Cross-Entropy*) | |
-| `sans` | Lấy mẫu âm đối kháng tự thích nghi (*Self-Adversarial NS*) | Mặc định gốc RotatE khi bật `-adv` |
-| `kgau` | Căn chỉnh–Độ đều (*Alignment–Uniformity*) | Họ KGAU |
-| `kgmau` | KGAU với biên căn chỉnh | |
-| `kgmamu` | KGAU với biên căn chỉnh và biên độ đều | |
+| `sans` | Lấy mẫu âm đối kháng tự thích nghi (*Self-Adversarial NS*) | Mặc định của RotatE (kích hoạt qua cờ `-adv`). |
+| `kgau` | Căn chỉnh – Độ đều (*Alignment – Uniformity*) | Thuộc họ KGAU. |
+| `kgmau` | KGAU kết hợp biên căn chỉnh | |
+| `kgmamu`| KGAU kết hợp biên căn chỉnh và biên độ đều | |
 
 ### Chiến lược huấn luyện (`--strategy`)
 
-| Nhóm | Giá trị | Mô tả ngắn |
+| Nhóm | Giá trị (`--strategy`) | Mô tả |
 |---|---|---|
-| Lấy mẫu âm (NegSamp) | `uniform`, `bernoulli`, `selfadv` | Mỗi bộ ba dương kèm \(N\) thực thể âm |
-| Toàn bộ âm (AllNeg) | `1vsall`, `kvsall` | Chấm điểm trên toàn bộ tập thực thể |
-| KGAU | `kgau` | Chiến lược buấn luyện KGAU |
+| Lấy mẫu âm (NegSamp) | `uniform`, `bernoulli`, `selfadv` | Mỗi bộ ba dương (positive) đi kèm N thực thể âm (negative). |
+| Sinh mẫu đối nghịch | `kbgan` | Sử dụng Generator mồi để trích xuất các *hard negatives* chất lượng cao. |
+| Toàn bộ âm (AllNeg) | `1vsall`, `kvsall` | Chấm điểm ứng viên trên toàn bộ không gian tập thực thể. |
+| KGAU | `kgau` | Chiến lược huấn luyện đặc thù sử dụng positive samples để tối ưu Alignment-Uniformity. |
 
-### Chỉ số đánh giá
+### Tác vụ & Chỉ số đánh giá
+- **Dự đoán liên kết (Link prediction, filtered):** MRR, MR, HITS@1, HITS@3, HITS@10.
+- **Phân loại Giá trị / Phân loại Bộ ba (Value / Triple Classification):** Accuracy, Precision, Recall, F1, PR-AUC, ROC-AUC. 
+  *(Tích hợp cơ chế tự động dò ngưỡng Hybrid: Relation-specific thresholds kết hợp Global fallback).*
 
-- Dự đoán liên kết (*link prediction*, filtered): **MRR**, **MR**, **HITS@1**, **HITS@3**, **HITS@10**
-- Phân loại bộ ba (*triple classification*): accuracy, precision, recall, F1, PR-AUC, ROC-AUC
-
-### Tối ưu hiệu năng / bộ nhớ
-
-- **Chunking lấy mẫu âm** (`--negative_chunk_size`, mặc định `256`): chia việc chấm điểm mẫu âm, kết hợp gradient checkpointing
-- **Chunking cặp độ đều** (`--uniform_pair_chunk_size`, mặc định `256`): tính độ phủ đều theo khối cặp, giữ đúng mọi cặp \(i < j\)
-- RotatE AllNeg: nhân kernel Triton (kèm fallback PyTorch) để tăng tốc chấm điểm toàn thực thể
+### Tối ưu Hiệu năng / Bộ nhớ
+- **Chunking lấy mẫu âm** (`--negative_chunk_size`, mặc định `256`): Chia nhỏ quá trình chấm điểm mẫu âm kết hợp Gradient Checkpointing để chống tràn RAM GPU (OOM).
+- **Chunking độ đều KGAU** (`--uniform_pair_chunk_size`, mặc định `256`): Tính toán độ phủ đều theo khối cặp, tối ưu bộ nhớ nhưng vẫn đảm bảo trọn vẹn thuật toán.
+- **Tăng tốc RotatE AllNeg**: Tích hợp nhân kernel Triton (với fallback PyTorch) để tăng tốc độ chấm điểm trên toàn bộ thực thể.
 
 ## Cấu trúc thư mục
 
-```
+```text
 KGEsfromRotatE/
-├── codes/                 # Huấn luyện và đánh giá chính
-│   ├── run.py             # CLI: đọc args, vòng lặp train/valid/test
-│   ├── loss.py            # Các hàm mất mát (gồm hàm mất mát KGAU)
-│   ├── strategy.py        # Chiến lược NegSamp / AllNeg / KGAU
-│   ├── dataloader.py      # Dataset / DataLoader
-│   └── metrics/           # Độ đo xếp hạng và phân loại
-├── configs/               # Tệp cấu hình JSON (ComplEx/RotatE × loss × dataset)
-├── data/                  # Bộ dữ liệu KGE
-├── visualization/         # Huấn luyện theo config + biểu đồ / t-SNE
-│   ├── main.py            # Đường cong học: căn chỉnh–độ đều, loss, MRR
-│   └── emb_tsne.py        # Ảnh chụp t-SNE embedding theo epoch
-├── nohup/                 # Chạy nền (log, pid)
-├── run.sh                 # Tiện ích tìm siêu tham số (kiểu RotatE gốc)
-└── best_config.sh         # Cấu hình tái hiện bài báo RotatE
+├── codes/                 # Mã nguồn lõi (Kiến trúc, Huấn luyện, Đánh giá)
+│   ├── __init__.py
+│   ├── dataloader.py      # Xử lý Dataset và DataLoader
+│   ├── loss.py            # Cài đặt các hàm mất mát (KGAU, BCE, Margin, SANS,...)
+│   ├── metrics.py         # Tổng hợp các độ đo xếp hạng và phân loại
+│   ├── model.py           # Kiến trúc KGEModel, query/target encoders, hàm train/test
+│   └── strategy.py        # Chiến lược huấn luyện (NegSamp, AllNeg, KBGAN, KGAU)
+├── configs/               # Các tệp cấu hình JSON mẫu cho từng bộ dữ liệu và mô hình
+├── data/                  # Thư mục chứa các bộ dữ liệu Đồ thị tri thức
+├── docs/                  # Tài liệu và ghi chú của dự án
+├── nohup/                 # Scripts hỗ trợ chạy nền và lưu trữ log
+├── visualization/         # Công cụ trực quan hóa (Learning curves, t-SNE)
+│   ├── emb_tsne.py        
+│   └── main.py            
+├── .gitignore
+├── LICENSE
+├── main.py                # ENTRY POINT: File chạy chính của toàn bộ dự án
+└── requirements.txt       # Danh sách thư viện phụ thuộc
 ```
 
 ## Định dạng dữ liệu
 
-Mỗi bộ dữ liệu trong `data/<tên>/` gồm:
+Mỗi bộ dữ liệu đặt trong thư mục `data/<tên_dataset>/` bắt buộc phải bao gồm 5 tệp:
 
 | Tệp | Vai trò |
 |---|---|
-| `entities.dict` | Ánh xạ thực thể → id |
-| `relations.dict` | Ánh xạ quan hệ → id |
-| `train.txt` | Bộ ba huấn luyện |
-| `valid.txt` | Bộ ba kiểm định (tạo tệp rỗng nếu không có) |
-| `test.txt` | Bộ ba kiểm thử |
+| `entities.dict` | Từ điển ánh xạ: Tên thực thể → ID |
+| `relations.dict` | Từ điển ánh xạ: Tên quan hệ → ID |
+| `train.txt` | Tập bộ ba dùng để huấn luyện |
+| `valid.txt` | Tập kiểm định (Tạo tệp rỗng nếu không sử dụng) |
+| `test.txt` | Tập kiểm thử (Đánh giá mô hình cuối cùng) |
 
-Các bộ có sẵn ví dụ: `wn18rr`, `fb15k_237`, `fb15k`, `wn18`, `countries_s1/s2/s3`, `yago3_10`, `hetionet`.
+*Một số bộ dataset tiêu biểu: `wn18rr`, `fb15k_237`, `countries_s1/s2/s3`, `yago3_10`, `hetionet`.*
 
-## Cài đặt
+## Cài đặt Môi trường
 
-1. Tạo môi trường ảo và kích hoạt:
+1. Tạo và kích hoạt môi trường ảo (Virtual Environment):
 
 ```bash
 python -m venv .venv
 
-# Linux/macOS
+# Trên Linux/macOS
 source .venv/bin/activate
 
-# Windows (PowerShell)
+# Trên Windows (PowerShell)
 .venv\Scripts\activate
 ```
 
-2. Cài phụ thuộc:
+2. Cài đặt các thư viện phụ thuộc:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Huấn luyện
+## Hướng dẫn Chạy mô hình (Huấn luyện & Đánh giá)
 
-### Cách 1 — Theo tệp cấu hình JSON (khuyến nghị)
+Tất cả các lệnh thực thi đều được gọi từ thư mục gốc (root) thông qua file `main.py`.
 
-Các thí nghiệm trong repo thường dùng `visualization/main.py` (vẽ đường cong học) hoặc chạy nền qua `nohup/`:
+### Cách 1 — Chạy theo tệp cấu hình JSON (Khuyến nghị)
+Sử dụng công cụ trong thư mục `visualization` hoặc `nohup` để chạy dựa trên config định sẵn, tự động vẽ đường cong học tập (Learning curves).
 
 ```bash
-# Huấn luyện + lưu biểu đồ căn chỉnh/độ đều và loss/MRR
-.venv/bin/python -u visualization/main.py configs/ComplEx64_WN18RR_kgau4_100e.json --gpu 0 --no-show
+# Huấn luyện + lưu biểu đồ căn chỉnh/độ đều, loss, MRR
+python -u visualization/main.py configs/ComplEx64_WN18RR_kgau4_100e.json --gpu 0 --no-show
 
-# Chạy nền
+# Hoặc chạy nền bằng script nohup
 ./nohup/run.sh configs/ComplEx64_WN18RR_kgau4_100e.json --gpu 0 --no-show
 ```
 
-Ví dụ cấu hình KGAU (`configs/ComplEx64_WN18RR_kgau4_100e.json`):
+### Cách 2 — Chạy trực tiếp qua CLI `main.py`
 
-```json
-{
-  "model": "ComplEx",
-  "data_path": "data/wn18rr",
-  "loss": "kgau",
-  "strategy": "kgau",
-  "dim": 64,
-  "batch_size": 512,
-  "margin_gamma": 200.0,
-  "learning_rate": 0.002,
-  "epochs": 100,
-  "double_entity_embedding": true,
-  "double_relation_embedding": true,
-  "uniform_t": 4,
-  "uniform_pair_chunk_size": 256,
-  "uniform_gamma_q": 1.0,
-  "uniform_gamma_y": 1.0,
-  "uniform_gamma_e": 1.0
-}
-```
-
-### Cách 2 — CLI `codes/run.py`
-
-Ví dụ huấn luyện RotatE trên FB15k với GPU 0 (phong cách gốc RotatE):
-
+**Ví dụ 1: Huấn luyện RotatE trên tập FB15k (Phong cách gốc):**
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -u codes/run.py --do_train \
-  --cuda \
-  --do_valid \
-  --do_test \
+CUDA_VISIBLE_DEVICES=0 python main.py --do_train --do_valid --do_test --cuda \
   --data_path data/fb15k \
-  --model RotatE \
+  --model RotatE -de \
   -n 256 -b 1024 -d 1000 \
   -g 24.0 -a 1.0 -adv \
   -lr 0.0001 --epochs 150 \
-  --test_batch_size 16 -de
+  --test_batch_size 16 
 ```
 
-Ví dụ ComplEx + KGAU trên WN18RR:
-
+**Ví dụ 2: Huấn luyện ComplEx với Loss KGAU trên WN18RR:**
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -u codes/run.py --do_train --cuda \
-  --do_valid --do_test \
+CUDA_VISIBLE_DEVICES=0 python main.py --do_train --do_valid --do_test --cuda \
   --data_path data/wn18rr \
   --model ComplEx -de -dr \
   --loss kgau --strategy kgau \
@@ -169,80 +144,56 @@ CUDA_VISIBLE_DEVICES=0 python -u codes/run.py --do_train --cuda \
   -r 5e-6 -rp 3
 ```
 
-Xem đầy đủ tham số trong `codes/run.py` (`parse_args`).
-
-### Tái hiện kết quả bài báo RotatE
-
-Chạy các lệnh trong `best_config.sh` để tái hiện RotatE / ComplEx trên các bộ chuẩn (theo mã nguồn gốc). Tìm siêu tham số nhanh:
-
+**Ví dụ 3: Đánh giá Value/Triple Classification sử dụng KBGAN:**
 ```bash
-bash run.sh train RotatE fb15k 0 0 1024 256 1000 24.0 1.0 0.0001 150 16 -de
+CUDA_VISIBLE_DEVICES=0 python main.py --do_train --do_test --cuda \
+  --data_path data/wn18rr \
+  --model ComplEx -de -dr \
+  --strategy kbgan \
+  --generator_checkpoint path/to/generator/checkpoint \
+  --triple_classification \
+  --threshold_mode relation
 ```
 
-## Kiểm thử từ checkpoint
+## Kiểm thử từ Checkpoint đã lưu
+
+Sử dụng cờ `--init_checkpoint` trỏ tới thư mục chứa file `checkpoint` hoặc `checkpoint_best`. Hệ thống sẽ ưu tiên nạp trọng số tốt nhất dựa trên tập validation.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -u codes/run.py --do_test --cuda
+CUDA_VISIBLE_DEVICES=0 python main.py --do_test --cuda --init_checkpoint path/to/save_folder
 ```
 
-Checkpoint tốt nhất theo chỉ số kiểm định (best-valid) được ưu tiên khi đánh giá cuối (xem log `Test checkpoint: best-valid`).
+## Trực quan hóa Không gian Nhúng (t-SNE)
 
-## Trực quan hóa bản nhúng (t-SNE)
-
-`visualization/emb_tsne.py` huấn luyện theo config và lưu ảnh t-SNE tại các epoch mốc (mặc định: epoch 1, giữa, cuối — với 200 epoch là 1 / 100 / 200). Mỗi màu là một query `(head, relation)`; mỗi điểm là một trong top-\(k\) đuôi theo **điểm số mô hình tại đúng epoch đó** (không phải gold label).
+Chạy script `emb_tsne.py` để chụp lại không gian nhúng của đồ thị tri thức tại các mốc epoch cụ thể. Tính năng này giúp quan sát sự dịch chuyển của các cụm thực thể (clusters) trong quá trình mô hình học.
 
 ```bash
-.venv/bin/python -u visualization/emb_tsne.py \
+python -u visualization/emb_tsne.py \
   configs/ComplEx64_WN18RR_kgau4_200e.json \
   --tsne-epochs 1 100 200 --gpu 0
-
-# Chạy nền
-./nohup/run_emb_tsne.sh configs/ComplEx64_WN18RR_kgau4_200e.json --tsne-epochs 1 100 200 --gpu 0
 ```
+*Kết quả ảnh xuất ra mặc định nằm trong: `visualization/outputs/<tên_config>_<timestamp>/`.*
 
-Kết quả mặc định nằm trong `visualization/outputs/<tên_config>_<timestamp>/`.
+## Các Tham số Command-Line Quan trọng
 
-## Tham số quan trọng
-
-| Tham số | Ý nghĩa |
+| Cờ (Flag) | Ý nghĩa |
 |---|---|
-| `--model` | `ComplEx` hoặc `RotatE` |
-| `--loss` / `--strategy` | Hàm mất mát và chiến lược (bảng trên) |
-| `-d` / `--dim` | Số chiều embedding |
-| `-b` / `--batch_size` | Kích thước batch |
-| `-n` / `--negative_sample_size` | Số mẫu âm (NegSamp) |
-| `--negative_chunk_size` | Kích thước chunk khi chấm điểm mẫu âm (`≤0` = tắt) |
-| `-g` / `--margin_gamma` | Biên / hệ số gamma của mô hình |
-| `--uniform_t` | Nhiệt độ \(t\) trong độ đều |
-| `--uniform_pair_chunk_size` | Chunk cặp khi tính độ đều |
-| `--uniform-gamma-q/y/e` | Trọng số độ đều trên query / target / entity |
-| `-r` / `-rp` | Hệ số và bậc chuẩn hóa \(L_p\) embedding |
-| `--epochs` | Số chu kỳ huấn luyện |
-| `-de` / `-dr` | Nhân đôi embedding thực thể / quan hệ |
+| `--model` | Chọn kiến trúc: `ComplEx` hoặc `RotatE`. |
+| `--loss` | Chỉ định hàm mất mát (VD: `sans`, `kgau`, `bce`,...). |
+| `--strategy` | Chiến lược huấn luyện (VD: `uniform`, `kbgan`, `1vsall`, `kgau`). |
+| `-d` / `--dim` | Số chiều (Dimension) của vector nhúng. |
+| `-b` / `--batch_size` | Kích thước Batch Size huấn luyện. |
+| `-n` / `--negative_sample_size` | Số lượng mẫu âm sinh ra cho mỗi mẫu dương (áp dụng cho NegSamp). |
+| `--triple_classification`| Bật chế độ đánh giá Value Classification thay vì Link Prediction. |
+| `--generator_checkpoint`| Bắt buộc cung cấp đường dẫn checkpoint mô hình mồi nếu dùng `--strategy kbgan`. |
+| `--uniform_t` | Siêu tham số nhiệt độ T dùng trong uniformity loss. |
+| `-de` / `-dr` | Cờ nhân đôi kích thước không gian biểu diễn cho thực thể / quan hệ. |
 
-## Kiến trúc mã nguồn
+## Trích dẫn (Citation)
 
-Ba đối tượng chính:
+Nếu bạn sử dụng một phần hoặc toàn bộ mã nguồn liên quan đến RotatE, vui lòng trích dẫn bài báo gốc theo định dạng sau:
 
-- **TrainDataset / TestDataset** (`dataloader.py`, và dataset trong `strategy.py`): luồng dữ liệu huấn luyện và đánh giá
-- **KGEModel** (`model.py`): embedding, bộ chấm điểm (query/target encoder), API `train_step` / `test_step`
-- **Chiến lược + hàm mất mát** (`strategy.py`, `loss.py`): chuẩn bị batch và tính loss
-
-`codes/run.py` chứa hàm chính: phân tích tham số, đọc dữ liệu, khởi tạo mô hình và vòng lặp huấn luyện.
-
-Thêm scorers mới trong `model.py` (đăng ký vào `KGE_SCORERS`), ví dụ khung:
-
-```python
-def score(self, head, relation, tail, mode):
-    # trả về điểm số bộ ba; điểm cao = hợp lệ hơn
-    ...
-```
-
-## Trích dẫn
-
-Nếu sử dụng mã nguồn dựa trên RotatE, hãy trích dẫn [bài báo](https://openreview.net/forum?id=HkgEQnRqYQ):
-
-```
+```bibtex
 @inproceedings{
  sun2018rotate,
  title={RotatE: Knowledge Graph Embedding by Relational Rotation in Complex Space},

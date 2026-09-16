@@ -7,10 +7,9 @@ import random
 import numpy as np
 import torch
 
-from model import KGEModel, resolve_rotate_score_mode
-
-from loss import UniGammaController, build_training_optimizer, is_learnable_kgau_gammas, set_optimizer_learning_rates, update_kgau_gamma_schedule
-from strategy import get_strategy, resolve_strategy_name
+from codes.model import KGEModel, resolve_rotate_score_mode
+from codes.loss import UniGammaController, build_training_optimizer, is_learnable_kgau_gammas, set_optimizer_learning_rates, update_kgau_gamma_schedule
+from codes.strategy import get_strategy, resolve_strategy_name
 
 def steps_per_epoch(num_train_triples, batch_size):
     batches = (num_train_triples + batch_size - 1) // batch_size
@@ -48,12 +47,23 @@ def parse_args(args=None):
     parser.add_argument('-g', '--margin_gamma', default=12.0, type=float)
     parser.add_argument('-adv', '--negative_adversarial_sampling', action='store_true')
     parser.add_argument('-a', '--adversarial_temperature', default=1.0, type=float)
+    
     parser.add_argument(
         '--strategy', default=None, type=str,
-        choices=['uniform', 'bernoulli', 'selfadv', '1vsall', 'kvsall', 'kgau'],
-        help='Training strategy: NegSamp (uniform|bernoulli|selfadv), AllNeg (1vsall|kvsall), '
-             'or kgau (positives only). Default: kgau for KGAU-family loss, selfadv for sans, else uniform.',
+        choices=['uniform', 'bernoulli', 'selfadv', 'kbgan', '1vsall', 'kvsall', 'kgau'],
+        help='Training strategy. Include "kbgan" for adversarial sampling via Generator.',
     )
+    
+    # Bổ sung args cho Triple Classification
+    parser.add_argument('--triple_classification', action='store_true', 
+                        help='Evaluate on Triple Classification task instead of Link Prediction')
+    parser.add_argument('--threshold_mode', default='relation', type=str, choices=['global', 'relation'],
+                        help='Threshold search mode for Triple Classification')
+    
+    # Bổ sung arg để load Generator cho KBGAN
+    parser.add_argument('--generator_checkpoint', default=None, type=str,
+                        help='Path to the pre-trained KGE generator checkpoint (required if strategy=kbgan)')
+
     parser.add_argument('-b', '--batch_size', default=1024, type=int)
     parser.add_argument('-r', '--regularization_coeff', default=0.0, type=float,
                         help='Lp embedding regularization coefficient')
@@ -295,7 +305,39 @@ def main(args):
     if args.cuda:
         kge_model = kge_model.cuda()
 
+    # --- KHỞI TẠO GENERATOR CHO KBGAN ---
+    if resolve_strategy_name(args) == 'kbgan':
+        if not args.generator_checkpoint:
+            raise ValueError('KBGAN strategy requires a pre-trained generator. Please provide --generator_checkpoint')
+        
+        logging.info('Loading Generator for KBGAN from %s...' % args.generator_checkpoint)
+        gen_checkpoint = torch.load(os.path.join(args.generator_checkpoint, 'checkpoint'))
+        
+        # Đọc config của Generator
+        with open(os.path.join(args.generator_checkpoint, 'config.json'), 'r') as fjson:
+            gen_args = json.load(fjson)
+            
+        generator_model = KGEModel(
+            model_name=gen_args['model'],
+            nentity=nentity,
+            nrelation=nrelation,
+            dim=gen_args['dim'],
+            margin_gamma=gen_args['margin_gamma'],
+            double_entity_embedding=gen_args['double_entity_embedding'],
+            double_relation_embedding=gen_args['double_relation_embedding'],
+            score_mode=gen_args.get('score_mode', 'distance')
+        )
+        generator_model.load_state_dict(gen_checkpoint['model_state_dict'], strict=False)
+        generator_model.eval() # Generator chỉ để suy luận sinh mẫu, không học thêm
+        if args.cuda:
+            generator_model = generator_model.cuda()
+            
+        # Gắn generator vào discriminator (mô hình chính)
+        kge_model.generator = generator_model
+    # ------------------------------------
+
     init_step = 0
+    
     if args.init_checkpoint:
         logging.info('Loading checkpoint %s...' % args.init_checkpoint)
         checkpoint = torch.load(os.path.join(args.init_checkpoint, 'checkpoint'))
