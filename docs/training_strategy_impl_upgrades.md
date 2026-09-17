@@ -18,7 +18,7 @@ Setup tham chiếu: ComplEx `dim=500` (`D=1000` với double-emb), `batch_size=5
 3. Khi train và `C < N`: `torch.utils.checkpoint` mỗi chunk.
 4. `cat` → `negative_score [B, N]`; weight như cũ (Self-Adv softmax trên đủ N).
 
-**Code:** `codes/strategy.py` (`NegSampStrategy.score_negatives`)
+**Code:** `code/strategy.py` (`NegSampStrategy.score_negatives`)
 
 | Parameter | Default | Ý nghĩa |
 |---|---|---|
@@ -40,7 +40,7 @@ Setup tham chiếu: ComplEx `dim=500` (`D=1000` với double-emb), `batch_size=5
 3. `scores[B,E] =` matmul query × full entity table (`score_query_entities`).
 4. Loss trên `[B, E]` + labels.
 
-**Code:** `codes/model.py` (`score_all_entities`), `codes/strategy.py` (`AllNegStrategy`)
+**Code:** `code/model.py` (`score_all_entities`), `code/strategy.py` (`AllNegStrategy`)
 
 | Parameter | Default | Ý nghĩa |
 |---|---|---|
@@ -62,7 +62,7 @@ Setup tham chiếu: ComplEx `dim=500` (`D=1000` với double-emb), `batch_size=5
 3. Sau normalize: `‖a−b‖² = 2 − 2 a·b`.
 4. Cộng dồn `mean` rồi `log` — **exact** cùng công thức cũ.
 
-**Code:** `codes/loss.py` (`chunked_pairwise_uniformity`, …)
+**Code:** `code/loss.py` (`chunked_pairwise_uniformity`, …)
 
 | Parameter | Default | Ý nghĩa |
 |---|---|---|

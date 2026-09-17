@@ -3,25 +3,46 @@ import json
 import logging
 import os
 import random
+from datetime import datetime
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
-from codes.model import KGEModel, resolve_rotate_score_mode
-from codes.loss import UniGammaController, build_training_optimizer, is_learnable_kgau_gammas, set_optimizer_learning_rates, update_kgau_gamma_schedule
-from codes.strategy import get_strategy, resolve_strategy_name
+from code.model import KGEModel, resolve_rotate_score_mode
+from code.loss import UniGammaController, build_training_optimizer, is_learnable_kgau_gammas, set_optimizer_learning_rates, update_kgau_gamma_schedule
+from code.strategy import get_strategy, resolve_strategy_name
 
 def steps_per_epoch(num_train_triples, batch_size):
     batches = (num_train_triples + batch_size - 1) // batch_size
     return 2 * batches
 
 def parse_args(args=None):
+    # =========================================================================
+    # PASS 1: Quét tìm file config JSON trước
+    # =========================================================================
+    conf_parser = argparse.ArgumentParser(add_help=False)
+    conf_parser.add_argument(
+        'config_file', nargs='?', type=str, default=None, 
+        help='Đường dẫn đến file cấu hình JSON (Ví dụ: configs/ComplEx128_WN18RR_kgau4_100e.json)'
+    )
+    
+    known_args, remaining_argv = conf_parser.parse_known_args(args)
+    
+    defaults = {}
+    if known_args.config_file and known_args.config_file.endswith('.json'):
+        with open(known_args.config_file, 'r') as fjson:
+            defaults = json.load(fjson)
+
+    # =========================================================================
+    # PASS 2: Khởi tạo parser chính và nạp thông số
+    # =========================================================================
     parser = argparse.ArgumentParser(
         description='Training and Testing Knowledge Graph Embedding Models',
-        usage='train.py [<args>] [-h | --help]'
+        parents=[conf_parser] # Kế thừa lại tham số config_file
     )
 
-    parser.add_argument('--cuda', action='store_true', help='use GPU')
+    parser.add_argument('--no_cuda', action='store_true', help='Ép không dùng GPU (Mặc định tự động dùng GPU nếu có)')
     
     parser.add_argument('--do_train', action='store_true')
     parser.add_argument('--do_valid', action='store_true')
@@ -29,8 +50,7 @@ def parse_args(args=None):
     parser.add_argument('--evaluate_train', action='store_true', help='Evaluate on training data')
     
     parser.add_argument('--countries', action='store_true', help='Use Countries S1/S2/S3 datasets')
-    parser.add_argument('--regions', type=int, nargs='+', default=None, 
-                        help='Region Id for Countries S1/S2/S3 datasets, DO NOT MANUALLY SET')
+    parser.add_argument('--regions', type=int, nargs='+', default=None, help='Region Id for Countries S1/S2/S3 datasets')
     
     parser.add_argument('--data_path', type=str, default=None)
     parser.add_argument('--model', default='TransE', type=str)
@@ -38,103 +58,99 @@ def parse_args(args=None):
     parser.add_argument('-dr', '--double_relation_embedding', action='store_true')
     
     parser.add_argument('-n', '--negative_sample_size', default=128, type=int)
-    parser.add_argument(
-        '--negative_chunk_size', default=256, type=int,
-        help='NegSamp only: max negatives scored per chunk (default 256; <=0 = no chunking). '
-             'When chunking, uses gradient checkpointing to cap peak GPU memory.',
-    )
+    parser.add_argument('--negative_chunk_size', default=256, type=int, help='Max negatives scored per chunk')
     parser.add_argument('-d', '--dim', default=500, type=int)
     parser.add_argument('-g', '--margin_gamma', default=12.0, type=float)
     parser.add_argument('-adv', '--negative_adversarial_sampling', action='store_true')
     parser.add_argument('-a', '--adversarial_temperature', default=1.0, type=float)
     
-    parser.add_argument(
-        '--strategy', default=None, type=str,
-        choices=['uniform', 'bernoulli', 'selfadv', 'kbgan', '1vsall', 'kvsall', 'kgau'],
-        help='Training strategy. Include "kbgan" for adversarial sampling via Generator.',
-    )
+    parser.add_argument('--strategy', default=None, type=str,
+                        choices=['uniform', 'bernoulli', 'selfadv', 'kbgan', '1vsall', 'kvsall', 'kgau'],
+                        help='Training strategy. Include "kbgan" for adversarial sampling via Generator.')
     
-    # Bổ sung args cho Triple Classification
+    # Args cho Value / Triple Classification
     parser.add_argument('--triple_classification', action='store_true', 
-                        help='Evaluate on Triple Classification task instead of Link Prediction')
+                        help='Evaluate on Value / Triple Classification task')
     parser.add_argument('--threshold_mode', default='relation', type=str, choices=['global', 'relation'],
                         help='Threshold search mode for Triple Classification')
-    
-    # Bổ sung arg để load Generator cho KBGAN
     parser.add_argument('--generator_checkpoint', default=None, type=str,
                         help='Path to the pre-trained KGE generator checkpoint (required if strategy=kbgan)')
 
     parser.add_argument('-b', '--batch_size', default=1024, type=int)
-    parser.add_argument('-r', '--regularization_coeff', default=0.0, type=float,
-                        help='Lp embedding regularization coefficient')
-    parser.add_argument('-rp', '--regularization_p', default=3, type=int,
-                        help='Lp norm order for embedding regularization')
-    parser.add_argument('--test_batch_size', default=4, type=int, help='valid/test batch size')
-    parser.add_argument('--uni_weight', action='store_true', 
-                        help='Otherwise use subsampling weighting like in word2vec')
+    parser.add_argument('-r', '--regularization_coeff', default=0.0, type=float)
+    parser.add_argument('-rp', '--regularization_p', default=3, type=int)
+    parser.add_argument('--test_batch_size', default=4, type=int)
+    parser.add_argument('--uni_weight', action='store_true')
     
     parser.add_argument('-lr', '--learning_rate', default=0.0001, type=float)
-    parser.add_argument('-cpu', '--cpu_num', default=4, type=int,
-                        help='DataLoader workers (clamped to system-suggested max)')
+    parser.add_argument('-cpu', '--cpu_num', default=4, type=int)
     parser.add_argument('-init', '--init_checkpoint', default=None, type=str)
     parser.add_argument('-save', '--save_path', default=None, type=str)
-    parser.add_argument('--epochs', default=100, type=int,
-                        help='Number of training epochs (full head+tail passes over train triples)')
-    parser.add_argument('--warm_up_epochs', default=None, type=int,
-                        help='Epochs before first learning-rate decay (default: epochs // 2)')
+    parser.add_argument('--epochs', default=100, type=int)
+    parser.add_argument('--warm_up_epochs', default=None, type=int)
     
     parser.add_argument('--save_checkpoint_steps', default=10000, type=int)
     parser.add_argument('--valid_steps', default=10000, type=int)
-    parser.add_argument('--log_steps', default=100, type=int, help='train log every xx steps')
-    parser.add_argument('--test_log_steps', default=1000, type=int, help='valid/test log every xx steps')
+    parser.add_argument('--log_steps', default=100, type=int)
+    parser.add_argument('--test_log_steps', default=1000, type=int)
     
     parser.add_argument('--loss', default='sans', type=str,
-                        choices=['se', 'hinge', 'bce', 'mr', 'bpr', 'ce', 'sans', 'kgau', 'kgmau', 'kgmamu'],
-                        help='Training loss (see codes/loss.py)')
+                        choices=['se', 'hinge', 'bce', 'mr', 'bpr', 'ce', 'sans', 'kgau', 'kgmau', 'kgmamu'])
 
-    parser.add_argument('--align_margin', default=0.0, type=float,
-                        help='Margin m for KGmAU/KGmAmU alignment: ReLU(d^2 - m); keep small in [0, 4]')
-    parser.add_argument('--align_alpha', default=2.0, type=float,
-                        help='KGAU alignment exponent: E[||x-y||_2^alpha] (default 2)')
-    parser.add_argument('--uniform_margin', default=2.0, type=float,
-                        help='Margin m_u for KGmAmU soft-margin AU: log E[exp(t*ReLU(m_u-d^2))]; in (0, 4]')
-    parser.add_argument('--uniform_t', default=4, type=float,
-                        help='Uniformity temperature for KGAU loss')
-    parser.add_argument(
-        '--uniform_pair_chunk_size', default=256, type=int,
-        help='KGAU-family: pairwise block size for uniformity (default 256; <=0 = no blocking). '
-             'Exact i<j reduction; lowers peak memory vs torch.pdist.',
-    )
-    parser.add_argument('--uniform-gamma-q', dest='uniform_gamma_q', default=1.0, type=float,
-                        help='Initial KGAU uniformity weight for query embeddings (0=off)')
-    parser.add_argument('--uniform-gamma-y', dest='uniform_gamma_y', default=1.0, type=float,
-                        help='Initial KGAU uniformity weight for target embeddings (0=off)')
-    parser.add_argument('--uniform-gamma-e', dest='uniform_gamma_e', default=0.0, type=float,
-                        help='Initial KGAU uniformity weight for entity embeddings (0=off)')
+    parser.add_argument('--align_margin', default=0.0, type=float)
+    parser.add_argument('--align_alpha', default=2.0, type=float)
+    parser.add_argument('--uniform_margin', default=2.0, type=float)
+    parser.add_argument('--uniform_t', default=4, type=float)
+    parser.add_argument('--uniform_pair_chunk_size', default=256, type=int)
+    parser.add_argument('--uniform-gamma-q', dest='uniform_gamma_q', default=1.0, type=float)
+    parser.add_argument('--uniform-gamma-y', dest='uniform_gamma_y', default=1.0, type=float)
+    parser.add_argument('--uniform-gamma-e', dest='uniform_gamma_e', default=0.0, type=float)
 
-    parser.add_argument('--learnable_kgau_gammas', action='store_true',
-                        help='Learn batch-wise KGAU gamma down-weighting via log_gamma_adj')
-    parser.add_argument('--log_kgau_gamma_lr', default=None, type=float,
-                        help='LR for learnable KGAU gammas (default: learning_rate)')
-    parser.add_argument('--gamma_linear_schedule', action='store_true',
-                        help='Linearly anneal KGAU gamma schedule multiplier over training')
-    parser.add_argument('--gamma_schedule_end', default=0.1, type=float,
-                        help='Final KGAU gamma schedule multiplier')
-    parser.add_argument('--gamma_schedule_start_epoch', default=0, type=int,
-                        help='Epoch when KGAU gamma schedule starts')
-    parser.add_argument('--gamma_schedule_epochs', default=0, type=int,
-                        help='KGAU gamma schedule length (0=full epochs)')
+    parser.add_argument('--learnable_kgau_gammas', action='store_true')
+    parser.add_argument('--log_kgau_gamma_lr', default=None, type=float)
+    parser.add_argument('--gamma_linear_schedule', action='store_true')
+    parser.add_argument('--gamma_schedule_end', default=0.1, type=float)
+    parser.add_argument('--gamma_schedule_start_epoch', default=0, type=int)
+    parser.add_argument('--gamma_schedule_epochs', default=0, type=int)
     
     parser.add_argument('--nentity', type=int, default=0, help='DO NOT MANUALLY SET')
     parser.add_argument('--nrelation', type=int, default=0, help='DO NOT MANUALLY SET')
+
+    # =========================================================================
+    # Áp dụng Defaults từ JSON và Parse CLI args để đè lên
+    # =========================================================================
+    parser.set_defaults(**defaults)
+    parsed_args = parser.parse_args(remaining_argv)
     
-    return parser.parse_args(args)
+    # 1. Tự động nhận diện GPU: Luôn dùng cuda trừ khi cờ --no_cuda được bật
+    if not parsed_args.no_cuda:
+        parsed_args.cuda = torch.cuda.is_available()
+    else:
+        parsed_args.cuda = False
+        
+    # 2. Tự động thiết lập quy trình: Nếu chạy bằng config, tự kích hoạt train/valid/test
+    if known_args.config_file:
+        if not (parsed_args.do_train or parsed_args.do_valid or parsed_args.do_test):
+            parsed_args.do_train = True
+            parsed_args.do_valid = True
+            parsed_args.do_test = True
+            
+    # 3. Tự động gán save_path vào thư mục outputs/ với timestamp
+    if parsed_args.do_train and parsed_args.save_path is None:
+        if known_args.config_file:
+            config_name = os.path.basename(known_args.config_file).replace('.json', '')
+        else:
+            config_name = "main_cli"
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        parsed_args.save_path = os.path.join('outputs', f"{config_name}_{timestamp}")
+            
+    return parsed_args
+
 
 def override_config(args):
     '''
     Override model and data configuration
     '''
-    
     with open(os.path.join(args.init_checkpoint, 'config.json'), 'r') as fjson:
         argparse_dict = json.load(fjson)
     
@@ -146,7 +162,8 @@ def override_config(args):
     args.double_relation_embedding = argparse_dict['double_relation_embedding']
     args.dim = argparse_dict['dim']
     args.test_batch_size = argparse_dict['test_batch_size']
-    
+
+
 def save_model(model, optimizer, save_variable_list, args, checkpoint_name='checkpoint'):
     '''
     Save the parameters of the model and the optimizer,
@@ -154,7 +171,7 @@ def save_model(model, optimizer, save_variable_list, args, checkpoint_name='chec
     '''
     argparse_dict = vars(args)
     with open(os.path.join(args.save_path, 'config.json'), 'w') as fjson:
-        json.dump(argparse_dict, fjson)
+        json.dump(argparse_dict, fjson, indent=4)
 
     torch.save({
         **save_variable_list,
@@ -191,13 +208,13 @@ def read_triple(file_path, entity2id, relation2id):
             triples.append((entity2id[h], relation2id[r], entity2id[t]))
     return triples
 
+
 def set_logger(args):
     '''
-    Write logs to checkpoint and console
+    Write logs to checkpoint file ONLY (to avoid breaking tqdm progress bar on console)
     '''
-
     if args.do_train:
-        log_file = os.path.join(args.save_path or args.init_checkpoint, 'train.log')
+        log_file = os.path.join(args.save_path, 'train.log')
     else:
         log_file = os.path.join(args.save_path or args.init_checkpoint, 'test.log')
 
@@ -208,20 +225,27 @@ def set_logger(args):
         filename=log_file,
         filemode='w'
     )
-    console = logging.StreamHandler()
-    console.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(asctime)s %(levelname)-8s %(message)s')
-    console.setFormatter(formatter)
-    logging.getLogger('').addHandler(console)
+
 
 def log_metrics(mode, step, metrics):
     '''
-    Print the evaluation logs
+    Print the evaluation logs to File
     '''
     for metric in metrics:
         logging.info('%s %s at step %d: %f' % (mode, metric, step, metrics[metric]))
-        
-        
+
+
+def save_results_to_txt(filepath, mode, metrics):
+    '''
+    Save evaluation metrics to results.txt
+    '''
+    with open(filepath, 'a') as f:
+        f.write(f"=== {mode} Results ===\n")
+        for k, v in metrics.items():
+            f.write(f"{k}: {v:.4f}\n")
+        f.write("\n")
+
+
 def main(args):
     if (not args.do_train) and (not args.do_valid) and (not args.do_test):
         raise ValueError('one of train/val/test mode must be choosed.')
@@ -237,7 +261,7 @@ def main(args):
     if args.save_path and not os.path.exists(args.save_path):
         os.makedirs(args.save_path)
     
-    # Write logs to checkpoint and console
+    # Write logs to file only
     set_logger(args)
     
     with open(os.path.join(args.data_path, 'entities.dict')) as fin:
@@ -252,7 +276,6 @@ def main(args):
             rid, relation = line.strip().split('\t')
             relation2id[relation] = int(rid)
     
-    # Read regions for Countries S* datasets
     if args.countries:
         regions = list()
         with open(os.path.join(args.data_path, 'regions.list')) as fin:
@@ -263,26 +286,20 @@ def main(args):
 
     nentity = len(entity2id)
     nrelation = len(relation2id)
-    
     args.nentity = nentity
     args.nrelation = nrelation
     
-    logging.info('Model: %s' % args.model)
-    logging.info('Data Path: %s' % args.data_path)
-    logging.info('#entity: %d' % nentity)
-    logging.info('#relation: %d' % nrelation)
+    print('Model:', args.model)
+    print('Data Path:', args.data_path)
+    print('#entity:', nentity)
+    print('#relation:', nrelation)
     
     train_triples = read_triple(os.path.join(args.data_path, 'train.txt'), entity2id, relation2id)
-    logging.info('#train: %d' % len(train_triples))
     valid_triples = read_triple(os.path.join(args.data_path, 'valid.txt'), entity2id, relation2id)
-    logging.info('#valid: %d' % len(valid_triples))
     test_triples = read_triple(os.path.join(args.data_path, 'test.txt'), entity2id, relation2id)
-    logging.info('#test: %d' % len(test_triples))
 
     steps_per_epoch_val = steps_per_epoch(len(train_triples), args.batch_size)
     max_steps_internal = args.epochs * steps_per_epoch_val
-    
-    #All true triples
     all_true_triples = train_triples + valid_triples + test_triples
     
     kge_model = KGEModel(
@@ -296,12 +313,6 @@ def main(args):
         score_mode=resolve_rotate_score_mode(args) if args.model == 'RotatE' else 'distance',
     )
     
-    logging.info('Model Parameter Configuration:')
-    if args.model == 'RotatE':
-        logging.info('RotatE score_mode = %s' % kge_model.score_mode)
-    for name, param in kge_model.named_parameters():
-        logging.info('Parameter %s: %s, require_grad = %s' % (name, str(param.size()), str(param.requires_grad)))
-
     if args.cuda:
         kge_model = kge_model.cuda()
 
@@ -310,10 +321,9 @@ def main(args):
         if not args.generator_checkpoint:
             raise ValueError('KBGAN strategy requires a pre-trained generator. Please provide --generator_checkpoint')
         
-        logging.info('Loading Generator for KBGAN from %s...' % args.generator_checkpoint)
+        print('Loading Generator for KBGAN from %s...' % args.generator_checkpoint)
         gen_checkpoint = torch.load(os.path.join(args.generator_checkpoint, 'checkpoint'))
         
-        # Đọc config của Generator
         with open(os.path.join(args.generator_checkpoint, 'config.json'), 'r') as fjson:
             gen_args = json.load(fjson)
             
@@ -328,38 +338,32 @@ def main(args):
             score_mode=gen_args.get('score_mode', 'distance')
         )
         generator_model.load_state_dict(gen_checkpoint['model_state_dict'], strict=False)
-        generator_model.eval() # Generator chỉ để suy luận sinh mẫu, không học thêm
+        generator_model.eval() 
         if args.cuda:
             generator_model = generator_model.cuda()
             
-        # Gắn generator vào discriminator (mô hình chính)
         kge_model.generator = generator_model
     # ------------------------------------
 
     init_step = 0
-    
     if args.init_checkpoint:
-        logging.info('Loading checkpoint %s...' % args.init_checkpoint)
+        print('Loading checkpoint %s...' % args.init_checkpoint)
         checkpoint = torch.load(os.path.join(args.init_checkpoint, 'checkpoint'))
         init_step = checkpoint['step']
         kge_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     else:
-        logging.info('Ramdomly Initializing %s Model...' % args.model)
+        print('Randomly Initializing %s Model...' % args.model)
 
     if is_learnable_kgau_gammas(args):
         UniGammaController(args).ensure_model_params(kge_model)
     
     if args.do_train:
-        # Set training dataloader iterator (strategy-dependent)
         strategy = get_strategy(args)
         train_iterator = strategy.build_train_iterator(train_triples, nentity, nrelation)
         
-        # Set training configuration
         current_learning_rate = args.learning_rate
         optimizer = build_training_optimizer(kge_model, args)
-        warm_up_epochs_val = (
-            args.warm_up_epochs if args.warm_up_epochs is not None else args.epochs // 2
-        )
+        warm_up_epochs_val = (args.warm_up_epochs if args.warm_up_epochs is not None else args.epochs // 2)
         warm_up_steps_internal = warm_up_epochs_val * steps_per_epoch_val
 
         if args.init_checkpoint:
@@ -374,128 +378,130 @@ def main(args):
     
     step = init_step
     
-    logging.info('Start Training...')
-    logging.info('init_step = %d' % init_step)
-    logging.info('epochs = %d' % args.epochs)
-    logging.info('steps_per_epoch = %d' % steps_per_epoch_val)
-    logging.info('batch_size = %d' % args.batch_size)
-    logging.info('strategy = %s' % resolve_strategy_name(args))
-    logging.info('negative_adversarial_sampling = %s' % str(
-        getattr(args, 'negative_adversarial_sampling', False)
-    ))
-    logging.info('dim = %d' % args.dim)
-    logging.info('margin_gamma = %f' % args.margin_gamma)
-    if getattr(args, 'negative_adversarial_sampling', False):
-        logging.info('adversarial_temperature = %f' % args.adversarial_temperature)
-    
-    # Set valid dataloader as it would be evaluated during training
-    
     if args.do_train:
-        logging.info('learning_rate = %d' % current_learning_rate)
-
-        training_logs = []
-        last_schedule_epoch = None
-        best_valid_metric = float('-inf')
-        best_valid_step = None
-        best_model_state = None
-        valid_metric_key = 'MRR'
+        print('\n--- Start Training ---')
+        print(f"Output directory: {args.save_path}")
+        print(f"Strategy: {resolve_strategy_name(args)} | Loss: {args.loss} | Epochs: {args.epochs}")
         
-        #Training Loop
-        for step in range(init_step, max_steps_internal):
+        training_logs = []
+        best_valid_metric = float('-inf')
+        best_valid_epoch = None
+        best_model_state = None
+        valid_metric_key = 'MRR' if not args.triple_classification else 'f1'
+        
+        init_epoch = init_step // steps_per_epoch_val + 1
+        
+        # Vòng lặp ngoài theo Epochs
+        epoch_bar = tqdm(range(init_epoch, args.epochs + 1), desc='Training', unit='epoch', dynamic_ncols=True)
+        
+        for epoch in epoch_bar:
             if is_learnable_kgau_gammas(args):
-                current_epoch = step // steps_per_epoch_val + 1
-                if current_epoch != last_schedule_epoch:
-                    args.current_epoch = current_epoch
-                    update_kgau_gamma_schedule(args)
-                    last_schedule_epoch = current_epoch
+                args.current_epoch = epoch
+                update_kgau_gamma_schedule(args)
             
-            log = kge_model.train_step(kge_model, optimizer, train_iterator, args)
+            # Vòng lặp trong theo Batch/Steps
+            step_bar = tqdm(range(steps_per_epoch_val), desc=f'  Epoch {epoch}', unit='batch', leave=False, dynamic_ncols=True)
             
-            training_logs.append(log)
-            
-            if step >= warm_up_steps_internal:
-                current_learning_rate = current_learning_rate / 10
-                logging.info('Change learning_rate to %f at step %d' % (current_learning_rate, step))
-                if is_learnable_kgau_gammas(args) and len(optimizer.param_groups) > 1:
-                    set_optimizer_learning_rates(
-                        optimizer, current_learning_rate,
-                        getattr(args, 'log_kgau_gamma_lr', None) or current_learning_rate,
-                    )
-                else:
-                    for group in optimizer.param_groups:
-                        group['lr'] = current_learning_rate
-                warm_up_steps_internal = warm_up_steps_internal * 3
-                warm_up_epochs_val = warm_up_epochs_val * 3
-            
-            if step % args.save_checkpoint_steps == 0:
-                save_variable_list = {
-                    'step': step, 
-                    'current_learning_rate': current_learning_rate,
-                    'warm_up_epochs': warm_up_epochs_val
-                }
-                save_model(kge_model, optimizer, save_variable_list, args)
+            for _ in step_bar:
+                log = kge_model.train_step(kge_model, optimizer, train_iterator, args)
+                training_logs.append(log)
+                step += 1
                 
-            if step % args.log_steps == 0:
-                metrics = {}
-                for metric in training_logs[0].keys():
-                    metrics[metric] = sum([log[metric] for log in training_logs])/len(training_logs)
-                log_metrics('Training average', step, metrics)
-                training_logs = []
+                # --- Điều chỉnh Learning Rate ---
+                if step >= warm_up_steps_internal:
+                    current_learning_rate = current_learning_rate / 10
+                    tqdm.write(f'Change learning_rate to {current_learning_rate} at epoch {epoch}')
+                    if is_learnable_kgau_gammas(args) and len(optimizer.param_groups) > 1:
+                        set_optimizer_learning_rates(
+                            optimizer, current_learning_rate,
+                            getattr(args, 'log_kgau_gamma_lr', None) or current_learning_rate,
+                        )
+                    else:
+                        for group in optimizer.param_groups:
+                            group['lr'] = current_learning_rate
+                    warm_up_steps_internal = warm_up_steps_internal * 3
+                    warm_up_epochs_val = warm_up_epochs_val * 3
                 
-            if args.do_valid and step % args.valid_steps == 0:
-                logging.info('Evaluating on Valid Dataset...')
+                # --- Ghi Log Train ---
+                if step % args.log_steps == 0:
+                    metrics = {}
+                    for metric in training_logs[0].keys():
+                        metrics[metric] = sum([l[metric] for l in training_logs])/len(training_logs)
+                    
+                    postfix_str = ', '.join([f"{k}={v:.4f}" for k, v in metrics.items()])
+                    step_bar.set_postfix_str(postfix_str)
+                    log_metrics('Training average', step, metrics)
+                    training_logs = []
+
+            # --- LƯU TRỮ VÀ ĐÁNH GIÁ CUỐI MỖI EPOCH ---
+            # Lưu checkpoint cuối mỗi epoch thay vì theo step
+            save_variable_list = {
+                'step': step, 
+                'current_learning_rate': current_learning_rate,
+                'warm_up_epochs': warm_up_epochs_val
+            }
+            save_model(kge_model, optimizer, save_variable_list, args)
+            
+            # Đánh giá Validation cuối mỗi Epoch
+            if args.do_valid:
                 metrics = kge_model.test_step(kge_model, valid_triples, all_true_triples, args)
                 log_metrics('Valid', step, metrics)
+                
+                # Cập nhật thông số lên thanh Epoch
+                epoch_bar.set_postfix_str(f"Valid {valid_metric_key}={metrics.get(valid_metric_key, 0):.4f}")
+                
                 if valid_metric_key in metrics and metrics[valid_metric_key] > best_valid_metric:
                     best_valid_metric = metrics[valid_metric_key]
-                    best_valid_step = step
+                    best_valid_epoch = epoch
                     best_model_state = clone_model_state(kge_model)
-                    save_variable_list = {
-                        'step': step,
-                        'current_learning_rate': current_learning_rate,
-                        'warm_up_epochs': warm_up_epochs_val,
+                    
+                    save_variable_list.update({
                         'best_valid_metric': best_valid_metric,
                         'best_valid_metric_name': valid_metric_key,
-                    }
+                        'best_valid_epoch': best_valid_epoch,
+                    })
                     save_model(
                         kge_model, optimizer, save_variable_list, args,
                         checkpoint_name='checkpoint_best',
                     )
-                    logging.info(
-                        'New best valid %s = %f at step %d' % (
-                            valid_metric_key, best_valid_metric, step,
-                        )
-                    )
-        
-        save_variable_list = {
-            'step': step, 
-            'current_learning_rate': current_learning_rate,
-            'warm_up_epochs': warm_up_epochs_val
-        }
-        save_model(kge_model, optimizer, save_variable_list, args)
+                    tqdm.write(f'---> New best valid {valid_metric_key} = {best_valid_metric:.4f} at epoch {epoch}')
 
+        # Sau khi kết thúc huấn luyện, nạp lại mô hình tốt nhất
         if best_model_state is not None:
             kge_model.load_state_dict(best_model_state)
-            logging.info(
-                'Restored best model at step %d (valid %s = %f) for evaluation' % (
-                    best_valid_step, valid_metric_key, best_valid_metric,
-                )
-            )
-        
+            print(f'\nRestored best model at epoch {best_valid_epoch} (valid {valid_metric_key} = {best_valid_metric:.4f}) for final evaluation')
+
+    # =========================================================================
+    # Giai đoạn đánh giá cuối cùng & Lưu kết quả ra file results.txt
+    # =========================================================================
+    results_file = os.path.join(args.save_path or args.init_checkpoint, 'results.txt')
+
     if args.do_valid:
-        logging.info('Evaluating on Valid Dataset...')
+        print('\nFinal Evaluating on Valid Dataset...')
         metrics = kge_model.test_step(kge_model, valid_triples, all_true_triples, args)
         log_metrics('Valid', step, metrics)
+        save_results_to_txt(results_file, 'Valid', metrics)
+        for k, v in metrics.items():
+            print(f"  {k}: {v:.4f}")
     
     if args.do_test:
-        logging.info('Evaluating on Test Dataset...')
+        print('\nFinal Evaluating on Test Dataset...')
         metrics = kge_model.test_step(kge_model, test_triples, all_true_triples, args)
         log_metrics('Test', step, metrics)
+        save_results_to_txt(results_file, 'Test', metrics)
+        for k, v in metrics.items():
+            print(f"  {k}: {v:.4f}")
     
     if args.evaluate_train:
-        logging.info('Evaluating on Training Dataset...')
+        print('\nFinal Evaluating on Training Dataset...')
         metrics = kge_model.test_step(kge_model, train_triples, all_true_triples, args)
-        log_metrics('Test', step, metrics)
-        
+        log_metrics('Train', step, metrics)
+        save_results_to_txt(results_file, 'Train', metrics)
+        for k, v in metrics.items():
+            print(f"  {k}: {v:.4f}")
+            
+    if args.save_path:
+        print(f'\nAll results and checkpoints have been saved to: {args.save_path}')
+
 if __name__ == '__main__':
     main(parse_args())

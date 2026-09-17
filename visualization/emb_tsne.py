@@ -12,7 +12,7 @@ from tqdm import tqdm
 from sklearn.manifold import TSNE  # Added for embedding visualization
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, 'codes'))
+sys.path.insert(0, os.path.join(ROOT, 'code'))
 
 import run as train_run
 from loss import (

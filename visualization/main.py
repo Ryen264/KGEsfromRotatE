@@ -11,10 +11,10 @@ import torch
 from tqdm import tqdm
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, 'codes'))
+sys.path.insert(0, ROOT)
 
-import run as train_run
-from loss import (
+import main as train_run
+from code.loss import (
     KGAULoss,
     KGmAULoss,
     KGmAmULoss,
@@ -24,9 +24,9 @@ from loss import (
     is_learnable_kgau_gammas,
     update_kgau_gamma_schedule,
 )
-from metrics.classification import classification_metrics_from_probs
-from model import KGEModel, resolve_rotate_score_mode
-from strategy import get_strategy, resolve_strategy_name
+from code.metrics import triple_classification_metrics
+from code.model import KGEModel, resolve_rotate_score_mode
+from code.strategy import get_strategy, resolve_strategy_name
 
 DEFAULT_UNIFORM_KEYS = ['query', 'target', 'entity', 'relation']
 DEFAULT_UNIFORM_T = 4
@@ -97,7 +97,7 @@ def evaluate_triple_classification(model, test_triples, args):
     with torch.no_grad():
         y_score = model(sample).squeeze(1).cpu().numpy()
 
-    return classification_metrics_from_probs(np.array(y_true), y_score)
+    return triple_classification_metrics(np.array(y_true), y_score)
 
 
 def dataset_display_name(data_path):
@@ -462,7 +462,6 @@ def get_kgau_family_loss(args):
 
 def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     loss_fn = get_kgau_family_loss(args)
-    loss_name = getattr(args, 'loss', 'kgau')
     head = model.entity_embedding[positive_sample[:, 0]]
     relation = model.relation_embedding[positive_sample[:, 1]]
     tail = model.entity_embedding[positive_sample[:, 2]]
@@ -470,45 +469,22 @@ def compute_au_metrics(model, positive_sample, mode, args, uniform_sets):
     query_e = model.query_encoder(head, relation, tail, mode=mode)
     target_e = model.target_encoder(tail, head=head, relation=relation, mode=mode)
 
-    align_margin = getattr(args, 'align_margin', 0.0)
-    align_alpha = getattr(args, 'align_alpha', 2.0)
-    uniform_margin = getattr(args, 'uniform_margin', 2.0)
-    uniform_t = DEFAULT_UNIFORM_T
-
-    if loss_name in ('kgmau', 'kgmamu'):
-        align_loss = loss_fn.margin_alignment(
-            query_e, target_e, align_margin=align_margin,
-        ).item()
-    else:
-        align_loss = loss_fn.alignment(
-            query_e, target_e, align_alpha=align_alpha,
-        ).item()
+    # BaseKGAULoss tự động xử lý align_alpha và align_margin từ args
+    align_loss = loss_fn.compute_alignment(query_e, target_e).item()
 
     uniform_components = {}
     embeddings = {
         'query': query_e,
         'target': target_e,
-        'head': head,   # already embedded by entity_embedding
-        'tail': tail,   # already embedded by entity_embedding
-        'entity': torch.cat([head, tail], dim=0),   # already embedded by entity_embedding
-        'relation': relation,   # already embedded by relation_embedding
+        'head': head,
+        'tail': tail,
+        'entity': torch.cat([head, tail], dim=0),
+        'relation': relation,
     }
 
     for key in uniform_sets:
-        pair_chunk = int(getattr(args, 'uniform_pair_chunk_size', 0) or 0)
-        if loss_name == 'kgmamu':
-            uniform_components[key] = loss_fn.margin_uniformity(
-                embeddings[key],
-                uniform_margin=uniform_margin,
-                uniform_t=uniform_t,
-                pair_chunk_size=pair_chunk,
-            ).item()
-        else:
-            uniform_components[key] = loss_fn.uniformity(
-                embeddings[key],
-                uniform_t=uniform_t,
-                pair_chunk_size=pair_chunk,
-            ).item()
+        # BaseKGAULoss tự động định tuyến đến hàm uniformity/margin_uniformity tương ứng
+        uniform_components[key] = loss_fn.compute_uniformity(embeddings[key]).item()
 
     uniform_loss = float(np.mean(list(uniform_components.values())))
     return align_loss, uniform_components, uniform_loss

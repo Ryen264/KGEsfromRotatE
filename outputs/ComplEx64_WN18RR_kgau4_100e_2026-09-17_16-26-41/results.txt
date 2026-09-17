@@ -1,0 +1,14 @@
+=== Valid Results ===
+MRR: 0.4671
+MR: 4073.9005
+HITS@1: 0.4244
+HITS@3: 0.4863
+HITS@10: 0.5433
+
+=== Test Results ===
+MRR: 0.4738
+MR: 4066.8395
+HITS@1: 0.4330
+HITS@3: 0.4922
+HITS@10: 0.5483
+
