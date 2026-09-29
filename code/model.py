@@ -4,7 +4,7 @@ This module implements:
   - KGEBase: common interface for a KGE score function.
   - ComplEx, RotatE: score functions, each in its own class, exposing
     `query_encoder` / `target_encoder` / `score` so that training
-    strategies (NegSamp, AllNeg, KGAU, ...) can reuse the same query /
+    strategies (NegSamp, AllNeg, KGAU...) can reuse the same query /
     target embeddings the score is built from.
   - KGEModel: the nn.Module wrapping entity/relation embedding tables
     around a KGE score function, plus the train/eval loop entry points
@@ -71,6 +71,138 @@ def resolve_rotate_score_mode(args):
         pass
     return 'distance'
 
+# =============================================================================
+# Base space
+# =============================================================================
+
+class BaseSpace:
+    @staticmethod
+    def normalize(x):
+        raise NotImplementedError
+
+    @staticmethod
+    def distance(q, y):
+        raise NotImplementedError
+
+
+# =============================================================================
+# Euclidean space
+# =============================================================================
+
+class EuclideanSpace(BaseSpace):
+    @staticmethod
+    def normalize(x):
+        # Chuẩn hóa L2 toàn cục trên không gian thực
+        return F.normalize(x, p=2, dim=-1)
+    
+    @staticmethod
+    def distance(q, y):
+        # Khoảng cách L2 (Euclidean)
+        return torch.norm(q - y, p=2, dim=-1)
+
+
+# =============================================================================
+# Complex space
+# =============================================================================
+
+class ComplexSpace(BaseSpace):
+    @staticmethod
+    def normalize(x):
+        # Chuẩn hóa element-wise modulus cho số phức để giữ nguyên góc pha
+        re, im = torch.chunk(x, 2, dim=-1)
+        modulus = torch.sqrt(re**2 + im**2).clamp_min(1e-12)
+        return torch.cat([re / modulus, im / modulus], dim=-1)
+
+    @staticmethod
+    def distance(q, y):
+        # Khoảng cách L1 trên mặt phẳng phức (duy trì gradient ổn định)
+        re_q, im_q = torch.chunk(q, 2, dim=-1)
+        re_y, im_y = torch.chunk(y, 2, dim=-1)
+        return torch.norm(re_q - re_y, p=1, dim=-1) + torch.norm(im_q - im_y, p=1, dim=-1)
+
+
+# =============================================================================
+# Quaternion space
+# =============================================================================
+
+class QuaternionSpace(BaseSpace):
+    @staticmethod
+    def normalize(x):
+        # Chuẩn hóa Quaternion (giống hàm q_norm trong TransERR và việc chia denominator_b trong QuatE)
+        s, i, j, k = torch.chunk(x, 4, dim=-1)
+        modulus = torch.sqrt(s**2 + i**2 + j**2 + k**2).clamp_min(1e-12)
+        return torch.cat([s / modulus, i / modulus, j / modulus, k / modulus], dim=-1)
+
+    @staticmethod
+    def distance(q, y):
+        # TransERR sử dụng chuẩn L1 cho khoảng cách
+        s_q, i_q, j_q, k_q = torch.chunk(q, 4, dim=-1)
+        s_y, i_y, j_y, k_y = torch.chunk(y, 4, dim=-1)
+        return (torch.norm(s_q - s_y, p=1, dim=-1) +
+                torch.norm(i_q - i_y, p=1, dim=-1) +
+                torch.norm(j_q - j_y, p=1, dim=-1) +
+                torch.norm(k_q - k_y, p=1, dim=-1))
+
+    @staticmethod
+    def hamilton_product(a, b):
+        # Tích Hamilton kết hợp 4 thành phần của số siêu phức
+        s_a, x_a, y_a, z_a = torch.chunk(a, 4, dim=-1)
+        s_b, x_b, y_b, z_b = torch.chunk(b, 4, dim=-1)
+
+        A = s_a * s_b - x_a * x_b - y_a * y_b - z_a * z_b
+        B = s_a * x_b + s_b * x_a + y_a * z_b - y_b * z_a
+        C = s_a * y_b + s_b * y_a + z_a * x_b - z_b * x_a
+        D = s_a * z_b + s_b * z_a + x_a * y_b - x_b * y_a
+        return torch.cat([A, B, C, D], dim=-1)
+
+
+# =============================================================================
+# Hyperbolic space
+# =============================================================================
+
+class HyperbolicSpace(BaseSpace):
+    @staticmethod
+    def normalize(x):
+        # Giới hạn norm của vector trong đĩa Poincaré (phải nhỏ hơn 1)
+        norm = torch.norm(x, p=2, dim=-1, keepdim=True)
+        return torch.where(norm >= 1, x / (norm - 1e-5), x)
+
+    @staticmethod
+    def distance(q, y, c=1.0):
+        # Khoảng cách Poincaré dựa trên phép cộng Möbius (-q + y)
+        # c là độ cong (curvature), mặc định c=1.0. Trong AttH c có thể học được
+        sqdist = (2. * HyperbolicSpace.artanh(
+            torch.clamp(torch.norm(HyperbolicSpace.mobius_add(-q, y, c), p=2, dim=-1), 1e-10, 1 - 1e-5)
+        ))**2
+        return sqdist
+
+    @staticmethod
+    def artanh(x):
+        return 0.5 * torch.log((1 + x) / (1 - x))
+
+    @staticmethod
+    def mobius_add(u, v, c=1.0):
+        # Phép cộng Möbius trong đĩa Poincaré
+        v = v + 1e-5
+        norm_u_sq = torch.norm(u, p=2, dim=-1, keepdim=True) ** 2
+        norm_v_sq = torch.norm(v, p=2, dim=-1, keepdim=True) ** 2
+        dot_uv = (u * v).sum(dim=-1, keepdim=True)
+        num = (1 + 2 * c * dot_uv + c * norm_v_sq) * u + (1 - c * norm_u_sq) * v
+        den = 1 + 2 * c * dot_uv + c ** 2 * norm_u_sq * norm_v_sq
+        return num / den.clamp_min(1e-15)
+
+    @staticmethod
+    def expmap0(v, c=1.0):
+        # Ánh xạ từ không gian tiếp tuyến (Euclid) vào không gian Hyperbolic
+        norm_v = torch.norm(v, p=2, dim=-1, keepdim=True)
+        return torch.tanh(np.sqrt(c) * norm_v) * (v / norm_v.clamp_min(1e-15)) / np.sqrt(c)
+
+    @staticmethod
+    def logmap0(y, c=1.0):
+        # Ánh xạ từ không gian Hyperbolic về không gian tiếp tuyến (Euclid)
+        norm_y = torch.norm(y, p=2, dim=-1, keepdim=True)
+        return HyperbolicSpace.artanh(np.sqrt(c) * norm_y) * (y / norm_y.clamp_min(1e-15)) / np.sqrt(c)
+
 
 # =============================================================================
 # Base class
@@ -104,6 +236,108 @@ class KGEBase(object):
 
 
 # =============================================================================
+# TransE
+# =============================================================================
+
+class TransE(KGEBase):
+    '''
+    TransE: Translating Embeddings for Modeling Multi-relational Data.
+    '''
+    
+    def __init__(self, margin_gamma, embedding_range=None, score_mode='distance', space=EuclideanSpace):
+        self.margin_gamma = margin_gamma
+        self.score_mode = score_mode
+        self.space = space
+
+    def query_encoder(self, head, relation, tail, mode):
+        if mode == 'head-batch':
+            return tail - relation
+        return head + relation
+
+    def target_encoder(self, head, relation, tail, mode):
+        if mode == 'head-batch':
+            return head
+        return tail
+
+    def score(self, head, relation, tail, mode):
+        query = self.query_encoder(head, relation, tail, mode)
+        target = self.target_encoder(head, relation, tail, mode)
+
+        if self.score_mode == 'cosine':
+            query_n = self.space.normalize(query)
+            target_n = self.space.normalize(target)
+            return -self.space.distance(query_n, target_n)
+        return self.margin_gamma.item() - self.space.distance(query, target)
+
+
+# =============================================================================
+# DistMult
+# =============================================================================
+
+class DistMult(KGEBase):
+    '''
+    DistMult: Semantic matching model via bilinear dot product.
+    '''
+
+    def __init__(self, score_mode='distance', space=EuclideanSpace):
+        self.score_mode = score_mode
+        self.space = space
+
+    def query_encoder(self, head, relation, tail, mode):
+        if mode == 'head-batch':
+            return tail * relation
+        return head * relation
+
+    def target_encoder(self, head, relation, tail, mode):
+        if mode == 'head-batch':
+            return head
+        return tail
+
+    def score(self, head, relation, tail, mode):
+        query = self.query_encoder(head, relation, tail, mode)
+        target = self.target_encoder(head, relation, tail, mode)
+
+        if self.score_mode == 'cosine':
+            query_n = self.space.normalize(query)
+            target_n = self.space.normalize(target)
+            return -self.space.distance(query_n, target_n)
+        return (query * target).sum(dim=-1)
+
+
+# =============================================================================
+# MuRE (from MuRP: Multi-Relational Projection for Knowledge Graph Completion)
+# =============================================================================
+
+class MuRE(KGEBase):
+    '''
+    MuRE: Multi-Relational Euclidean model.
+    '''
+
+    def __init__(self, space=EuclideanSpace):
+        self.space = space
+
+    def query_encoder(self, head, relation, tail, mode):
+        # relation trong MuRE gồm 2 phần: Ru (diagonal weight) và rv (translation)
+        Ru, rv = torch.chunk(relation, 2, dim=-1)
+        if mode == 'head-batch':
+            return (tail + rv) / Ru.clamp_min(1e-5) # Đảo ngược xấp xỉ
+        return head * Ru - rv
+
+    def target_encoder(self, head, relation, tail, mode):
+        if mode == 'head-batch':
+            return head
+        return tail
+
+    def score(self, head, relation, tail, head_bias, tail_bias, mode):
+        query = self.query_encoder(head, relation, tail, mode)
+        target = self.target_encoder(head, relation, tail, mode)
+        
+        # Khoảng cách Euclid bình phương + bias
+        sqdist = torch.sum(torch.pow(query - target, 2), dim=-1)
+        return -sqdist + head_bias + tail_bias
+
+
+# =============================================================================
 # ComplEx
 # =============================================================================
 
@@ -115,6 +349,10 @@ class ComplEx(KGEBase):
     [real, imaginary] halves). The score is the Hermitian dot product
     Re(<h * r, conj(t)>).
     '''
+
+    def __init__(self, score_mode='distance', space=ComplexSpace):
+        self.score_mode = score_mode
+        self.space = space
 
     @staticmethod
     def _merge_complex(re_part, im_part):
@@ -155,6 +393,11 @@ class ComplEx(KGEBase):
     def score(self, head, relation, tail, mode):
         query = self.query_encoder(head, relation, tail, mode)
         target = self.target_encoder(head, relation, tail, mode)
+        
+        if self.score_mode == 'cosine':
+            query_n = self.space.normalize(query)
+            target_n = self.space.normalize(target)
+            return -self.space.distance(query_n, target_n)
         return self._hermitian_dot(query, target)
 
     def score_query_entities(self, query, entity_embedding):
@@ -178,7 +421,6 @@ class ComplEx(KGEBase):
 # implementation detail of `RotatE.score_query_entities`.
 
 if _TRITON_AVAILABLE:
-
     @triton.jit
     def _rotate_allneg_fwd_kernel(
         re_q_ptr, im_q_ptr, re_e_ptr, im_e_ptr, scores_ptr,
@@ -385,7 +627,6 @@ class _RotatEScoreQueryEntities(torch.autograd.Function):
 
     Private implementation detail of `RotatE.score_query_entities`.
     '''
-
     _BYTES_BUDGET = 512 * 1024 * 1024
     _TRITON_BLOCK_E = 64
     _TRITON_BLOCK_D = 64
@@ -591,10 +832,9 @@ class RotatE(KGEBase):
       - 'cosine' (KGAU-family): cosine(query, target) after L2-normalize,
         matching KGAU alignment on normalized query/target embeddings.
     '''
-
     SCORE_MODES = ('distance', 'cosine')
 
-    def __init__(self, embedding_range, margin_gamma, score_mode='distance'):
+    def __init__(self, embedding_range, margin_gamma, score_mode='distance', space=ComplexSpace):
         if score_mode not in self.SCORE_MODES:
             raise ValueError(
                 'RotatE score_mode must be one of {}, got {}'.format(
@@ -604,6 +844,7 @@ class RotatE(KGEBase):
         self.embedding_range = embedding_range
         self.margin_gamma = margin_gamma
         self.score_mode = score_mode
+        self.space = space
         self.pi = 3.14159265358979323846
 
     def _relation_rotation(self, relation):
@@ -630,30 +871,15 @@ class RotatE(KGEBase):
             return head
         return tail
 
-    @staticmethod
-    def _complex_distance(re_diff, im_diff):
-        # Per-dim complex modulus, then L1 over dims.
-        # Use stack(...).norm (finite grad at 0) -- NOT hypot, which yields
-        # NaN grads when re=im=0. That happens once 1vsAll/KvsAll fits positives.
-        return torch.stack([re_diff, im_diff], dim=0).norm(dim=0).sum(dim=-1)
-
-    @staticmethod
-    def _cosine_score(query, target):
-        '''Cosine similarity after L2-normalize along the embedding dim.'''
-        query = F.normalize(query, p=2, dim=-1)
-        target = F.normalize(target, p=2, dim=-1)
-        return (query * target).sum(dim=-1)
-
     def score(self, head, relation, tail, mode):
         query = self.query_encoder(head, relation, tail, mode)
         target = self.target_encoder(head, relation, tail, mode)
+
         if self.score_mode == 'cosine':
-            return self._cosine_score(query, target)
-        re_query, im_query = self._split_complex(query)
-        re_target, im_target = self._split_complex(target)
-        return self.margin_gamma.item() - self._complex_distance(
-            re_query - re_target, im_query - im_target
-        )
+            query_n = self.space.normalize(query)
+            target_n = self.space.normalize(target)
+            return -self.space.distance(query_n, target_n)
+        return self.margin_gamma.item() - self.space.distance(query, target)
 
     def score_query_entities(self, query, entity_embedding):
         '''
@@ -677,9 +903,204 @@ class RotatE(KGEBase):
         return _RotatEScoreQueryEntities.apply(re_q, im_q, re_e, im_e, gamma)
 
 
+# =============================================================================
+# QuatE
+# =============================================================================
+
+class QuatE(KGEBase):
+    '''
+    QuatE: Quaternion Knowledge Graph Embeddings.
+    '''
+
+    def __init__(self, score_mode='distance', space=QuaternionSpace):
+        self.score_mode = score_mode
+        self.space = space
+
+    def query_encoder(self, head, relation, tail, mode):
+        # Chuẩn hóa relation quaternion
+        rel_norm = self.space.normalize(relation)
+        if mode == 'head-batch':
+            # Nghịch đảo Quaternion cho relation (đảo dấu phần ảo x, y, z)
+            s, x, y, z = torch.chunk(rel_norm, 4, dim=-1)
+            rel_inv = torch.cat([s, -x, -y, -z], dim=-1)
+            return self.space.hamilton_product(tail, rel_inv)
+        return self.space.hamilton_product(head, rel_norm)
+
+    def target_encoder(self, head, relation, tail, mode):
+        if mode == 'head-batch':
+            return head
+        return tail
+
+    def score(self, head, relation, tail, mode):
+        query = self.query_encoder(head, relation, tail, mode)
+        target = self.target_encoder(head, relation, tail, mode)
+
+        if self.score_mode == 'cosine':
+            query_n = self.space.normalize(query)
+            target_n = self.space.normalize(target)
+            return -self.space.distance(query_n, target_n)
+        
+        # QuatE dùng tích vô hướng (inner product) ở bước cuối cùng
+        return (query * target).sum(dim=-1)
+
+
+# =============================================================================
+# TransERR
+# =============================================================================
+
+class TransERR(KGEBase):
+    '''
+    TransERR: Translation-based Knowledge Graph Embedding via Efficient Relation Rotation
+    '''
+
+    def __init__(self, margin_gamma, embedding_range=None, score_mode='distance', space=QuaternionSpace):
+        self.margin_gamma = margin_gamma
+        self.score_mode = score_mode
+        self.space = space
+
+    def query_encoder(self, head, relation, tail, mode):
+        # Tách relation thành 3 phần wh, r, wt
+        wh, r, wt = torch.chunk(relation, 3, dim=-1)
+        if mode == 'head-batch':
+            # Với target là head, query đại diện cho phần còn lại: calc(tail, wt) - r
+            wt_norm = self.space.normalize(wt) #
+            return self.space.hamilton_product(tail, wt_norm) - r
+        else:
+            # Vời target là tail, query đại diện cho: calc(head, wh) + r
+            wh_norm = self.space.normalize(wh) #
+            return self.space.hamilton_product(head, wh_norm) + r
+
+    def target_encoder(self, head, relation, tail, mode):
+        wh, r, wt = torch.chunk(relation, 3, dim=-1)
+        if mode == 'head-batch':
+            # target là calc(head, wh)
+            wh_norm = self.space.normalize(wh) #
+            return self.space.hamilton_product(head, wh_norm)
+        else:
+            # target là calc(tail, wt)
+            wt_norm = self.space.normalize(wt) #
+            return self.space.hamilton_product(tail, wt_norm)
+
+    def score(self, head, relation, tail, mode):
+        query = self.query_encoder(head, relation, tail, mode)
+        target = self.target_encoder(head, relation, tail, mode)
+
+        if self.score_mode == 'cosine':
+            query_n = self.space.normalize(query)
+            target_n = self.space.normalize(target)
+            return -self.space.distance(query_n, target_n)
+        
+        # Hàm loss chuẩn L1 của TransERR
+        return self.margin_gamma.item() - self.space.distance(query, target)
+
+
+# =============================================================================
+# MuRP
+# =============================================================================
+
+class MuRP(KGEBase):
+    '''
+    MuRP: Multi-Relational Poincaré model.
+    '''
+
+    def __init__(self, space=HyperbolicSpace):
+        self.space = space
+
+    def query_encoder(self, head, relation, tail, mode):
+        # Chuẩn hóa an toàn
+        head_n = self.space.normalize(head)
+        Ru, rvh = torch.chunk(relation, 2, dim=-1)
+        rvh_n = self.space.normalize(rvh)
+
+        if mode == 'head-batch':
+            return tail # Cần xử lý cẩn thận phép nghịch đảo Möbius khi train head-batch
+            
+        # Ánh xạ log, nhân hệ số, ánh xạ exp
+        u_e = self.space.logmap0(head_n)
+        u_W = u_e * Ru
+        u_m = self.space.expmap0(u_W)
+        u_m = self.space.normalize(u_m)
+        return u_m, rvh_n
+
+    def target_encoder(self, head, relation, tail, mode):
+        return self.space.normalize(tail)
+
+    def score(self, head, relation, tail, head_bias, tail_bias, mode):
+        u_m, rvh_n = self.query_encoder(head, relation, tail, mode)
+        v = self.target_encoder(head, relation, tail, mode)
+        
+        # Kết hợp mục tiêu và véc-tơ tịnh tiến quan hệ bằng phép cộng Möbius
+        v_m = self.space.mobius_add(v, rvh_n)
+        v_m = self.space.normalize(v_m)
+        
+        sqdist = self.space.distance(u_m, v_m)
+        return -sqdist + head_bias + tail_bias
+
+
+# =============================================================================
+# AttH
+# =============================================================================
+
+class AttH(KGEBase):
+    '''
+    AttH: Hyperbolic Attention Model (Reflection + Rotation).
+    '''
+
+    def __init__(self, space=HyperbolicSpace):
+        self.space = space
+        # Độ cong c có thể thiết lập là nn.Parameter trong KGEModel và truyền vào
+        self.c = 1.0 
+
+    def _givens_rotation(self, rot, entity):
+        # Xấp xỉ phép quay Givens: tách tensor thành các khối 2D và nhân ma trận quay
+        # (Cần triển khai hàm tiện ích givens_rotations tương ứng)
+        return rot * entity 
+
+    def _givens_reflection(self, ref, entity):
+        # Xấp xỉ phép phản xạ Givens
+        return ref * entity
+
+    def query_encoder(self, head, relation, tail, mode):
+        # Trích xuất 4 thành phần quan hệ
+        rot, ref, rel, context_vec = torch.chunk(relation, 4, dim=-1)
+        
+        rot_q = self._givens_rotation(rot, head)
+        ref_q = self._givens_reflection(ref, head)
+        
+        cands = torch.stack([ref_q, rot_q], dim=1)
+        
+        # Self-attention mechanism
+        scale = 1.0 / np.sqrt(head.size(-1))
+        att_weights = torch.sum(context_vec.unsqueeze(1) * cands * scale, dim=-1, keepdim=True)
+        att_weights = torch.softmax(att_weights, dim=1)
+        att_q = torch.sum(att_weights * cands, dim=1)
+        
+        lhs = self.space.expmap0(att_q, self.c)
+        rel_h = self.space.expmap0(rel, self.c)
+        
+        # Hyperbolic translation
+        return self.space.mobius_add(lhs, rel_h, self.c)
+
+    def target_encoder(self, head, relation, tail, mode):
+        return self.space.expmap0(tail, self.c)
+
+    def score(self, head, relation, tail, mode):
+        query = self.query_encoder(head, relation, tail, mode)
+        target = self.target_encoder(head, relation, tail, mode)
+        
+        # Trả về khoảng cách âm bình phương
+        return -self.space.distance(query, target, self.c)
+
 KGE_SCORERS = {
+    'TransE': TransE,
+    'DistMult': DistMult,
+    'MuRE': MuRE,
     'ComplEx': ComplEx,
     'RotatE': RotatE,
+    'QuatE': QuatE,
+    'TransERR': TransERR,
+    'MuRP': MuRP,
+    'AttH': AttH
 }
 
 
@@ -717,6 +1138,12 @@ class KGEModel(nn.Module):
         self.entity_dim = dim * 2 if double_entity_embedding else dim
         self.relation_dim = dim * 2 if double_relation_embedding else dim
 
+        # Điều chỉnh relation_dim cho các mô hình đặc thù
+        if model_name == 'TransERR':
+            self.relation_dim = self.entity_dim * 3
+        elif model_name == 'AttH':
+            self.relation_dim = self.entity_dim * 4  # rot, ref, trans, context_vec
+
         self.entity_embedding = nn.Parameter(torch.zeros(nentity, self.entity_dim))
         nn.init.uniform_(
             tensor=self.entity_embedding,
@@ -731,6 +1158,11 @@ class KGEModel(nn.Module):
             b=self.embedding_range.item()
         )
 
+        # Khởi tạo tham số Bias đặc thù cho MuRE và MuRP
+        if model_name in ['MuRE', 'MuRP']:
+            self.head_bias = nn.Parameter(torch.zeros(nentity))
+            self.tail_bias = nn.Parameter(torch.zeros(nentity))
+
         if model_name == 'ComplEx' and (not double_entity_embedding or not double_relation_embedding):
             raise ValueError('ComplEx should use --double_entity_embedding and --double_relation_embedding')
 
@@ -740,13 +1172,18 @@ class KGEModel(nn.Module):
         if model_name not in KGE_SCORERS:
             raise ValueError('model %s not supported' % model_name)
 
-        if model_name == 'RotatE':
-            # KGAU uses cosine; NegSamp/AllNeg keep RotatE distance.
-            self.kge_scorer = RotatE(
+        # Cập nhật phân nhánh khởi tạo Scorer
+        if model_name in ['RotatE', 'TransE', 'TransERR']:
+            self.kge_scorer = KGE_SCORERS[model_name](
                 embedding_range=self.embedding_range,
                 margin_gamma=self.margin_gamma,
                 score_mode=score_mode,
             )
+        elif model_name in ['DistMult', 'ComplEx', 'QuatE']:
+            self.kge_scorer = KGE_SCORERS[model_name](score_mode=score_mode)
+        elif model_name in ['MuRE', 'MuRP', 'AttH']:
+            # Các mô hình này tạm thời sử dụng tham số mặc định của constructor
+            self.kge_scorer = KGE_SCORERS[model_name]()
         else:
             self.kge_scorer = KGE_SCORERS[model_name]()
             
@@ -760,54 +1197,47 @@ class KGEModel(nn.Module):
         return self.kge_scorer.target_encoder(head, relation, tail, mode)
 
     def _lookup_triple(self, sample, mode):
-        '''Index into the embedding tables for `sample`, per `mode`.
+        '''Index into the embedding tables for `sample`, per `mode`.'''
+        head_bias, tail_bias = None, None
 
-        Returns (head, relation, tail) broadcastable as
-        [batch, 1, dim] / [batch, negative_sample_size, dim], and the
-        score-function mode to use ('head-batch' or 'tail-batch').
-        '''
         if mode == 'single':
-            head = torch.index_select(
-                self.entity_embedding, dim=0, index=sample[:, 0]
-            ).unsqueeze(1)
-            relation = torch.index_select(
-                self.relation_embedding, dim=0, index=sample[:, 1]
-            ).unsqueeze(1)
-            tail = torch.index_select(
-                self.entity_embedding, dim=0, index=sample[:, 2]
-            ).unsqueeze(1)
-            return head, relation, tail, 'tail-batch'
+            head_idx, tail_idx = sample[:, 0], sample[:, 2]
+            head = torch.index_select(self.entity_embedding, dim=0, index=head_idx).unsqueeze(1)
+            relation = torch.index_select(self.relation_embedding, dim=0, index=sample[:, 1]).unsqueeze(1)
+            tail = torch.index_select(self.entity_embedding, dim=0, index=tail_idx).unsqueeze(1)
+            
+            if hasattr(self, 'head_bias'):
+                head_bias = torch.index_select(self.head_bias, dim=0, index=head_idx).unsqueeze(1)
+                tail_bias = torch.index_select(self.tail_bias, dim=0, index=tail_idx).unsqueeze(1)
+            return head, relation, tail, 'tail-batch', head_bias, tail_bias
 
         if mode == 'head-batch':
             tail_part, head_part = sample
             batch_size, negative_sample_size = head_part.size(0), head_part.size(1)
+            head_idx, tail_idx = head_part.reshape(-1), tail_part[:, 2]
 
-            head = torch.index_select(
-                self.entity_embedding, dim=0, index=head_part.reshape(-1)
-            ).view(batch_size, negative_sample_size, -1)
-            relation = torch.index_select(
-                self.relation_embedding, dim=0, index=tail_part[:, 1]
-            ).unsqueeze(1)
-            tail = torch.index_select(
-                self.entity_embedding, dim=0, index=tail_part[:, 2]
-            ).unsqueeze(1)
-            return head, relation, tail, mode
+            head = torch.index_select(self.entity_embedding, dim=0, index=head_idx).view(batch_size, negative_sample_size, -1)
+            relation = torch.index_select(self.relation_embedding, dim=0, index=tail_part[:, 1]).unsqueeze(1)
+            tail = torch.index_select(self.entity_embedding, dim=0, index=tail_idx).unsqueeze(1)
+            
+            if hasattr(self, 'head_bias'):
+                head_bias = torch.index_select(self.head_bias, dim=0, index=head_idx).view(batch_size, negative_sample_size)
+                tail_bias = torch.index_select(self.tail_bias, dim=0, index=tail_idx).unsqueeze(1)
+            return head, relation, tail, mode, head_bias, tail_bias
 
         if mode == 'tail-batch':
             head_part, tail_part = sample
             batch_size, negative_sample_size = tail_part.size(0), tail_part.size(1)
+            head_idx, tail_idx = head_part[:, 0], tail_part.reshape(-1)
 
-            head = torch.index_select(
-                self.entity_embedding, dim=0, index=head_part[:, 0]
-            ).unsqueeze(1)
-            relation = torch.index_select(
-                self.relation_embedding, dim=0, index=head_part[:, 1]
-            ).unsqueeze(1)
-            tail = torch.index_select(
-                self.entity_embedding, dim=0, index=tail_part.reshape(-1)
-            ).view(batch_size, negative_sample_size, -1)
-            return head, relation, tail, mode
-
+            head = torch.index_select(self.entity_embedding, dim=0, index=head_idx).unsqueeze(1)
+            relation = torch.index_select(self.relation_embedding, dim=0, index=head_part[:, 1]).unsqueeze(1)
+            tail = torch.index_select(self.entity_embedding, dim=0, index=tail_idx).view(batch_size, negative_sample_size, -1)
+            
+            if hasattr(self, 'head_bias'):
+                head_bias = torch.index_select(self.head_bias, dim=0, index=head_idx).unsqueeze(1)
+                tail_bias = torch.index_select(self.tail_bias, dim=0, index=tail_idx).view(batch_size, negative_sample_size)
+            return head, relation, tail, mode, head_bias, tail_bias
         raise ValueError('mode %s not supported' % mode)
 
     def forward(self, sample, mode='single'):
@@ -820,7 +1250,11 @@ class KGEModel(nn.Module):
         negative samples and positive samples usually share two elements
         in their triple ((head, relation) or (relation, tail)).
         '''
-        head, relation, tail, score_mode = self._lookup_triple(sample, mode)
+        head, relation, tail, score_mode, head_bias, tail_bias = self._lookup_triple(sample, mode)
+        
+        # Gọi score() kèm Bias nếu model có hỗ trợ
+        if head_bias is not None:
+            return self.kge_scorer.score(head, relation, tail, head_bias, tail_bias, score_mode)
         return self.kge_scorer.score(head, relation, tail, score_mode)
 
     def score_all_entities(self, positive_sample, mode='tail-batch'):
@@ -832,6 +1266,13 @@ class KGEModel(nn.Module):
         when the scorer supports it; otherwise falls back to chunked
         forward().
         '''
+        scorer = self.kge_scorer
+        
+        # Bắt buộc kiểm tra hỗ trợ phương thức trước để bảo vệ chuỗi pipeline,
+        # tránh crash khi tuple được trả về từ MuRP.query_encoder
+        if not hasattr(scorer, 'score_query_entities'):
+            return self._score_all_entities_chunked(positive_sample, mode)
+
         head = self.entity_embedding[positive_sample[:, 0]].unsqueeze(1)
         relation = self.relation_embedding[positive_sample[:, 1]].unsqueeze(1)
         tail = self.entity_embedding[positive_sample[:, 2]].unsqueeze(1)
@@ -842,10 +1283,7 @@ class KGEModel(nn.Module):
             query = self.kge_scorer.query_encoder(head, relation, tail, 'tail-batch')
 
         query = query.squeeze(1)  # [B, D]
-        scorer = self.kge_scorer
-        if hasattr(scorer, 'score_query_entities'):
-            return scorer.score_query_entities(query, self.entity_embedding)
-        return self._score_all_entities_chunked(positive_sample, mode)
+        return scorer.score_query_entities(query, self.entity_embedding)
 
     def _score_all_entities_chunked(self, positive_sample, mode, chunk_size=None):
         '''Fallback: score entity id chunks through forward().'''
