@@ -23,8 +23,13 @@ if [ -f "$ROOT/.venv/bin/activate" ]; then
     . "$ROOT/.venv/bin/activate"
 fi
 
+PYTHON="python"
+if [ -f "$ROOT/.venv/bin/python" ]; then
+    PYTHON="$ROOT/.venv/bin/python"
+fi
+
 # Tự động điều hướng: 
-# Nếu tham số đầu tiên là file .json -> chạy visualization/main.py
+# Nếu tham số đầu tiên là file .json -> chạy main.py
 # Ngược lại -> chạy thẳng main.py ở root
 if [[ "$1" == *.json ]]; then
     CONFIG="$1"
@@ -33,7 +38,7 @@ if [[ "$1" == *.json ]]; then
         echo "Config not found: $CONFIG"
         exit 1
     fi
-    CMD="python -u visualization/main.py $CONFIG --no-show $*"
+    CMD="$PYTHON -u main.py $CONFIG $*"
     CONFIG_STEM="$(basename "$CONFIG" .json)"
 else
     if [ -z "$1" ]; then
@@ -42,7 +47,7 @@ else
         echo "  ./nohup/run.sh --do_train [args]"
         exit 1
     fi
-    CMD="python -u main.py $*"
+    CMD="$PYTHON -u main.py $*"
     CONFIG_STEM="main_cli"
 fi
 

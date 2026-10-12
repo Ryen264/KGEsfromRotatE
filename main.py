@@ -43,6 +43,7 @@ def parse_args(args=None):
     )
 
     parser.add_argument('--no_cuda', action='store_true', help='Ép không dùng GPU (Mặc định tự động dùng GPU nếu có)')
+    parser.add_argument('--no-show', '--no_show', action='store_true', help=argparse.SUPPRESS)
     
     parser.add_argument('--do_train', action='store_true')
     parser.add_argument('--do_valid', action='store_true')
