@@ -54,9 +54,9 @@ except ImportError:  # pragma: no cover
     _TRITON_AVAILABLE = False
 
 
-def resolve_rotate_score_mode(args):
+def resolve_score_mode(args):
     '''
-    RotatE scoring mode from training setup.
+    Scoring mode from training setup for all Geometry-aware models.
 
     KGAU-family (loss or strategy) aligns L2-normalized query/target
     embeddings, so ranking uses cosine similarity. NegSamp / AllNeg keep
@@ -162,10 +162,11 @@ class QuaternionSpace(BaseSpace):
 
 class HyperbolicSpace(BaseSpace):
     @staticmethod
-    def normalize(x):
+    def normalize(x, maxnorm=1.0 - 1e-5):
         # Giới hạn norm của vector trong đĩa Poincaré (phải nhỏ hơn 1)
-        norm = torch.norm(x, p=2, dim=-1, keepdim=True)
-        return torch.where(norm >= 1, x / (norm - 1e-5), x)
+        norm = torch.norm(x, p=2, dim=-1, keepdim=True).clamp_min(1e-15)
+        projected = x / norm * maxnorm
+        return torch.where(norm > maxnorm, projected, x)
 
     @staticmethod
     def distance(q, y, c=1.0):
@@ -178,12 +179,12 @@ class HyperbolicSpace(BaseSpace):
 
     @staticmethod
     def artanh(x):
+        x = torch.clamp(x, -1.0 + 1e-5, 1.0 - 1e-5)
         return 0.5 * torch.log((1 + x) / (1 - x))
 
     @staticmethod
     def mobius_add(u, v, c=1.0):
         # Phép cộng Möbius trong đĩa Poincaré
-        v = v + 1e-5
         norm_u_sq = torch.norm(u, p=2, dim=-1, keepdim=True) ** 2
         norm_v_sq = torch.norm(v, p=2, dim=-1, keepdim=True) ** 2
         dot_uv = (u * v).sum(dim=-1, keepdim=True)
@@ -1007,33 +1008,46 @@ class MuRP(KGEBase):
         self.space = space
 
     def query_encoder(self, head, relation, tail, mode):
-        # Chuẩn hóa an toàn
-        head_n = self.space.normalize(head)
         Ru, rvh = torch.chunk(relation, 2, dim=-1)
         rvh_n = self.space.normalize(rvh)
 
         if mode == 'head-batch':
-            return tail # Cần xử lý cẩn thận phép nghịch đảo Möbius khi train head-batch
-            
-        # Ánh xạ log, nhân hệ số, ánh xạ exp
-        u_e = self.space.logmap0(head_n)
-        u_W = u_e * Ru
-        u_m = self.space.expmap0(u_W)
-        u_m = self.space.normalize(u_m)
-        return u_m, rvh_n
+            # Với target là head, query bắt đầu từ tail:
+            # Đảo ngược phép cộng Möbius: tail \ominus rvh_n = tail \oplus (-rvh_n)
+            tail_n = self.space.normalize(tail)
+            v_inv = self.space.mobius_add(tail_n, -rvh_n)
+            v_inv = self.space.normalize(v_inv)
+            # Đảo ngược phép biến đổi đường chéo:
+            v_e = self.space.logmap0(v_inv)
+            v_W = v_e / Ru.clamp_min(1e-5)
+            v_m = self.space.expmap0(v_W)
+            return self.space.normalize(v_m)
+        else:
+            # Với target là tail, query bắt đầu từ head:
+            head_n = self.space.normalize(head)
+            u_e = self.space.logmap0(head_n)
+            u_W = u_e * Ru
+            u_m = self.space.expmap0(u_W)
+            u_m = self.space.normalize(u_m)
+            query = self.space.mobius_add(u_m, rvh_n)
+            return self.space.normalize(query)
 
     def target_encoder(self, head, relation, tail, mode):
-        return self.space.normalize(tail)
+        target = head if mode == 'head-batch' else tail
+        return self.space.normalize(target)
 
-    def score(self, head, relation, tail, head_bias, tail_bias, mode):
-        u_m, rvh_n = self.query_encoder(head, relation, tail, mode)
-        v = self.target_encoder(head, relation, tail, mode)
-        
-        # Kết hợp mục tiêu và véc-tơ tịnh tiến quan hệ bằng phép cộng Möbius
-        v_m = self.space.mobius_add(v, rvh_n)
-        v_m = self.space.normalize(v_m)
-        
-        sqdist = self.space.distance(u_m, v_m)
+    def score(self, head, relation, tail, head_bias=0.0, tail_bias=0.0, mode='tail-batch'):
+        if isinstance(head_bias, str):
+            mode = head_bias
+            head_bias = 0.0
+            tail_bias = 0.0
+        if head_bias is None:
+            head_bias = 0.0
+        if tail_bias is None:
+            tail_bias = 0.0
+        query = self.query_encoder(head, relation, tail, mode)
+        target = self.target_encoder(head, relation, tail, mode)
+        sqdist = self.space.distance(query, target)
         return -sqdist + head_bias + tail_bias
 
 

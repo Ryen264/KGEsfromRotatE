@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from code.model import KGEModel, resolve_rotate_score_mode
+from code.model import KGEModel, resolve_score_mode
 from code.loss import UniGammaController, build_training_optimizer, is_learnable_kgau_gammas, set_optimizer_learning_rates, update_kgau_gamma_schedule
 from code.strategy import get_strategy, resolve_strategy_name
 
@@ -310,7 +310,7 @@ def main(args):
         margin_gamma=args.margin_gamma,
         double_entity_embedding=args.double_entity_embedding,
         double_relation_embedding=args.double_relation_embedding,
-        score_mode=resolve_rotate_score_mode(args) if args.model == 'RotatE' else 'distance',
+        score_mode=resolve_score_mode(args),
     )
     
     if args.cuda:
