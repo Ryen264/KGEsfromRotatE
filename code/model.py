@@ -921,7 +921,7 @@ class pRotatE(KGEBase):
         self.pi = 3.14159265358979323846
 
     def _get_phase(self, x):
-        # Đưa các giá trị embedding về phân phối đều trong khoảng [-pi, pi][cite: 32]
+        # Đưa các giá trị embedding về phân phối đều trong khoảng [-pi, pi]
         return x / (self.embedding_range.item() / self.pi)
 
     def query_encoder(self, head, relation, tail, mode):
@@ -948,10 +948,10 @@ class pRotatE(KGEBase):
             t_c = torch.cat([torch.cos(target), torch.sin(target)], dim=-1)
             return (q_c * t_c).sum(dim=-1)
         
-        # Hàm score gốc của pRotatE[cite: 32]
-        score = torch.sin(query - target)[cite: 32]
-        score = torch.abs(score)[cite: 32]
-        return self.margin_gamma.item() - score.sum(dim=-1) * self.modulus[cite: 32]
+        # Hàm score gốc của pRotatE
+        score = torch.sin(query - target)
+        score = torch.abs(score)
+        return self.margin_gamma.item() - score.sum(dim=-1) * self.modulus
 
 
 # =============================================================================
@@ -1230,7 +1230,7 @@ class KGEModel(nn.Module):
 
         # pRotatE sử dụng thêm learnable parameter modulus
         if model_name == 'pRotatE':
-            self.modulus = nn.Parameter(torch.Tensor([0.5 * self.embedding_range.item()]))[cite: 32]
+            self.modulus = nn.Parameter(torch.Tensor([0.5 * self.embedding_range.item()]))
 
         if model_name == 'ComplEx' and (not double_entity_embedding or not double_relation_embedding):
             raise ValueError('ComplEx should use --double_entity_embedding and --double_relation_embedding')
