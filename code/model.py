@@ -905,6 +905,56 @@ class RotatE(KGEBase):
 
 
 # =============================================================================
+# pRotatE
+# =============================================================================
+
+class pRotatE(KGEBase):
+    '''
+    pRotatE: Knowledge Graph Embedding by Relational Rotation (Phase only).
+    '''
+    def __init__(self, embedding_range, margin_gamma, modulus, score_mode='distance', space=EuclideanSpace):
+        self.margin_gamma = margin_gamma
+        self.embedding_range = embedding_range
+        self.modulus = modulus
+        self.score_mode = score_mode
+        self.space = space
+        self.pi = 3.14159265358979323846
+
+    def _get_phase(self, x):
+        # Đưa các giá trị embedding về phân phối đều trong khoảng [-pi, pi][cite: 32]
+        return x / (self.embedding_range.item() / self.pi)
+
+    def query_encoder(self, head, relation, tail, mode):
+        phase_relation = self._get_phase(relation)
+        if mode == 'head-batch':
+            phase_tail = self._get_phase(tail)
+            return phase_tail - phase_relation
+        else:
+            phase_head = self._get_phase(head)
+            return phase_head + phase_relation
+
+    def target_encoder(self, head, relation, tail, mode):
+        if mode == 'head-batch':
+            return self._get_phase(head)
+        return self._get_phase(tail)
+
+    def score(self, head, relation, tail, mode):
+        query = self.query_encoder(head, relation, tail, mode)
+        target = self.target_encoder(head, relation, tail, mode)
+
+        if self.score_mode == 'cosine':
+            # Hỗ trợ KGAU strategy: Ánh xạ pha thành vector 2D trên vòng tròn đơn vị để dùng cosine similarity
+            q_c = torch.cat([torch.cos(query), torch.sin(query)], dim=-1)
+            t_c = torch.cat([torch.cos(target), torch.sin(target)], dim=-1)
+            return (q_c * t_c).sum(dim=-1)
+        
+        # Hàm score gốc của pRotatE[cite: 32]
+        score = torch.sin(query - target)[cite: 32]
+        score = torch.abs(score)[cite: 32]
+        return self.margin_gamma.item() - score.sum(dim=-1) * self.modulus[cite: 32]
+
+
+# =============================================================================
 # QuatE
 # =============================================================================
 
@@ -1108,11 +1158,12 @@ class AttH(KGEBase):
 KGE_SCORERS = {
     'TransE': TransE,
     'DistMult': DistMult,
-    'MuRE': MuRE,
     'ComplEx': ComplEx,
     'RotatE': RotatE,
+    'pRotatE': pRotatE,
     'QuatE': QuatE,
     'TransERR': TransERR,
+    'MuRE': MuRE,
     'MuRP': MuRP,
     'AttH': AttH
 }
@@ -1177,22 +1228,32 @@ class KGEModel(nn.Module):
             self.head_bias = nn.Parameter(torch.zeros(nentity))
             self.tail_bias = nn.Parameter(torch.zeros(nentity))
 
+        # pRotatE sử dụng thêm learnable parameter modulus
+        if model_name == 'pRotatE':
+            self.modulus = nn.Parameter(torch.Tensor([0.5 * self.embedding_range.item()]))[cite: 32]
+
         if model_name == 'ComplEx' and (not double_entity_embedding or not double_relation_embedding):
             raise ValueError('ComplEx should use --double_entity_embedding and --double_relation_embedding')
 
         if model_name == 'RotatE' and (not double_entity_embedding or double_relation_embedding):
             raise ValueError('RotatE should use --double_entity_embedding')
 
+        if model_name == 'pRotatE' and (double_entity_embedding or double_relation_embedding):
+            raise ValueError('pRotatE should not use double embeddings')
+
         if model_name not in KGE_SCORERS:
             raise ValueError('model %s not supported' % model_name)
 
         # Cập nhật phân nhánh khởi tạo Scorer
-        if model_name in ['RotatE', 'TransE', 'TransERR']:
-            self.kge_scorer = KGE_SCORERS[model_name](
-                embedding_range=self.embedding_range,
-                margin_gamma=self.margin_gamma,
-                score_mode=score_mode,
-            )
+        if model_name in ['RotatE', 'TransE', 'TransERR', 'pRotatE']:
+            kwargs = {
+                'embedding_range': self.embedding_range,
+                'margin_gamma': self.margin_gamma,
+                'score_mode': score_mode,
+            }
+            if model_name == 'pRotatE':
+                kwargs['modulus'] = self.modulus
+            self.kge_scorer = KGE_SCORERS[model_name](**kwargs)
         elif model_name in ['DistMult', 'ComplEx', 'QuatE']:
             self.kge_scorer = KGE_SCORERS[model_name](score_mode=score_mode)
         elif model_name in ['MuRE', 'MuRP', 'AttH']:
