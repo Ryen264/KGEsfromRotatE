@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+import time
 from datetime import datetime
 
 import numpy as np
@@ -122,6 +123,9 @@ def parse_args(args=None):
     # =========================================================================
     parser.set_defaults(**defaults)
     parsed_args = parser.parse_args(remaining_argv)
+    
+    # Khôi phục lại config_file đã bị lấy mất ở bước parse_known_args
+    parsed_args.config_file = known_args.config_file
     
     # 1. Tự động nhận diện GPU: Luôn dùng cuda trừ khi cờ --no_cuda được bật
     if not parsed_args.no_cuda:
@@ -391,11 +395,13 @@ def main(args):
         valid_metric_key = 'MRR' if not args.triple_classification else 'f1'
         
         init_epoch = init_step // steps_per_epoch_val + 1
+        epoch_times = []
         
         # Vòng lặp ngoài theo Epochs
         epoch_bar = tqdm(range(init_epoch, args.epochs + 1), desc='Training', unit='epoch', dynamic_ncols=True)
         
         for epoch in epoch_bar:
+            epoch_start_time = time.time()
             if is_learnable_kgau_gammas(args):
                 args.current_epoch = epoch
                 update_kgau_gamma_schedule(args)
@@ -466,6 +472,9 @@ def main(args):
                         checkpoint_name='checkpoint_best',
                     )
                     tqdm.write(f'---> New best valid {valid_metric_key} = {best_valid_metric:.4f} at epoch {epoch}')
+            
+            # Ghi nhận thời gian kết thúc epoch
+            epoch_times.append(time.time() - epoch_start_time)
 
         # Sau khi kết thúc huấn luyện, nạp lại mô hình tốt nhất
         if best_model_state is not None:
@@ -476,31 +485,57 @@ def main(args):
     # Giai đoạn đánh giá cuối cùng & Lưu kết quả ra file results.txt
     # =========================================================================
     results_file = os.path.join(args.save_path or args.init_checkpoint, 'results.txt')
-
+    print('\nFinal Evaluating for full report...')
+    
+    # 1. Thu thập thời gian và RAM
+    avg_time = sum(epoch_times) / len(epoch_times) if args.do_train and len(epoch_times) > 0 else 0.0
+    peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3) if args.cuda else 0.0
+    
+    # 2. Force chạy cả 2 task đánh giá
+    valid_lp, valid_tc, test_lp, test_tc = {}, {}, {}, {}
+    
     if args.do_valid:
-        print('\nFinal Evaluating on Valid Dataset...')
-        metrics = kge_model.test_step(kge_model, valid_triples, all_true_triples, args)
-        log_metrics('Valid', step, metrics)
-        save_results_to_txt(results_file, 'Valid', metrics)
-        for k, v in metrics.items():
-            print(f"  {k}: {v:.4f}")
-    
+        print('--> Valid Link Prediction...')
+        valid_lp = KGEModel._test_step_ranking(kge_model, valid_triples, all_true_triples, args)
+        print('--> Valid Triple Classification...')
+        valid_tc = KGEModel._test_step_triple_classification(kge_model, valid_triples, all_true_triples, args)
+        
     if args.do_test:
-        print('\nFinal Evaluating on Test Dataset...')
-        metrics = kge_model.test_step(kge_model, test_triples, all_true_triples, args)
-        log_metrics('Test', step, metrics)
-        save_results_to_txt(results_file, 'Test', metrics)
-        for k, v in metrics.items():
-            print(f"  {k}: {v:.4f}")
-    
-    if args.evaluate_train:
-        print('\nFinal Evaluating on Training Dataset...')
-        metrics = kge_model.test_step(kge_model, train_triples, all_true_triples, args)
-        log_metrics('Train', step, metrics)
-        save_results_to_txt(results_file, 'Train', metrics)
-        for k, v in metrics.items():
-            print(f"  {k}: {v:.4f}")
-            
+        print('--> Test Link Prediction...')
+        test_lp = KGEModel._test_step_ranking(kge_model, test_triples, all_true_triples, args)
+        print('--> Test Triple Classification...')
+        test_tc = KGEModel._test_step_triple_classification(kge_model, test_triples, all_true_triples, args)
+
+    # 3. Thông tin Validation
+    best_epoch_str = str(best_valid_epoch) if args.do_train and best_valid_epoch is not None else "N/A"
+    best_metric_val = best_valid_metric if args.do_train and best_valid_metric != float('-inf') else 0.0
+    metric_name = valid_metric_key if args.do_train else "Metric"
+    config_path = getattr(args, 'config_file', 'CLI') or 'CLI'
+
+    # 4. Lưu ra file theo đúng format
+    with open(results_file, 'w') as f:
+        f.write(f"Config path: {config_path}\n")
+        f.write(f"MRR: {test_lp.get('MRR', 0):.4f}\n")
+        f.write(f"Hit@1: {test_lp.get('HITS@1', 0):.4f}\n")
+        f.write(f"Hit@3: {test_lp.get('HITS@3', 0):.4f}\n")
+        f.write(f"Hit@10: {test_lp.get('HITS@10', 0):.4f}\n")
+        f.write(f"Acc: {test_tc.get('acc', 0):.4f}\n")
+        f.write(f"F1: {test_tc.get('f1', 0):.4f}\n")
+        f.write(f"PR-AUC: {test_tc.get('pr_auc', 0):.4f}\n")
+        f.write(f"ROC-AUC: {test_tc.get('roc_auc', 0):.4f}\n")
+        f.write(f"Time per epoch (s): {avg_time:.2f}\n")
+        f.write(f"Peak GPU Memory (GB): {peak_mem:.4f}\n")
+        f.write(f"Best Valid epoch: {best_epoch_str}\n")
+        f.write(f"Best Valid {metric_name}: {best_metric_val:.4f}\n")
+        f.write(f"Valid MRR: {valid_lp.get('MRR', 0):.4f}\n")
+        f.write(f"Valid Hit@1: {valid_lp.get('HITS@1', 0):.4f}\n")
+        f.write(f"Valid Hit@3: {valid_lp.get('HITS@3', 0):.4f}\n")
+        f.write(f"Valid Hit@10: {valid_lp.get('HITS@10', 0):.4f}\n")
+        f.write(f"Valid Acc: {valid_tc.get('acc', 0):.4f}\n")
+        f.write(f"Valid F1: {valid_tc.get('f1', 0):.4f}\n")
+        f.write(f"Valid PR-AUC: {valid_tc.get('pr_auc', 0):.4f}\n")
+        f.write(f"Valid ROC-AUC: {valid_tc.get('roc_auc', 0):.4f}\n")
+
     if args.save_path:
         print(f'\nAll results and checkpoints have been saved to: {args.save_path}')
 
