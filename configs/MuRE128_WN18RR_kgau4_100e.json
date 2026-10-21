@@ -3,7 +3,7 @@
   "data_path": "data/wn18rr",
   "loss": "kgau",
   "strategy": "kgau",
-  "dim": 64,
+  "dim": 128,
   "batch_size": 512,
   "margin_gamma": 200.0,
   "learning_rate": 0.002,
